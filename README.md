@@ -108,6 +108,47 @@ cryp/
 - **Page Cache 控制** — `FADV_SEQUENTIAL | FADV_NOREUSE` 预声明 + `FADV_DONTNEED` 主动释放
 - **GOMEMLIMIT** — 限制 Go 堆上限为 256MB，触发更积极的 GC
 
+## GPU 加速（可选）
+
+当前版本支持在**视频缩略图生成**阶段通过 FFmpeg 启用硬件解码加速，默认 `CRYP_FFMPEG_HWACCEL=auto`：
+
+- 自动优先尝试常见硬件后端（`vaapi`、`qsv`、`cuda` 等，取决于本机 FFmpeg 支持）
+- 若硬件不可用或驱动不兼容，会自动降级到 CPU 路径
+- 兼容 AMD / Intel CPU，以及核显/独显环境（由 FFmpeg 驱动栈决定最终可用后端）
+
+可用环境变量：
+
+- `CRYP_FFMPEG_HWACCEL`：硬件加速策略（默认 `auto`；可设 `none`/`cpu` 强制 CPU，或指定 `vaapi`/`qsv`/`cuda`）
+
+示例（自动探测 + 自动降级）：
+
+```yaml
+environment:
+  - CRYP_FFMPEG_HWACCEL=auto
+```
+
+示例（Intel/AMD iGPU，常见 Linux VAAPI）：
+
+```yaml
+environment:
+  - CRYP_FFMPEG_HWACCEL=vaapi
+```
+
+示例（NVIDIA）：
+
+```yaml
+environment:
+  - CRYP_FFMPEG_HWACCEL=cuda
+```
+
+说明：
+
+- 该加速仅影响 `internal/thumbnail` 的 FFmpeg 缩略图任务。
+- 即使显卡不可用，也会自动回退到 CPU，不影响功能可用性。
+- `auto` 模式会自动选择可用后端，并自动处理常见输出格式参数。
+- 服务启动时会先做一次 GPU 自检；若自检失败，会在当前进程内关闭 GPU 加速并全程使用 CPU。
+- 文件内容 AES-GCM 加解密仍走 Go 原生实现（CPU/AES-NI），保持兼容和稳定。
+
 ## 技术栈
 
 **后端**: Go 1.24, Gin, SQLite (go-sqlite3, WAL 模式)

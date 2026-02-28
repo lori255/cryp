@@ -57,22 +57,194 @@ type Generator struct {
 	sessions *session.Store
 	port     string
 	jobs     chan thumbJob
+	ffmpeg   ffmpegConfig
 	wg       sync.WaitGroup
+}
+
+type ffmpegConfig struct {
+	bin      string
+	hwaccel  string
+	attempts []ffmpegAttempt
+}
+
+type ffmpegAttempt struct {
+	hwaccel             string
+	hwaccelOutputFormat string
 }
 
 // NewGenerator creates a new thumbnail generator.
 // sessions and port are used to create temporary auth sessions for internal
 // FFmpeg HTTP requests against the local server's content endpoint.
 func NewGenerator(vaultDir string, sessions *session.Store, port string) *Generator {
+	cfg := ffmpegConfig{
+		bin:     "ffmpeg",
+		hwaccel: strings.TrimSpace(os.Getenv("CRYP_FFMPEG_HWACCEL")),
+	}
+	if cfg.hwaccel == "" {
+		cfg.hwaccel = "auto"
+	}
+
+	candidates := buildFFmpegAttempts(cfg)
+	cfg.attempts = probeFFmpegAttempts(cfg.bin, candidates)
+	if len(cfg.attempts) == 1 && cfg.attempts[0].hwaccel == "" {
+		log.Printf("thumbnail: active backend order: cpu")
+	} else {
+		log.Printf("thumbnail: active backend order: %s", formatFFmpegAttempts(cfg.attempts))
+	}
+
 	g := &Generator{
 		vaultDir: vaultDir,
 		sessions: sessions,
 		port:     port,
 		jobs:     make(chan thumbJob, queueSize),
+		ffmpeg:   cfg,
 	}
 	g.wg.Add(1)
 	go g.worker()
 	return g
+}
+
+func buildFFmpegAttempts(cfg ffmpegConfig) []ffmpegAttempt {
+	hw := strings.ToLower(strings.TrimSpace(cfg.hwaccel))
+	if hw == "none" || hw == "off" || hw == "cpu" {
+		return []ffmpegAttempt{{}}
+	}
+
+	if hw != "" && hw != "auto" {
+		return []ffmpegAttempt{
+			{
+				hwaccel:             hw,
+				hwaccelOutputFormat: defaultOutputFormat(hw),
+			},
+			{},
+		}
+	}
+
+	available := detectFFmpegHwaccels(cfg.bin)
+	order := []string{"vaapi", "qsv", "cuda", "d3d11va", "videotoolbox"}
+	attempts := make([]ffmpegAttempt, 0, len(order)+1)
+	for _, name := range order {
+		if !available[name] {
+			continue
+		}
+		attempts = append(attempts, ffmpegAttempt{
+			hwaccel:             name,
+			hwaccelOutputFormat: defaultOutputFormat(name),
+		})
+	}
+
+	attempts = append(attempts, ffmpegAttempt{})
+	return attempts
+}
+
+func detectFFmpegHwaccels(bin string) map[string]bool {
+	out, err := exec.Command(bin, "-hide_banner", "-hwaccels").CombinedOutput()
+	if err != nil {
+		return map[string]bool{}
+	}
+
+	available := make(map[string]bool)
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		item := strings.ToLower(strings.TrimSpace(line))
+		if item == "" || strings.Contains(item, ":") {
+			continue
+		}
+		available[item] = true
+	}
+	return available
+}
+
+func defaultOutputFormat(hwaccel string) string {
+	switch strings.ToLower(strings.TrimSpace(hwaccel)) {
+	case "vaapi":
+		return "vaapi"
+	case "cuda":
+		return "cuda"
+	default:
+		return ""
+	}
+}
+
+func probeFFmpegAttempts(bin string, attempts []ffmpegAttempt) []ffmpegAttempt {
+	if len(attempts) == 0 {
+		return []ffmpegAttempt{{}}
+	}
+
+	valid := make([]ffmpegAttempt, 0, len(attempts))
+	for _, attempt := range attempts {
+		if attempt.hwaccel == "" {
+			continue
+		}
+		if canUseFFmpegAttempt(bin, attempt) {
+			valid = append(valid, attempt)
+		}
+	}
+
+	valid = append(valid, ffmpegAttempt{})
+	return valid
+}
+
+func canUseFFmpegAttempt(bin string, attempt ffmpegAttempt) bool {
+	probePath := "/tmp/cryp-ffmpeg-probe.mp4"
+	createCmd := exec.Command(
+		bin,
+		"-hide_banner",
+		"-loglevel", "error",
+		"-f", "lavfi",
+		"-i", "testsrc2=size=128x72:rate=30",
+		"-t", "1",
+		"-c:v", "h264",
+		"-y", probePath,
+	)
+	if out, err := createCmd.CombinedOutput(); err != nil {
+		_ = out
+		return false
+	}
+
+	probeArgs := make([]string, 0, 16)
+	probeArgs = append(probeArgs, "-hide_banner", "-loglevel", "error")
+	probeArgs = appendAttemptHwArgs(probeArgs, attempt)
+	probeArgs = append(probeArgs, "-i", probePath, "-frames:v", "1", "-f", "null", "-")
+
+	runCmd := exec.Command(bin, probeArgs...)
+	out, err := runCmd.CombinedOutput()
+	if err != nil {
+		_ = out
+		return false
+	}
+	return true
+}
+
+func appendAttemptHwArgs(args []string, attempt ffmpegAttempt) []string {
+	if attempt.hwaccel == "" {
+		return args
+	}
+	args = append(args, "-hwaccel", attempt.hwaccel)
+	if attempt.hwaccel == "vaapi" {
+		if _, err := os.Stat("/dev/dri/renderD128"); err == nil {
+			args = append(args, "-hwaccel_device", "/dev/dri/renderD128")
+		}
+	}
+	if attempt.hwaccelOutputFormat != "" {
+		args = append(args, "-hwaccel_output_format", attempt.hwaccelOutputFormat)
+	}
+	return args
+}
+
+func formatFFmpegAttempts(attempts []ffmpegAttempt) string {
+	if len(attempts) == 0 {
+		return "cpu"
+	}
+	parts := make([]string, 0, len(attempts))
+	for _, a := range attempts {
+		if a.hwaccel == "" {
+			parts = append(parts, "cpu")
+			continue
+		}
+		parts = append(parts, a.hwaccel)
+	}
+	return strings.Join(parts, " -> ")
 }
 
 // Stop gracefully shuts down the generator
@@ -164,29 +336,49 @@ func (g *Generator) generate(job thumbJob) error {
 	thumbTmp := outPath + ".tmp"
 	defer os.Remove(thumbTmp)
 
-	var stderrBuf bytes.Buffer
-	cmd := exec.Command("ffmpeg",
-		// Pass session cookie via HTTP headers for authentication
-		"-headers", fmt.Sprintf("Cookie: session_id=%s\r\n", sessionID),
-		// Input from local HTTP server (supports Range for seeking)
-		"-i", contentURL,
-		// Extract a single frame
-		"-frames:v", "1",
-		// Scale to thumbnail size with padding to maintain aspect ratio
-		"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black",
-			thumbWidth, thumbHeight, thumbWidth, thumbHeight),
-		"-q:v", "5",
-		"-f", "image2",
-		"-y", thumbTmp,
-	)
-	cmd.Stderr = &stderrBuf
+	var lastErr error
+	for _, attempt := range g.ffmpeg.attempts {
+		ffmpegArgs := make([]string, 0, 24)
+		ffmpegArgs = appendAttemptHwArgs(ffmpegArgs, attempt)
 
-	if err := cmd.Run(); err != nil {
-		errOut := stderrBuf.String()
-		if len(errOut) > 500 {
-			errOut = errOut[len(errOut)-500:]
+		ffmpegArgs = append(ffmpegArgs,
+			// Pass session cookie via HTTP headers for authentication
+			"-headers", fmt.Sprintf("Cookie: session_id=%s\r\n", sessionID),
+			// Input from local HTTP server (supports Range for seeking)
+			"-i", contentURL,
+			// Extract a single frame
+			"-frames:v", "1",
+			// Scale to thumbnail size with padding to maintain aspect ratio
+			"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black",
+				thumbWidth, thumbHeight, thumbWidth, thumbHeight),
+			"-q:v", "5",
+			"-f", "image2",
+			"-y", thumbTmp,
+		)
+
+		var stderrBuf bytes.Buffer
+		cmd := exec.Command(g.ffmpeg.bin, ffmpegArgs...)
+		cmd.Stderr = &stderrBuf
+
+		if err := cmd.Run(); err != nil {
+			errOut := stderrBuf.String()
+			if len(errOut) > 500 {
+				errOut = errOut[len(errOut)-500:]
+			}
+
+			if attempt.hwaccel != "" {
+				log.Printf("thumbnail: hwaccel=%s failed, fallback next backend: %v", attempt.hwaccel, err)
+			}
+			lastErr = fmt.Errorf("ffmpeg: %w: %s", err, errOut)
+			continue
 		}
-		return fmt.Errorf("ffmpeg: %w: %s", err, errOut)
+
+		lastErr = nil
+		break
+	}
+
+	if lastErr != nil {
+		return lastErr
 	}
 
 	// Encrypt the thumbnail JPEG before storing
