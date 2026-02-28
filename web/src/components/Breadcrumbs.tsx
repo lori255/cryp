@@ -11,7 +11,7 @@ export default function Breadcrumbs({ path, onNavigate, rootPath = '/', rootLabe
   const pathParts = path.split('/').filter(Boolean)
 
   return (
-    <nav className="flex items-center gap-1 text-sm overflow-x-auto flex-shrink-0">
+    <nav className="flex items-center gap-1 text-sm overflow-x-auto flex-1 min-w-0">
       <button
         onClick={() => onNavigate(rootPath)}
         className="text-gray-400 hover:text-white transition-colors flex-shrink-0"
