@@ -2,6 +2,7 @@ package thumbnail
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -99,7 +100,7 @@ func (g *Generator) HasThumbnail(vaultID, virtualPath string) bool {
 // thumbPath returns the on-disk path for a thumbnail
 func (g *Generator) thumbPath(vaultID, virtualPath string) string {
 	hash := sha256.Sum256([]byte(virtualPath))
-	name := fmt.Sprintf("%x.jpg", hash)
+	name := fmt.Sprintf("%x.c9r", hash)
 	return filepath.Join(g.vaultDir, vaultID, thumbDir, name)
 }
 
@@ -196,9 +197,9 @@ func (g *Generator) generate(job thumbJob) error {
 		return fmt.Errorf("ffmpeg: %w: %s", err, errOut)
 	}
 
-	// Atomic rename
-	if err := os.Rename(thumbTmp, outPath); err != nil {
-		return fmt.Errorf("rename: %w", err)
+	// Encrypt the thumbnail JPEG before storing
+	if err := g.encryptFile(thumbTmp, outPath, job.Keys.MasterKey); err != nil {
+		return fmt.Errorf("encrypt thumbnail: %w", err)
 	}
 
 	return nil
@@ -237,4 +238,77 @@ func (g *Generator) scanDir(vault *crypto.Vault, dirPath string) {
 			g.Enqueue(vault.ID, vault.Path, vault.Keys, fullPath)
 		}
 	}
+}
+
+// encryptFile reads a plaintext file, encrypts it using the same format as vault
+// content files (header + AES-256-GCM chunks), and writes the result to outPath.
+func (g *Generator) encryptFile(srcPath, outPath string, masterKey []byte) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
 	}
+	defer src.Close()
+
+	out, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	contentKey := make([]byte, crypto.MasterKeySize)
+	if _, err := rand.Read(contentKey); err != nil {
+		os.Remove(outPath)
+		return err
+	}
+
+	header, err := crypto.WriteFileHeader(out, masterKey, contentKey)
+	if err != nil {
+		os.Remove(outPath)
+		return err
+	}
+
+	writer, err := crypto.NewEncryptingWriter(out, header.ContentKey, header.Nonce)
+	if err != nil {
+		os.Remove(outPath)
+		return err
+	}
+
+	if _, err := io.Copy(writer, src); err != nil {
+		os.Remove(outPath)
+		return err
+	}
+
+	if err := writer.Close(); err != nil {
+		os.Remove(outPath)
+		return err
+	}
+
+	return nil
+}
+
+// DecryptThumbnail opens an encrypted thumbnail and returns a reader for the
+// decrypted JPEG content. Caller must call release() when done.
+func DecryptThumbnail(path string, masterKey []byte) (io.Reader, func(), error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	header, err := crypto.ReadFileHeader(file, masterKey)
+	if err != nil {
+		file.Close()
+		return nil, nil, err
+	}
+
+	reader, err := crypto.NewDecryptingReader(file, header.ContentKey, header.Nonce)
+	if err != nil {
+		file.Close()
+		return nil, nil, err
+	}
+
+	release := func() {
+		reader.Release()
+		file.Close()
+	}
+	return reader, release, nil
+}

@@ -461,8 +461,18 @@ func (s *Server) handleThumbnail(c *gin.Context) {
 		return
 	}
 
+	// Decrypt the encrypted thumbnail and stream it back
+	reader, release, err := thumbnail.DecryptThumbnail(thumbPath, sess.Keys.MasterKey)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "decrypt thumbnail failed"})
+		return
+	}
+	defer release()
+
 	c.Header("Cache-Control", "public, max-age=86400")
-	c.File(thumbPath)
+	c.Header("Content-Type", "image/jpeg")
+	c.Status(http.StatusOK)
+	io.Copy(c.Writer, reader)
 }
 
 func getContentType(ext string) string {
