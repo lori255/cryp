@@ -2,9 +2,11 @@ package api
 
 import (
 	"net/http"
+	"os"
 
 	"cryp/internal/crypto"
 	"cryp/internal/storage"
+	"cryp/internal/task"
 
 	"github.com/gin-gonic/gin"
 )
@@ -35,6 +37,16 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
+	// Limit concurrent scrypt derivations to prevent OOM under load.
+	// Each scrypt call uses ~32MB; with GOMEMLIMIT=256MiB we allow max 2.
+	select {
+	case s.scryptSem <- struct{}{}:
+		defer func() { <-s.scryptSem }()
+	default:
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "server busy, try again"})
+		return
+	}
+
 	keys, err := crypto.UnlockVault([]byte(req.Password), config)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "wrong password"})
@@ -48,7 +60,8 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
-	// Set cookie
+	// Set cookie with SameSite=Strict
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("session_id", sessionID, 86400, "/", "", false, true)
 
 	// Trigger background thumbnail scan for videos missing thumbnails
@@ -75,6 +88,7 @@ func (s *Server) handleLogout(c *gin.Context) {
 		s.sessions.Delete(sessionID)
 	}
 
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("session_id", "", -1, "/", "", false, true)
 	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
 }
@@ -122,7 +136,20 @@ func (s *Server) handleCreateVault(c *gin.Context) {
 		return
 	}
 
-	id := generateID()
+	// Limit concurrent scrypt derivations
+	select {
+	case s.scryptSem <- struct{}{}:
+		defer func() { <-s.scryptSem }()
+	default:
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "server busy, try again"})
+		return
+	}
+
+	id, err := task.GenerateID()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate vault id"})
+		return
+	}
 	vaultPath := s.vaultDir + "/" + id
 
 	config, keys, err := crypto.InitVault(vaultPath, []byte(req.Password))
@@ -148,6 +175,7 @@ func (s *Server) handleCreateVault(c *gin.Context) {
 		return
 	}
 
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("session_id", sessionID, 86400, "/", "", false, true)
 
 	_ = config // config is stored on disk
@@ -172,6 +200,19 @@ func (s *Server) handleListVaults(c *gin.Context) {
 func (s *Server) handleDeleteVault(c *gin.Context) {
 	id := c.Param("id")
 
+	// Read optional body for deleteFiles flag
+	var req struct {
+		DeleteFiles bool `json:"deleteFiles"`
+	}
+	_ = c.ShouldBindJSON(&req) // optional body, ignore errors
+
+	// Look up vault path before deleting the record
+	vault, err := s.db.GetVault(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "vault not found"})
+		return
+	}
+
 	// Delete sessions for this vault
 	s.sessions.DeleteByVault(id)
 
@@ -180,6 +221,10 @@ func (s *Server) handleDeleteVault(c *gin.Context) {
 		return
 	}
 
-	// Note: we don't delete the encrypted files on disk for safety
+	// Optionally remove encrypted files from disk
+	if req.DeleteFiles {
+		_ = os.RemoveAll(vault.Path)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "vault deleted"})
 }

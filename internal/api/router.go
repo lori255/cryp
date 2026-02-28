@@ -21,16 +21,18 @@ type Server struct {
 	thumbs    *thumbnail.Generator
 	vaultDir  string
 	staticFS  fs.FS
+	scryptSem chan struct{} // limits concurrent scrypt derivations to prevent OOM
 }
 
 func NewServer(db *storage.DB, sessions *session.Store, tasks *task.Manager, thumbs *thumbnail.Generator, vaultDir string, staticFS fs.FS) *Server {
 	return &Server{
-		db:       db,
-		sessions: sessions,
-		tasks:    tasks,
-		thumbs:   thumbs,
-		vaultDir: vaultDir,
-		staticFS: staticFS,
+		db:        db,
+		sessions:  sessions,
+		tasks:     tasks,
+		thumbs:    thumbs,
+		vaultDir:  vaultDir,
+		staticFS:  staticFS,
+		scryptSem: make(chan struct{}, 2), // max 2 concurrent scrypt ops (~64MB peak)
 	}
 }
 
@@ -39,9 +41,13 @@ func (s *Server) SetupRouter() *gin.Engine {
 	r := gin.Default()
 	r.MaxMultipartMemory = 8 << 20 // 8MB — excess spills to temp files on disk
 
-	// CORS middleware
+	// CORS middleware — restrict to same origin (not wildcard)
 	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		origin := c.GetHeader("Origin")
+		if origin != "" {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Access-Control-Allow-Credentials", "true")
+		}
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-ID")
 		c.Header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
@@ -63,10 +69,8 @@ func (s *Server) SetupRouter() *gin.Engine {
 		// Vault management - no session required (manages vault lifecycle)
 		api.POST("/vaults", s.handleCreateVault)
 		api.GET("/vaults", s.handleListVaults)
-		api.DELETE("/vaults/:id", s.handleDeleteVault)
 		// Directory browsing (requires session for security)
 		api.GET("/browse-dir", s.handleBrowseDir)
-
 		// Vault operations - session required
 		vaultOps := api.Group("/vaults/:id")
 		vaultOps.Use(s.authMiddleware())
@@ -77,6 +81,7 @@ func (s *Server) SetupRouter() *gin.Engine {
 			vaultOps.POST("/files/mkdir", s.handleMkdir)
 			vaultOps.DELETE("/files", s.handleDeleteFile)
 			vaultOps.GET("/thumbnail", s.handleThumbnail)
+			vaultOps.DELETE("", s.handleDeleteVault) // vault deletion requires auth
 
 			// Task management
 			vaultOps.GET("/tasks", s.handleListTasks)
@@ -88,7 +93,6 @@ func (s *Server) SetupRouter() *gin.Engine {
 			vaultOps.DELETE("/tasks/:taskId", s.handleDeleteTask)
 		}
 	}
-
 	// Serve React static files
 	if s.staticFS != nil {
 		// Serve static assets (js, css, etc.)
@@ -126,11 +130,7 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionID := c.GetHeader("X-Session-ID")
 		if sessionID == "" {
-			// Try query parameter (for img/video elements that can't set headers)
-			sessionID = c.Query("sid")
-		}
-		if sessionID == "" {
-			// Try cookie
+			// Use httpOnly cookie (secure fallback for img/video elements)
 			if cookie, err := c.Cookie("session_id"); err == nil {
 				sessionID = cookie
 			}

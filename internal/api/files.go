@@ -41,11 +41,11 @@ func (s *Server) handleListFiles(c *gin.Context) {
 
 	// Build response with thumbnail availability
 	type fileResp struct {
-		Name         string `json:"name"`
-		IsDir        bool   `json:"isDir"`
-		Size         int64  `json:"size,omitempty"`
-		ModTime      int64  `json:"modTime,omitempty"`
-		HasThumb     bool   `json:"hasThumb,omitempty"`
+		Name     string `json:"name"`
+		IsDir    bool   `json:"isDir"`
+		Size     int64  `json:"size,omitempty"`
+		ModTime  int64  `json:"modTime,omitempty"`
+		HasThumb bool   `json:"hasThumb,omitempty"`
 	}
 
 	result := make([]fileResp, len(files))
@@ -440,6 +440,11 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 		}
 	}
 
+	// Clean up associated thumbnail if it exists
+	if s.thumbs != nil {
+		s.thumbs.DeleteThumbnail(sess.VaultID, path)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "deleted", "path": path})
 }
 
@@ -505,10 +510,4 @@ func getContentType(ext string) string {
 		return t
 	}
 	return "application/octet-stream"
-}
-
-func generateID() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
 }

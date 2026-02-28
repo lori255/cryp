@@ -35,14 +35,27 @@ type VaultKeys struct {
 	MACKey    []byte // 32 bytes - used for filename encryption (AES-SIV)
 }
 
+func (k *VaultKeys) Clone() *VaultKeys {
+	if k == nil {
+		return nil
+	}
+	cloned := &VaultKeys{
+		MasterKey: make([]byte, len(k.MasterKey)),
+		MACKey:    make([]byte, len(k.MACKey)),
+	}
+	copy(cloned.MasterKey, k.MasterKey)
+	copy(cloned.MACKey, k.MACKey)
+	return cloned
+}
+
 // VaultConfig holds the encrypted vault configuration stored in vault.json
 type VaultConfig struct {
 	ScryptSalt       []byte `json:"scryptSalt"`       // 16 bytes
-	ScryptN          int    `json:"scryptN"`           // 32768
-	ScryptR          int    `json:"scryptR"`           // 8
-	ScryptP          int    `json:"scryptP"`           // 1
-	WrappedMasterKey []byte `json:"wrappedMasterKey"`  // 40 bytes (32 + 8 wrap overhead)
-	WrappedMACKey    []byte `json:"wrappedMACKey"`     // 40 bytes
+	ScryptN          int    `json:"scryptN"`          // 32768
+	ScryptR          int    `json:"scryptR"`          // 8
+	ScryptP          int    `json:"scryptP"`          // 1
+	WrappedMasterKey []byte `json:"wrappedMasterKey"` // 40 bytes (32 + 8 wrap overhead)
+	WrappedMACKey    []byte `json:"wrappedMACKey"`    // 40 bytes
 }
 
 // DeriveKEK derives a Key Encryption Key from password using scrypt

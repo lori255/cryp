@@ -19,7 +19,7 @@ func (s *Server) handleBrowseDir(c *gin.Context) {
 
 	// Security: only allow browsing under /data
 	absPath, err := filepath.Abs(dirPath)
-	if err != nil || !strings.HasPrefix(absPath, "/data") {
+	if err != nil || (absPath != "/data" && !strings.HasPrefix(absPath, "/data/")) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied: can only browse /data"})
 		return
 	}
@@ -99,7 +99,11 @@ func (s *Server) handleCreateImportTask(c *gin.Context) {
 		return
 	}
 
-	taskID := task.GenerateID()
+	taskID, err := task.GenerateID()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate task id"})
+		return
+	}
 	err = s.tasks.StartImport(taskID, sess.VaultID, sess.VaultPath, sess.Keys, req.SourcePath, req.DestPath, req.DeleteSource)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start import: " + err.Error()})
@@ -201,7 +205,11 @@ func (s *Server) handleCreateUploadTask(c *gin.Context) {
 		return
 	}
 
-	taskID := task.GenerateID()
+	taskID, err := task.GenerateID()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate task id"})
+		return
+	}
 	if err := s.tasks.CreateUploadTask(taskID, sess.VaultID, req.TotalFiles, req.TotalBytes); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create upload task"})
 		return

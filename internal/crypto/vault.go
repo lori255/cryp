@@ -56,7 +56,10 @@ func InitVault(vaultPath string, password []byte) (*VaultConfig, *VaultKeys, err
 	}
 
 	// Create root directory with a directory ID
-	rootDirID := generateDirID()
+	rootDirID, err := generateDirID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate root dir id: %w", err)
+	}
 	rootEncName, err := EncryptFileName(keys.MACKey, "root", rootDirID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encrypt root dir name: %w", err)
@@ -75,8 +78,8 @@ func InitVault(vaultPath string, password []byte) (*VaultConfig, *VaultKeys, err
 
 	// Also store the root dir ID mapping in vault.json for easy lookup
 	rootMapping := &RootDirMapping{
-		RootDirID:      rootDirID,
-		RootEncName:    rootEncName,
+		RootDirID:   rootDirID,
+		RootEncName: rootEncName,
 	}
 	mappingData, err := json.Marshal(rootMapping)
 	if err != nil {
@@ -376,7 +379,10 @@ func (v *Vault) CreateEncryptedDirectory(virtualPath string) error {
 	}
 
 	// Generate and write directory ID
-	newDirID := generateDirID()
+	newDirID, err := generateDirID()
+	if err != nil {
+		return fmt.Errorf("generate dir ID: %w", err)
+	}
 	dirIDPath := filepath.Join(newDirPath, DirIDFile)
 	if err := os.WriteFile(dirIDPath, []byte(newDirID), 0600); err != nil {
 		return fmt.Errorf("write dir ID: %w", err)
@@ -385,10 +391,12 @@ func (v *Vault) CreateEncryptedDirectory(virtualPath string) error {
 	return nil
 }
 
-func generateDirID() string {
+func generateDirID() (string, error) {
 	b := make([]byte, 16)
-	rand.Read(b)
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate dir id: %w", err)
+	}
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
 }
 
 // shortenEncName returns the filesystem name for an encrypted name.

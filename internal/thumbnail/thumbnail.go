@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"sync"
 
 	"cryp/internal/crypto"
+	"cryp/internal/session"
 )
 
 const (
@@ -44,17 +46,28 @@ type thumbJob struct {
 	FilePath  string // virtual path within vault
 }
 
-// Generator manages async thumbnail generation with a single-worker queue
+// Generator manages async thumbnail generation with a single-worker queue.
+// It generates thumbnails by having FFmpeg fetch the video via the local
+// HTTP server's Range-enabled content endpoint. This means:
+//   - No plaintext temp files — decryption happens on-the-fly via HTTP Range
+//   - MP4 moov-at-end works — FFmpeg sends Range requests to seek
+//   - Only a few MB of data is transferred for a single frame extraction
 type Generator struct {
 	vaultDir string
+	sessions *session.Store
+	port     string
 	jobs     chan thumbJob
 	wg       sync.WaitGroup
 }
 
-// NewGenerator creates a new thumbnail generator
-func NewGenerator(vaultDir string) *Generator {
+// NewGenerator creates a new thumbnail generator.
+// sessions and port are used to create temporary auth sessions for internal
+// FFmpeg HTTP requests against the local server's content endpoint.
+func NewGenerator(vaultDir string, sessions *session.Store, port string) *Generator {
 	g := &Generator{
 		vaultDir: vaultDir,
+		sessions: sessions,
+		port:     port,
 		jobs:     make(chan thumbJob, queueSize),
 	}
 	g.wg.Add(1)
@@ -97,6 +110,12 @@ func (g *Generator) HasThumbnail(vaultID, virtualPath string) bool {
 	return g.GetPath(vaultID, virtualPath) != ""
 }
 
+// DeleteThumbnail removes a cached thumbnail for a file if it exists.
+func (g *Generator) DeleteThumbnail(vaultID, virtualPath string) {
+	p := g.thumbPath(vaultID, virtualPath)
+	os.Remove(p) // ignore error if not exists
+}
+
 // thumbPath returns the on-disk path for a thumbnail
 func (g *Generator) thumbPath(vaultID, virtualPath string) string {
 	hash := sha256.Sum256([]byte(virtualPath))
@@ -118,39 +137,23 @@ func (g *Generator) worker() {
 	}
 }
 
-// generate creates a thumbnail for a single video file
+// generate creates a thumbnail by having FFmpeg fetch the video via the local
+// HTTP server. The server supports Range requests, so FFmpeg can seek to read
+// the moov atom (even at end of file) and extract a frame — all without any
+// plaintext ever touching disk.
 func (g *Generator) generate(job thumbJob) error {
-	vault := &crypto.Vault{
-		ID:   job.VaultID,
-		Path: job.VaultPath,
-		Keys: job.Keys,
-	}
+	keysCopy := job.Keys.Clone()
 
-	// Resolve encrypted file path
-	encPath, err := vault.GetEncryptedFilePath(job.FilePath)
+	// Create a short-lived internal session so FFmpeg can authenticate
+	sessionID, err := g.sessions.Create(job.VaultID, job.VaultPath, keysCopy)
 	if err != nil {
-		return fmt.Errorf("resolve path: %w", err)
+		return fmt.Errorf("create temp session: %w", err)
 	}
+	defer g.sessions.Delete(sessionID)
 
-	// Open encrypted file
-	file, err := os.Open(encPath)
-	if err != nil {
-		return fmt.Errorf("open file: %w", err)
-	}
-	defer file.Close()
-
-	// Read file header to get content key
-	header, err := crypto.ReadFileHeader(file, job.Keys.MasterKey)
-	if err != nil {
-		return fmt.Errorf("read header: %w", err)
-	}
-
-	// Create decrypting reader
-	reader, err := crypto.NewDecryptingReader(file, header.ContentKey, header.Nonce)
-	if err != nil {
-		return fmt.Errorf("create reader: %w", err)
-	}
-	// reader.Release() called explicitly after copy to temp file
+	// Build the internal URL for the content endpoint
+	contentURL := fmt.Sprintf("http://127.0.0.1:%s/api/vaults/%s/files/content?path=%s",
+		g.port, job.VaultID, url.QueryEscape(job.FilePath))
 
 	// Ensure thumbnail directory exists
 	outPath := g.thumbPath(job.VaultID, job.FilePath)
@@ -158,29 +161,18 @@ func (g *Generator) generate(job thumbJob) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
-	// Decrypt entire file to temp file so FFmpeg can seek (MP4 moov atom may be at EOF)
-	decryptedTmp, err := os.CreateTemp(filepath.Dir(outPath), "dec-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	decryptedPath := decryptedTmp.Name()
-	defer os.Remove(decryptedPath)
-
-	if _, err := io.CopyBuffer(decryptedTmp, reader, make([]byte, 256*1024)); err != nil {
-		decryptedTmp.Close()
-		return fmt.Errorf("decrypt to temp: %w", err)
-	}
-	decryptedTmp.Close()
-	reader.Release() // release crypto resources early
-
-	// Run FFmpeg: extract first frame from decrypted temp file
 	thumbTmp := outPath + ".tmp"
 	defer os.Remove(thumbTmp)
 
 	var stderrBuf bytes.Buffer
 	cmd := exec.Command("ffmpeg",
-		"-i", decryptedPath,
+		// Pass session cookie via HTTP headers for authentication
+		"-headers", fmt.Sprintf("Cookie: session_id=%s\r\n", sessionID),
+		// Input from local HTTP server (supports Range for seeking)
+		"-i", contentURL,
+		// Extract a single frame
 		"-frames:v", "1",
+		// Scale to thumbnail size with padding to maintain aspect ratio
 		"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black",
 			thumbWidth, thumbHeight, thumbWidth, thumbHeight),
 		"-q:v", "5",

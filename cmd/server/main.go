@@ -46,7 +46,7 @@ func main() {
 	tasks := task.NewManager(db)
 
 	// Initialize thumbnail generator
-	thumbs := thumbnail.NewGenerator(*vaultDir)
+	thumbs := thumbnail.NewGenerator(*vaultDir, sessions, *port)
 	defer thumbs.Stop()
 
 	// Wire thumbnail enqueuer into task manager (avoids circular init)

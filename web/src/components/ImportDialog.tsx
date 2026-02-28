@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { api, type DirEntry, formatSize } from '../lib/api'
+import { api, type DirEntry, formatSize, joinPath } from '../lib/api'
 import { X, Folder, File, ChevronRight, Home, ArrowLeft, FolderInput } from 'lucide-react'
 
 interface ImportDialogProps {
@@ -48,7 +48,7 @@ export default function ImportDialog({ vaultId, onClose, onStarted }: ImportDial
   }
 
   function enterDir(name: string) {
-    navigateTo(currentPath === '/' ? `/${name}` : `${currentPath}/${name}`)
+    navigateTo(joinPath(currentPath, name))
   }
 
   async function handleSubmit() {

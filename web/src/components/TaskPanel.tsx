@@ -9,9 +9,15 @@ interface TaskPanelProps {
   onRefresh?: () => void
 }
 
+interface TaskActionError {
+  taskId?: string
+  message: string
+}
+
 export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPanelProps) {
   const [tasks, setTasks] = useState<TaskRecord[]>([])
   const [loading, setLoading] = useState(true)
+  const [actionError, setActionError] = useState<TaskActionError | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const prevTasksRef = useRef<TaskRecord[]>([])
 
@@ -44,23 +50,31 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
       
       prevTasksRef.current = newTasks
       setTasks(newTasks)
-    } catch { /* empty */ } finally {
+    } catch {
+      setActionError({ message: '任务列表加载失败' })
+    } finally {
       setLoading(false)
     }
   }
 
   async function handleCancel(taskId: string) {
+    setActionError(null)
     try {
       await api.cancelTask(vaultId, taskId)
       loadTasks()
-    } catch { /* empty */ }
+    } catch (err) {
+      setActionError({ taskId, message: err instanceof Error ? err.message : '取消任务失败' })
+    }
   }
 
   async function handleDelete(taskId: string) {
+    setActionError(null)
     try {
       await api.deleteTask(vaultId, taskId)
       loadTasks()
-    } catch { /* empty */ }
+    } catch (err) {
+      setActionError({ taskId, message: err instanceof Error ? err.message : '删除任务失败' })
+    }
   }
 
   if (!open) return null
@@ -81,10 +95,13 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
             {tasks.some(t => t.status === 'done') && (
               <button
                 onClick={async () => {
+                  setActionError(null)
                   try {
                     await api.deleteCompletedTasks(vaultId)
                     loadTasks()
-                  } catch { /* empty */ }
+                  } catch (err) {
+                    setActionError({ message: err instanceof Error ? err.message : '清除已完成任务失败' })
+                  }
                 }}
                 className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-red-400 transition-colors"
               >
@@ -98,6 +115,11 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          {actionError && (
+            <p className="text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2">
+              {actionError.message}
+            </p>
+          )}
           {loading ? (
             <div className="flex items-center justify-center py-20">
               <div className="animate-spin rounded-full h-6 w-6 border-2 border-blue-500 border-t-transparent" />

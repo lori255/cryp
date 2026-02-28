@@ -58,16 +58,6 @@ func (d *DB) migrate() error {
 			updated_at INTEGER NOT NULL
 		);
 
-		CREATE TABLE IF NOT EXISTS sessions (
-			id TEXT PRIMARY KEY,
-			vault_id TEXT,
-			data BLOB,
-			expires_at INTEGER NOT NULL,
-			created_at INTEGER NOT NULL
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
-
 		CREATE TABLE IF NOT EXISTS tasks (
 			id TEXT PRIMARY KEY,
 			vault_id TEXT NOT NULL,
@@ -154,17 +144,11 @@ func (d *DB) DeleteVault(id string) error {
 	return err
 }
 
-// CleanExpiredSessions removes expired sessions
-func (d *DB) CleanExpiredSessions() error {
-	_, err := d.Exec("DELETE FROM sessions WHERE expires_at < ?", time.Now().Unix())
-	return err
-}
-
 // TaskRecord represents a background task in the database
 type TaskRecord struct {
 	ID             string `json:"id"`
 	VaultID        string `json:"vaultId"`
-	Type           string `json:"type"` // "import" or "upload"
+	Type           string `json:"type"`   // "import" or "upload"
 	Status         string `json:"status"` // "pending", "running", "done", "error", "cancelled"
 	TotalFiles     int    `json:"totalFiles"`
 	ProcessedFiles int    `json:"processedFiles"`

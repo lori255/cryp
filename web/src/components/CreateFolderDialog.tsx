@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { api } from '../lib/api'
+import { api, joinPath } from '../lib/api'
 import { X, FolderPlus } from 'lucide-react'
 
 interface CreateFolderDialogProps {
@@ -20,7 +20,7 @@ export default function CreateFolderDialog({ vaultId, currentPath, onClose, onCr
     setSubmitting(true)
     setError('')
     try {
-      const fullPath = currentPath === '/' ? `/${name}` : `${currentPath}/${name}`
+      const fullPath = joinPath(currentPath, name)
       await api.mkdir(vaultId, fullPath)
       onCreated()
       onClose()

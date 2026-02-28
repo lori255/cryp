@@ -2,11 +2,10 @@ package crypto
 
 import (
 	"crypto/rand"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
-	"runtime/debug"
 
 	"golang.org/x/sys/unix"
 )
@@ -102,6 +101,7 @@ func DropFileCache(f *os.File) {
 }
 
 // EncryptSingleFile encrypts a file from srcPath into the vault at virtualPath.
+// The output file is fsync'd before returning to ensure data durability.
 func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath string) error {
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
@@ -128,6 +128,7 @@ func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath strin
 
 	contentKey := make([]byte, MasterKeySize)
 	if _, err := rand.Read(contentKey); err != nil {
+		os.Remove(encPath)
 		return err
 	}
 
@@ -149,7 +150,15 @@ func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath strin
 	}
 
 	if err := writer.Close(); err != nil {
+		os.Remove(encPath)
 		return err
+	}
+
+	// Fsync to ensure encrypted data is durable on disk before caller
+	// may delete the source file.
+	if err := outFile.Sync(); err != nil {
+		os.Remove(encPath)
+		return fmt.Errorf("fsync encrypted file: %w", err)
 	}
 
 	DropFileCache(srcFile)
@@ -157,11 +166,11 @@ func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath strin
 	return nil
 }
 
-// ReleaseMemoryAfterLargeFile forces GC and returns memory to OS.
-// Call after processing files > 100MB.
-func ReleaseMemoryAfterLargeFile() {
-	runtime.GC()
-	debug.FreeOSMemory()
+// ReleaseMemoryAfterLargeFile is a no-op kept for API compatibility.
+// With GOMEMLIMIT set, Go's GC automatically manages memory boundaries.
+// Manual runtime.GC() causes unnecessary Stop-The-World pauses.
+	func ReleaseMemoryAfterLargeFile() {
+	// Intentionally empty — rely on Go runtime + GOMEMLIMIT
 }
 
 // DropPathCache opens a file by path and drops its page cache.

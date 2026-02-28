@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { PhotoProvider, PhotoView } from 'react-photo-view'
-import { api, type FileItem, isImage, isVideo, formatSize, formatDate } from '../lib/api'
+import { api, type FileItem, isImage, isVideo, formatSize, formatDate, joinPath } from '../lib/api'
 import { Folder, File, Film, Image, ArrowLeft, Grid3x3, List, Upload, FolderPlus, Trash2, Home, ChevronRight, Lock, Music, ListTodo, FolderInput } from 'lucide-react'
 import VideoPlayer from '../components/VideoPlayer'
 import UploadDialog from '../components/UploadDialog'
@@ -25,7 +25,6 @@ export default function FileBrowser() {
 
   const loadFiles = useCallback(async () => {
     if (!vaultId) return
-    setLoading(true)
     setLoading(true)
     setError('')
     try {
@@ -62,21 +61,24 @@ export default function FileBrowser() {
   }
 
   function openDir(name: string) {
-    const newPath = currentPath === '/' ? `/${name}` : `${currentPath}/${name}`
+    const newPath = joinPath(currentPath, name)
     navigateTo(newPath)
   }
 
   function getFilePath(name: string) {
-    return currentPath === '/' ? `/${name}` : `${currentPath}/${name}`
+    return joinPath(currentPath, name)
   }
 
   async function handleDelete(file: FileItem) {
     if (!vaultId) return
     if (!confirm(`确定要删除 "${file.name}" 吗？`)) return
+    setError('')
     try {
       await api.deleteFile(vaultId, getFilePath(file.name))
       loadFiles()
-    } catch { /* empty */ }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '删除失败')
+    }
   }
 
   // Breadcrumb
@@ -233,7 +235,7 @@ function FileGridItem({ file, vaultId, currentPath, onOpenDir, onPlayVideo, onDe
   onPlayVideo: (url: string, title: string) => void
   onDelete: (file: FileItem) => void
 }) {
-  const filePath = currentPath === '/' ? `/${file.name}` : `${currentPath}/${file.name}`
+  const filePath = joinPath(currentPath, file.name)
 
   if (file.isDir) {
     return (
@@ -320,7 +322,7 @@ function FileListItem({ file, vaultId, currentPath, onOpenDir, onPlayVideo, onDe
   onPlayVideo: (url: string, title: string) => void
   onDelete: (file: FileItem) => void
 }) {
-  const filePath = currentPath === '/' ? `/${file.name}` : `${currentPath}/${file.name}`
+  const filePath = joinPath(currentPath, file.name)
 
   function handleClick() {
     if (file.isDir) {

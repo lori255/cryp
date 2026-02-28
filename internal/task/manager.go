@@ -224,13 +224,19 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 
 			info, _ := entry.Info()
 			if err := crypto.EncryptSingleFile(vault, keys, entryPath, virtualPath); err != nil {
+				// On failure (including cancellation), clean up the partially
+				// written encrypted file to avoid leaving corrupted data.
+				if encPath, resolveErr := vault.GetEncryptedFilePath(virtualPath); resolveErr == nil {
+					os.Remove(encPath)
+				}
 				return fmt.Errorf("encrypt %s: %w", virtualPath, err)
 			}
 
 			// Drop page cache for source file immediately after encryption.
 			crypto.DropPathCache(entryPath)
 
-			// Delete source file immediately after successful encryption
+			// Delete source file only after encryption is fully synced to disk.
+			// EncryptSingleFile now fsync's before returning, so this is safe.
 			if t.DeleteSource {
 				_ = os.Remove(entryPath)
 			}
@@ -242,9 +248,6 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			t.ProcessedFiles++
 			if info != nil {
 				t.ProcessedBytes += info.Size()
-				if info.Size() > 100*1024*1024 {
-					crypto.ReleaseMemoryAfterLargeFile()
-				}
 			}
 			_ = m.db.UpdateTask(t)
 		}
@@ -271,11 +274,13 @@ func countFiles(dir string) (int, int64, error) {
 	return count, totalBytes, err
 }
 
-// GenerateID generates a random hex ID
-func GenerateID() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
+// GenerateID generates a random hex ID (128-bit entropy)
+func GenerateID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate id: %w", err)
+	}
+	return fmt.Sprintf("%x", b), nil
 }
 
 // removeEmptyDirs walks bottom-up and removes empty directories.

@@ -1,13 +1,5 @@
 const API_BASE = '/api';
 
-export interface VaultRecord {
-  id: string;
-  name: string;
-  path: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
 export interface FileItem {
   name: string;
   isDir: boolean;
@@ -61,6 +53,7 @@ class ApiClient {
 
     const res = await fetch(`${API_BASE}${path}`, {
       ...options,
+      credentials: 'include',
       headers: { ...headers, ...(options?.headers as Record<string, string>) },
     });
 
@@ -94,10 +87,6 @@ class ApiClient {
     );
   }
 
-  async listVaults() {
-    return this.request<{ vaults: VaultRecord[] }>('/vaults');
-  }
-
   async createVault(name: string, password: string) {
     const data = await this.request<{ id: string; name: string; sessionId: string }>(
       '/vaults',
@@ -119,11 +108,11 @@ class ApiClient {
   }
 
   getContentUrl(vaultId: string, path: string): string {
-    return `${API_BASE}/vaults/${vaultId}/files/content?path=${encodeURIComponent(path)}&sid=${this.sessionId || ''}`;
+    return `${API_BASE}/vaults/${vaultId}/files/content?path=${encodeURIComponent(path)}`;
   }
 
   getThumbnailUrl(vaultId: string, path: string): string {
-    return `${API_BASE}/vaults/${vaultId}/thumbnail?path=${encodeURIComponent(path)}&sid=${this.sessionId || ''}`;
+    return `${API_BASE}/vaults/${vaultId}/thumbnail?path=${encodeURIComponent(path)}`;
   }
 
   uploadFile(
@@ -161,6 +150,7 @@ class ApiClient {
         url += `&taskId=${taskId}&fileIndex=${fileIndex ?? 0}&totalFiles=${totalFiles ?? 1}`;
       }
       xhr.open('POST', url);
+      xhr.withCredentials = true;
       if (this.sessionId) {
         xhr.setRequestHeader('X-Session-ID', this.sessionId);
       }
@@ -242,6 +232,11 @@ export const isVideo = (name: string): boolean =>
 
 export const isAudio = (name: string): boolean =>
   /\.(mp3|wav|ogg|flac|aac|m4a|wma)$/i.test(name);
+
+export function joinPath(parent: string, name: string): string {
+  if (parent === '/') return `/${name}`;
+  return `${parent}/${name}`;
+}
 
 export function formatSize(bytes: number): string {
   if (bytes === 0) return '0 B';
