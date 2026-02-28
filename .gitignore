@@ -13,3 +13,4 @@ cmd/server/web/
 core
 *.prof
 *.pprof
+.ace-tool/
