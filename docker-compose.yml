@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  cryp:
+    build: .
+    container_name: cryp
+    ports:
+      - "9527:9527"
+    volumes:
+      - /vol3/1000/downloads/cryp:/data
+    environment:
+      - PORT=9527
+      - DATA_DIR=/data/config
+      - VAULT_DIR=/data/vaults
+      - GOMEMLIMIT=256MiB
+    restart: unless-stopped

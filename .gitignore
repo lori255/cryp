@@ -1,0 +1,15 @@
+node_modules/
+dist/
+web/node_modules/
+web/dist/
+cmd/server/web/
+*.exe
+*.test
+*.out
+.env
+/data/
+/server
+/cryp
+core
+*.prof
+*.pprof
