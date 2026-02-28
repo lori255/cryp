@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { api, type DirEntry, formatSize, joinPath } from '../lib/api'
-import { X, Folder, File, ChevronRight, Home, ArrowLeft, FolderInput } from 'lucide-react'
+import { X, Folder, File, ArrowLeft, FolderInput } from 'lucide-react'
 
+import Breadcrumbs from './Breadcrumbs'
 interface ImportDialogProps {
   vaultId: string
   onClose: () => void
@@ -64,10 +65,8 @@ export default function ImportDialog({ vaultId, onClose, onStarted }: ImportDial
     }
   }
 
-  const pathParts = currentPath.split('/').filter(Boolean)
   const dirCount = items.filter(i => i.isDir).length
   const fileCount = items.filter(i => !i.isDir).length
-
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-2 sm:p-4" onClick={onClose}>
       <div
@@ -86,21 +85,8 @@ export default function ImportDialog({ vaultId, onClose, onStarted }: ImportDial
         </div>
 
         {/* Breadcrumb */}
-        <div className="px-4 py-2 border-b border-gray-800/50 flex items-center gap-1 text-sm overflow-x-auto flex-shrink-0">
-          <button onClick={() => navigateTo('/data')} className="text-gray-400 hover:text-white flex-shrink-0">
-            <Home className="w-4 h-4" />
-          </button>
-          {pathParts.map((part, i) => (
-            <span key={i} className="flex items-center gap-1 flex-shrink-0">
-              <ChevronRight className="w-3 h-3 text-gray-600" />
-              <button
-                onClick={() => navigateTo('/' + pathParts.slice(0, i + 1).join('/'))}
-                className={`hover:text-white transition-colors ${i === pathParts.length - 1 ? 'text-white font-medium' : 'text-gray-400'}`}
-              >
-                {part}
-              </button>
-            </span>
-          ))}
+        <div className="px-4 py-2 border-b border-gray-800/50 flex-shrink-0">
+          <Breadcrumbs path={currentPath} onNavigate={navigateTo} rootPath="/data" />
         </div>
 
         {/* Directory listing */}

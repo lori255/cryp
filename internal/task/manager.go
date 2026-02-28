@@ -6,12 +6,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"cryp/internal/crypto"
 	"cryp/internal/storage"
+	"cryp/internal/thumbnail"
 )
 
 // ThumbEnqueuer is called after each file is encrypted to generate thumbnails
@@ -242,7 +242,7 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			}
 
 			// Enqueue video thumbnail generation
-			if m.thumbs != nil && isVideoFile(entry.Name()) {
+			if m.thumbs != nil && thumbnail.IsVideo(entry.Name()) {
 				m.thumbs.Enqueue(vault.ID, vault.Path, keys, virtualPath)
 			}
 			t.ProcessedFiles++
@@ -302,12 +302,3 @@ func removeEmptyDirs(root string) {
 	}
 }
 
-var videoExts = map[string]bool{
-	".mp4": true, ".webm": true, ".mkv": true, ".avi": true,
-	".mov": true, ".m4v": true, ".flv": true, ".wmv": true,
-}
-
-func isVideoFile(name string) bool {
-	ext := strings.ToLower(filepath.Ext(name))
-	return videoExts[ext]
-}
