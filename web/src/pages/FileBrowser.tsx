@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { PhotoProvider, PhotoView } from 'react-photo-view'
 import { api, type FileItem, isImage, isVideo, formatSize, formatDate } from '../lib/api'
+import { getCachedThumb, setCachedThumb, enqueueThumbGeneration, clearThumbQueue } from '../lib/thumbcache'
 import { Folder, File, Film, Image, ArrowLeft, Grid3x3, List, Upload, FolderPlus, Trash2, Home, ChevronRight, Lock, Music, ListTodo, FolderInput } from 'lucide-react'
 import VideoPlayer from '../components/VideoPlayer'
 import UploadDialog from '../components/UploadDialog'
@@ -25,6 +26,7 @@ export default function FileBrowser() {
 
   const loadFiles = useCallback(async () => {
     if (!vaultId) return
+    clearThumbQueue() // Cancel pending thumbnail generation from previous directory
     setLoading(true)
     setError('')
     try {
@@ -212,70 +214,66 @@ export default function FileBrowser() {
   )
 }
 
-// --- Video Thumbnail ---
-function VideoThumbnail({ src, alt }: { src: string; alt: string }) {
+
+// --- Lazy Thumbnail (image + video, with IntersectionObserver + concurrency queue) ---
+function Thumbnail({ src, alt, type }: { src: string; alt: string; type: 'image' | 'video' }) {
   const [thumb, setThumb] = useState<string | null>(null)
-  const [failed, setFailed] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const startedRef = useRef(false)
 
   useEffect(() => {
-    if (failed) return
-    const video = document.createElement('video')
-    // Don't set crossOrigin for same-origin requests — iOS Safari blocks canvas
-    // with crossOrigin='anonymous' even when CORS headers are present
-    video.preload = 'auto'
-    video.muted = true
-    // Required for iOS Safari: without playsinline, iOS won't load video in background
-    video.setAttribute('playsinline', '')
-    video.setAttribute('webkit-playsinline', '')
+    const el = containerRef.current
+    if (!el) return
+    startedRef.current = false
+    setThumb(null)
+    setLoading(false)
 
-    let cancelled = false
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry.isIntersecting || startedRef.current) return
+        startedRef.current = true
+        setLoading(true)
 
-    const cleanup = () => {
-      cancelled = true
-      video.removeAttribute('src')
-      video.load()
-    }
+        // Check cache first
+        getCachedThumb(src).then((cached) => {
+          if (cached) {
+            setThumb(cached)
+            setLoading(false)
+            return
+          }
+          // Enqueue generation (concurrency limited)
+          enqueueThumbGeneration(src, type).then((dataUrl) => {
+            if (dataUrl) {
+              setThumb(dataUrl)
+              setCachedThumb(src, dataUrl)
+            }
+            setLoading(false)
+          })
+        })
+      },
+      { rootMargin: '200px' } // Start loading 200px before entering viewport
+    )
 
-    video.addEventListener('loadeddata', () => {
-      if (cancelled) return
-      // On iOS, seeking to 0 is more reliable than seeking to 1
-      video.currentTime = Math.min(1, video.duration || 1)
-    })
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [src, type])
 
-    video.addEventListener('seeked', () => {
-      if (cancelled) return
-      try {
-        const canvas = document.createElement('canvas')
-        canvas.width = video.videoWidth || 320
-        canvas.height = video.videoHeight || 180
-        const ctx = canvas.getContext('2d')
-        if (ctx) {
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-          setThumb(canvas.toDataURL('image/jpeg', 0.7))
-        }
-      } catch {
-        setFailed(true)
-      }
-      cleanup()
-    })
+  const fallback = type === 'video'
+    ? <Film className="w-10 h-10 text-purple-500" />
+    : <Image className="w-10 h-10 text-blue-500" />
 
-    video.addEventListener('error', () => {
-      setFailed(true)
-      cleanup()
-    })
-
-    // iOS needs a brief delay before setting src for programmatic video loading
-    video.src = src
-    // Explicitly call load() — iOS Safari won't auto-load without it
-    video.load()
-    return cleanup
-  }, [src, failed])
-
-  if (thumb) {
-    return <img src={thumb} alt={alt} className="w-full h-full object-cover" />
-  }
-
-  return <Film className="w-10 h-10 text-purple-500" />
+  return (
+    <div ref={containerRef} className="w-full h-full flex items-center justify-center">
+      {thumb ? (
+        <img src={thumb} alt={alt} className="w-full h-full object-cover" />
+      ) : loading ? (
+        <div className="animate-pulse bg-gray-700 w-full h-full" />
+      ) : (
+        fallback
+      )}
+    </div>
+  )
 }
 
 // --- Grid Item ---
@@ -310,7 +308,7 @@ function FileGridItem({ file, vaultId, currentPath, onOpenDir, onPlayVideo, onDe
         <PhotoView src={contentUrl}>
           <div className="bg-gray-900 border border-gray-800 hover:border-gray-700 rounded-xl overflow-hidden cursor-pointer transition-all">
             <div className="aspect-square bg-gray-800">
-              <img src={contentUrl} alt={file.name} className="w-full h-full object-cover" loading="lazy" />
+              <Thumbnail src={contentUrl} alt={file.name} type="image" />
             </div>
             <div className="p-2">
               <p className="text-xs text-gray-400 truncate">{file.name}</p>
@@ -332,7 +330,7 @@ function FileGridItem({ file, vaultId, currentPath, onOpenDir, onPlayVideo, onDe
         <button onClick={() => onPlayVideo(contentUrl, file.name)}
           className="w-full bg-gray-900 border border-gray-800 hover:border-gray-700 rounded-xl overflow-hidden transition-all text-center">
           <div className="aspect-video bg-gray-800 flex items-center justify-center">
-            <VideoThumbnail src={contentUrl} alt={file.name} />
+            <Thumbnail src={contentUrl} alt={file.name} type="video" />
           </div>
           <div className="p-2">
             <p className="text-xs text-gray-400 truncate">{file.name}</p>
