@@ -1,8 +1,7 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { PhotoProvider, PhotoView } from 'react-photo-view'
 import { api, type FileItem, isImage, isVideo, formatSize, formatDate } from '../lib/api'
-import { getCachedThumb, setCachedThumb, enqueueThumbGeneration, clearThumbQueue } from '../lib/thumbcache'
 import { Folder, File, Film, Image, ArrowLeft, Grid3x3, List, Upload, FolderPlus, Trash2, Home, ChevronRight, Lock, Music, ListTodo, FolderInput } from 'lucide-react'
 import VideoPlayer from '../components/VideoPlayer'
 import UploadDialog from '../components/UploadDialog'
@@ -26,7 +25,7 @@ export default function FileBrowser() {
 
   const loadFiles = useCallback(async () => {
     if (!vaultId) return
-    clearThumbQueue() // Cancel pending thumbnail generation from previous directory
+    setLoading(true)
     setLoading(true)
     setError('')
     try {
@@ -51,6 +50,7 @@ export default function FileBrowser() {
   useEffect(() => { loadFiles() }, [loadFiles])
 
   function navigateTo(path: string) {
+    setFiles([])
     setCurrentPath(path)
   }
 
@@ -215,66 +215,14 @@ export default function FileBrowser() {
 }
 
 
-// --- Lazy Thumbnail (image + video, with IntersectionObserver + concurrency queue) ---
-function Thumbnail({ src, alt, type }: { src: string; alt: string; type: 'image' | 'video' }) {
-  const [thumb, setThumb] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  const containerRef = useRef<HTMLDivElement>(null)
-  const startedRef = useRef(false)
 
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
-    startedRef.current = false
-    setThumb(null)
-    setLoading(false)
-
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (!entry.isIntersecting || startedRef.current) return
-        startedRef.current = true
-        setLoading(true)
-
-        // Check cache first
-        getCachedThumb(src).then((cached) => {
-          if (cached) {
-            setThumb(cached)
-            setLoading(false)
-            return
-          }
-          // Enqueue generation (concurrency limited)
-          enqueueThumbGeneration(src, type).then((dataUrl) => {
-            if (dataUrl) {
-              setThumb(dataUrl)
-              setCachedThumb(src, dataUrl)
-            }
-            setLoading(false)
-          })
-        })
-      },
-      { rootMargin: '200px' } // Start loading 200px before entering viewport
-    )
-
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [src, type])
-
-  const fallback = type === 'video'
-    ? <Film className="w-10 h-10 text-purple-500" />
-    : <Image className="w-10 h-10 text-blue-500" />
-
-  return (
-    <div ref={containerRef} className="w-full h-full flex items-center justify-center">
-      {thumb ? (
-        <img src={thumb} alt={alt} className="w-full h-full object-cover" />
-      ) : loading ? (
-        <div className="animate-pulse bg-gray-700 w-full h-full" />
-      ) : (
-        fallback
-      )}
-    </div>
-  )
+// --- Video Thumbnail with server-side fallback ---
+function VideoThumb({ src, alt }: { src: string; alt: string }) {
+  const [err, setErr] = useState(false)
+  if (err) return <Film className="w-10 h-10 text-purple-500" />
+  return <img src={src} alt={alt} className="w-full h-full object-cover" onError={() => setErr(true)} />
 }
+
 
 // --- Grid Item ---
 function FileGridItem({ file, vaultId, currentPath, onOpenDir, onPlayVideo, onDelete }: {
@@ -308,7 +256,7 @@ function FileGridItem({ file, vaultId, currentPath, onOpenDir, onPlayVideo, onDe
         <PhotoView src={contentUrl}>
           <div className="bg-gray-900 border border-gray-800 hover:border-gray-700 rounded-xl overflow-hidden cursor-pointer transition-all">
             <div className="aspect-square bg-gray-800">
-              <Thumbnail src={contentUrl} alt={file.name} type="image" />
+              <img src={contentUrl} alt={file.name} className="w-full h-full object-cover" loading="lazy" />
             </div>
             <div className="p-2">
               <p className="text-xs text-gray-400 truncate">{file.name}</p>
@@ -325,12 +273,13 @@ function FileGridItem({ file, vaultId, currentPath, onOpenDir, onPlayVideo, onDe
 
   if (isVideo(file.name)) {
     const contentUrl = api.getContentUrl(vaultId, filePath)
+    const thumbUrl = file.hasThumb ? api.getThumbnailUrl(vaultId, filePath) : ''
     return (
       <div className="relative group">
         <button onClick={() => onPlayVideo(contentUrl, file.name)}
           className="w-full bg-gray-900 border border-gray-800 hover:border-gray-700 rounded-xl overflow-hidden transition-all text-center">
           <div className="aspect-video bg-gray-800 flex items-center justify-center">
-            <Thumbnail src={contentUrl} alt={file.name} type="video" />
+            {thumbUrl ? <VideoThumb src={thumbUrl} alt={file.name} /> : <Film className="w-10 h-10 text-purple-500" />}
           </div>
           <div className="p-2">
             <p className="text-xs text-gray-400 truncate">{file.name}</p>

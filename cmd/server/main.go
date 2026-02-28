@@ -10,6 +10,7 @@ import (
 	"cryp/internal/session"
 	"cryp/internal/storage"
 	"cryp/internal/task"
+	"cryp/internal/thumbnail"
 
 	"github.com/gin-gonic/gin"
 )
@@ -43,6 +44,14 @@ func main() {
 
 	// Initialize task manager
 	tasks := task.NewManager(db)
+
+	// Initialize thumbnail generator
+	thumbs := thumbnail.NewGenerator(*vaultDir)
+	defer thumbs.Stop()
+
+	// Wire thumbnail enqueuer into task manager (avoids circular init)
+	tasks.SetThumbEnqueuer(thumbs)
+
 	// Create vault directory
 	if err := os.MkdirAll(*vaultDir, 0700); err != nil {
 		log.Fatalf("Failed to create vault directory: %v", err)
@@ -56,7 +65,7 @@ func main() {
 
 	// Setup API server
 	gin.SetMode(gin.ReleaseMode)
-	server := api.NewServer(db, sessions, tasks, *vaultDir, staticFS)
+	server := api.NewServer(db, sessions, tasks, thumbs, *vaultDir, staticFS)
 	router := server.SetupRouter()
 
 	log.Printf("Cryp server starting on :%s", *port)

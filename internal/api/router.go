@@ -8,6 +8,7 @@ import (
 	"cryp/internal/session"
 	"cryp/internal/storage"
 	"cryp/internal/task"
+	"cryp/internal/thumbnail"
 
 	"github.com/gin-gonic/gin"
 )
@@ -17,15 +18,17 @@ type Server struct {
 	db        *storage.DB
 	sessions  *session.Store
 	tasks     *task.Manager
+	thumbs    *thumbnail.Generator
 	vaultDir  string
 	staticFS  fs.FS
 }
 
-func NewServer(db *storage.DB, sessions *session.Store, tasks *task.Manager, vaultDir string, staticFS fs.FS) *Server {
+func NewServer(db *storage.DB, sessions *session.Store, tasks *task.Manager, thumbs *thumbnail.Generator, vaultDir string, staticFS fs.FS) *Server {
 	return &Server{
 		db:       db,
 		sessions: sessions,
 		tasks:    tasks,
+		thumbs:   thumbs,
 		vaultDir: vaultDir,
 		staticFS: staticFS,
 	}

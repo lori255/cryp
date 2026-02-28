@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,11 +14,17 @@ import (
 	"cryp/internal/storage"
 )
 
+// ThumbEnqueuer is called after each file is encrypted to generate thumbnails
+type ThumbEnqueuer interface {
+	Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, virtualPath string)
+}
+
 // Manager handles background task execution
 type Manager struct {
 	db      *storage.DB
 	mu      sync.RWMutex
 	running map[string]chan struct{} // taskID -> cancel channel
+	thumbs  ThumbEnqueuer
 }
 
 // NewManager creates a new task manager and recovers interrupted tasks
@@ -29,6 +36,11 @@ func NewManager(db *storage.DB) *Manager {
 	// Mark previously running tasks as interrupted
 	m.recoverTasks()
 	return m
+}
+
+// SetThumbEnqueuer sets the thumbnail enqueuer (avoids circular init)
+func (m *Manager) SetThumbEnqueuer(t ThumbEnqueuer) {
+	m.thumbs = t
 }
 
 // recoverTasks marks any tasks that were "running" when server restarted as "error"
@@ -223,6 +235,10 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 				_ = os.Remove(entryPath)
 			}
 
+			// Enqueue video thumbnail generation
+			if m.thumbs != nil && isVideoFile(entry.Name()) {
+				m.thumbs.Enqueue(vault.ID, vault.Path, keys, virtualPath)
+			}
 			t.ProcessedFiles++
 			if info != nil {
 				t.ProcessedBytes += info.Size()
@@ -279,4 +295,14 @@ func removeEmptyDirs(root string) {
 	for i := len(dirs) - 1; i >= 0; i-- {
 		os.Remove(dirs[i])
 	}
+}
+
+var videoExts = map[string]bool{
+	".mp4": true, ".webm": true, ".mkv": true, ".avi": true,
+	".mov": true, ".m4v": true, ".flv": true, ".wmv": true,
+}
+
+func isVideoFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return videoExts[ext]
 }

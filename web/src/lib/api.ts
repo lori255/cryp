@@ -13,6 +13,7 @@ export interface FileItem {
   isDir: boolean;
   size: number;
   modTime: number;
+  hasThumb?: boolean;
 }
 
 export interface TaskRecord {

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"cryp/internal/crypto"
+	"cryp/internal/thumbnail"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/sys/unix"
@@ -38,9 +39,37 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		files = []crypto.FileInfo{}
 	}
 
+	// Build response with thumbnail availability
+	type fileResp struct {
+		Name         string `json:"name"`
+		IsDir        bool   `json:"isDir"`
+		Size         int64  `json:"size,omitempty"`
+		ModTime      int64  `json:"modTime,omitempty"`
+		HasThumb     bool   `json:"hasThumb,omitempty"`
+	}
+
+	result := make([]fileResp, len(files))
+	for i, f := range files {
+		fullPath := path
+		if fullPath == "/" {
+			fullPath = "/" + f.Name
+		} else {
+			fullPath = path + "/" + f.Name
+		}
+		result[i] = fileResp{
+			Name:    f.Name,
+			IsDir:   f.IsDir,
+			Size:    f.Size,
+			ModTime: f.ModTime,
+		}
+		if !f.IsDir && s.thumbs != nil && s.thumbs.HasThumbnail(sess.VaultID, fullPath) {
+			result[i].HasThumb = true
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"path":  path,
-		"files": files,
+		"files": result,
 	})
 }
 
@@ -327,6 +356,10 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 		}
 	}
 
+	// Enqueue video thumbnail generation
+	if s.thumbs != nil && thumbnail.IsVideo(fileName) {
+		s.thumbs.Enqueue(sess.VaultID, sess.VaultPath, sess.Keys, virtualPath)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"message":  "file uploaded",
 		"path":     virtualPath,
@@ -411,9 +444,25 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 }
 
 func (s *Server) handleThumbnail(c *gin.Context) {
-	// For thumbnails, we decrypt the file and let the browser handle display
-	// In production, you'd generate actual thumbnails with image resizing
-	s.handleFileContent(c)
+	sess := getSession(c)
+	path := c.Query("path")
+	if path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path required"})
+		return
+	}
+
+	thumbPath := s.thumbs.GetPath(sess.VaultID, path)
+	if thumbPath == "" {
+		// Thumbnail not yet generated — trigger async generation and return 404
+		if s.thumbs != nil {
+			s.thumbs.Enqueue(sess.VaultID, sess.VaultPath, sess.Keys, path)
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "thumbnail not ready"})
+		return
+	}
+
+	c.Header("Cache-Control", "public, max-age=86400")
+	c.File(thumbPath)
 }
 
 func getContentType(ext string) string {
