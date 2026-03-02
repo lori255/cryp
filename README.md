@@ -39,7 +39,8 @@
 ```bash
 git clone https://github.com/lori255/cryp.git
 cd cryp
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 访问 `http://localhost:9527`
@@ -49,14 +50,25 @@ docker compose up -d --build
 ```yaml
 services:
   cryp:
-    build: .
+    image: lori255/cryp:latest
     container_name: cryp
     ports:
       - "9527:9527"
     volumes:
       - /your/data/path:/data
+    # Optional GPU acceleration for thumbnail generation (Linux VAAPI)
+    # Enable only when host has /dev/dri/renderD128 and proper VAAPI driver stack.
+    # devices:
+    #   - /dev/dri/renderD128:/dev/dri/renderD128
+    # group_add:
+    #   - "105" # render device group GID on host (adjust to your host)
     environment:
+      - PORT=9527
+      - DATA_DIR=/data/config
+      - VAULT_DIR=/data/vaults
       - GOMEMLIMIT=256MiB
+      # Optional: thumbnail hardware acceleration strategy (auto/vaapi/qsv/cuda/cpu)
+      # - CRYP_FFMPEG_HWACCEL=auto
     restart: unless-stopped
 ```
 
