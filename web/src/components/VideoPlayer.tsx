@@ -23,7 +23,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       volume: 0.7,
       isLive: false,
       muted: false,
-      autoplay: true,
+      autoplay: false,
       pip: !isIOS,
       autoSize: true,
       autoMini: false,
@@ -53,14 +53,59 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     if (videoEl) {
       videoEl.setAttribute('playsinline', '')
       videoEl.setAttribute('webkit-playsinline', '')
+
+      let primedInitialSeek = false
+      const primeInitialSeek = () => {
+        if (primedInitialSeek || videoEl.currentTime > 0) {
+          primedInitialSeek = true
+          return
+        }
+
+        const applyNudge = () => {
+          if (primedInitialSeek || videoEl.currentTime > 0) {
+            primedInitialSeek = true
+            return
+          }
+          if (videoEl.readyState < HTMLMediaElement.HAVE_METADATA) {
+            return
+          }
+
+          const duration = Number.isFinite(videoEl.duration) ? videoEl.duration : 0
+          const targetTime = duration > 0 ? Math.min(0.001, duration) : 0.001
+          videoEl.currentTime = targetTime
+          primedInitialSeek = true
+        }
+
+        if (videoEl.readyState >= HTMLMediaElement.HAVE_METADATA) {
+          applyNudge()
+          return
+        }
+
+        videoEl.addEventListener('loadedmetadata', applyNudge, { once: true })
+      }
+
+      const onPlaying = () => {
+        primedInitialSeek = true
+      }
+
+      videoEl.addEventListener('play', primeInitialSeek)
+      videoEl.addEventListener('playing', onPlaying)
+
+      art.on('destroy', () => {
+        videoEl.removeEventListener('play', primeInitialSeek)
+        videoEl.removeEventListener('playing', onPlaying)
+      })
     }
 
     // On iOS PWA, native fullscreen API doesn't work.
     // Override fullscreen button to use webkitEnterFullscreen on the <video> element
     if (isIOS) {
       art.on('fullscreen', (state) => {
-        if (state && videoEl && 'webkitEnterFullscreen' in videoEl) {
-          ;(videoEl as any).webkitEnterFullscreen()
+        const iosVideo = videoEl as HTMLVideoElement & {
+          webkitEnterFullscreen?: () => void
+        }
+        if (state && iosVideo?.webkitEnterFullscreen) {
+          iosVideo.webkitEnterFullscreen()
         }
       })
     }
@@ -74,6 +119,28 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       }
     }
   }, [url])
+
+  useEffect(() => {
+    const { style } = document.body
+    const previousOverflow = style.overflow
+    const previousPosition = style.position
+    const previousTop = style.top
+    const previousWidth = style.width
+    const scrollY = window.scrollY
+
+    style.overflow = 'hidden'
+    style.position = 'fixed'
+    style.top = `-${scrollY}px`
+    style.width = '100%'
+
+    return () => {
+      style.overflow = previousOverflow
+      style.position = previousPosition
+      style.top = previousTop
+      style.width = previousWidth
+      window.scrollTo(0, scrollY)
+    }
+  }, [])
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
