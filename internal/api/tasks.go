@@ -135,11 +135,16 @@ func (s *Server) handleListTasks(c *gin.Context) {
 
 // handleGetTask returns a single task's status
 func (s *Server) handleGetTask(c *gin.Context) {
+	sess := getSession(c)
 	taskID := c.Param("taskId")
 
 	t, err := s.db.GetTask(taskID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		return
+	}
+	if t.VaultID != sess.VaultID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "task not for this vault"})
 		return
 	}
 
@@ -148,17 +153,22 @@ func (s *Server) handleGetTask(c *gin.Context) {
 
 // handleCancelTask cancels a running task
 func (s *Server) handleCancelTask(c *gin.Context) {
+	sess := getSession(c)
 	taskID := c.Param("taskId")
+	t, err := s.db.GetTask(taskID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		return
+	}
+	if t.VaultID != sess.VaultID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "task not for this vault"})
+		return
+	}
 
 	if s.tasks.CancelTask(taskID) {
 		c.JSON(http.StatusOK, gin.H{"message": "task cancelled"})
 	} else {
 		// Task might not be running, try to update status anyway
-		t, err := s.db.GetTask(taskID)
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
-			return
-		}
 		if t.Status == "running" || t.Status == "pending" {
 			t.Status = "cancelled"
 			_ = s.db.UpdateTask(t)
@@ -171,11 +181,16 @@ func (s *Server) handleCancelTask(c *gin.Context) {
 
 // handleDeleteTask deletes a completed/failed task record
 func (s *Server) handleDeleteTask(c *gin.Context) {
+	sess := getSession(c)
 	taskID := c.Param("taskId")
 
 	t, err := s.db.GetTask(taskID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		return
+	}
+	if t.VaultID != sess.VaultID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "task not for this vault"})
 		return
 	}
 

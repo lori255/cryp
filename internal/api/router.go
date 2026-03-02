@@ -69,8 +69,10 @@ func (s *Server) SetupRouter() *gin.Engine {
 		// Vault management - no session required (manages vault lifecycle)
 		api.POST("/vaults", s.handleCreateVault)
 		api.GET("/vaults", s.handleListVaults)
-		// Directory browsing (requires session for security)
-		api.GET("/browse-dir", s.handleBrowseDir)
+		authOps := api.Group("")
+		authOps.Use(s.authMiddleware())
+		authOps.GET("/browse-dir", s.handleBrowseDir)
+
 		// Vault operations - session required
 		vaultOps := api.Group("/vaults/:id")
 		vaultOps.Use(s.authMiddleware())
