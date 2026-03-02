@@ -3,6 +3,7 @@ package api
 import (
 	"io/fs"
 	"net/http"
+	"os"
 	"strings"
 
 	"cryp/internal/session"
@@ -22,6 +23,7 @@ type Server struct {
 	vaultDir  string
 	staticFS  fs.FS
 	scryptSem chan struct{} // limits concurrent scrypt derivations to prevent OOM
+	corsAllow map[string]struct{}
 }
 
 func NewServer(db *storage.DB, sessions *session.Store, tasks *task.Manager, thumbs *thumbnail.Generator, vaultDir string, staticFS fs.FS) *Server {
@@ -33,7 +35,25 @@ func NewServer(db *storage.DB, sessions *session.Store, tasks *task.Manager, thu
 		vaultDir:  vaultDir,
 		staticFS:  staticFS,
 		scryptSem: make(chan struct{}, 2), // max 2 concurrent scrypt ops (~64MB peak)
+		corsAllow: parseAllowedOrigins(os.Getenv("CRYP_ALLOWED_ORIGINS")),
 	}
+}
+
+func parseAllowedOrigins(raw string) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, p := range strings.Split(raw, ",") {
+		v := strings.TrimSpace(p)
+		if v == "" {
+			continue
+		}
+		out[v] = struct{}{}
+	}
+	return out
+}
+
+func (s *Server) isAllowedOrigin(origin string) bool {
+	_, ok := s.corsAllow[origin]
+	return ok
 }
 
 // SetupRouter configures all routes
@@ -45,8 +65,14 @@ func (s *Server) SetupRouter() *gin.Engine {
 	r.Use(func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
 		if origin != "" {
-			c.Header("Access-Control-Allow-Origin", origin)
-			c.Header("Access-Control-Allow-Credentials", "true")
+			if s.isAllowedOrigin(origin) {
+				c.Header("Access-Control-Allow-Origin", origin)
+				c.Header("Access-Control-Allow-Credentials", "true")
+				c.Header("Vary", "Origin")
+			} else if c.Request.Method == "OPTIONS" {
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
 		}
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-ID")
