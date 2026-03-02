@@ -1,5 +1,6 @@
 import { PhotoView } from 'react-photo-view'
 import { api, type FileItem, isImage, isVideo, formatSize, formatDate, joinPath } from '../lib/api'
+import { useImagePreviewSrc } from '../lib/useImagePreviewSrc'
 import { Folder, File, Film, Image, Trash2 } from 'lucide-react'
 
 export default function FileListItem({ file, vaultId, currentPath, onOpenDir, onPlayVideo, onDelete }: {
@@ -11,12 +12,14 @@ export default function FileListItem({ file, vaultId, currentPath, onOpenDir, on
   onDelete: (file: FileItem) => void
 }) {
   const filePath = joinPath(currentPath, file.name)
+  const contentUrl = api.getContentUrl(vaultId, filePath)
+  const { src: previewUrl } = useImagePreviewSrc(file.name, contentUrl)
 
   function handleClick() {
     if (file.isDir) {
       onOpenDir(file.name)
     } else if (isVideo(file.name)) {
-      onPlayVideo(api.getContentUrl(vaultId, filePath), file.name)
+      onPlayVideo(contentUrl, file.name)
     }
   }
 
@@ -44,8 +47,7 @@ export default function FileListItem({ file, vaultId, currentPath, onOpenDir, on
   )
 
   if (isImage(file.name)) {
-    const contentUrl = api.getContentUrl(vaultId, filePath)
-    return <PhotoView src={contentUrl}>{row}</PhotoView>
+    return <PhotoView src={previewUrl}>{row}</PhotoView>
   }
 
   return row

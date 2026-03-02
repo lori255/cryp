@@ -225,7 +225,7 @@ class ApiClient {
 export const api = new ApiClient();
 
 export const isImage = (name: string): boolean =>
-  /\.(jpg|jpeg|png|gif|webp|bmp|svg|ico|avif)$/i.test(name);
+  /\.(jpg|jpeg|png|gif|webp|bmp|svg|ico|avif|heic|heif)$/i.test(name);
 
 export const isVideo = (name: string): boolean =>
   /\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/i.test(name);

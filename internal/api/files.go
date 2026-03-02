@@ -487,6 +487,8 @@ func getContentType(ext string) string {
 		".png":  "image/png",
 		".gif":  "image/gif",
 		".webp": "image/webp",
+		".heic": "image/heic",
+		".heif": "image/heic",
 		".svg":  "image/svg+xml",
 		".bmp":  "image/bmp",
 		".ico":  "image/x-icon",
