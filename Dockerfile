@@ -10,7 +10,7 @@ RUN npm run build
 FROM golang:1.24-bookworm AS backend
 WORKDIR /app
 RUN apt-get update && apt-get install -y gcc musl-dev && rm -rf /var/lib/apt/lists/*
-ENV GOPROXY=https://goproxy.io,direct
+ENV GOPROXY=https://proxy.golang.org,direct
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
