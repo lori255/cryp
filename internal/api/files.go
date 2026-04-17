@@ -143,7 +143,29 @@ func (s *Server) handleFileContent(c *gin.Context) {
 
 	bufp := crypto.CopyBufPool.Get().(*[]byte)
 	defer crypto.CopyBufPool.Put(bufp)
-	io.CopyBuffer(c.Writer, reader, *bufp)
+	var droppedUntil int64
+	for {
+		n, readErr := reader.Read(*bufp)
+		if n > 0 {
+			if _, writeErr := c.Writer.Write((*bufp)[:n]); writeErr != nil {
+				return
+			}
+
+			// Periodically drop encrypted pages already consumed during long sequential reads.
+			readEnd, seekErr := file.Seek(0, io.SeekCurrent)
+			if seekErr == nil && readEnd-droppedUntil >= 8*1024*1024 {
+				unix.Fadvise(int(file.Fd()), droppedUntil, readEnd-droppedUntil, unix.FADV_DONTNEED)
+				droppedUntil = readEnd
+			}
+		}
+
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return
+		}
+	}
 
 	// Drop page cache after serving
 	crypto.DropFileCache(file)

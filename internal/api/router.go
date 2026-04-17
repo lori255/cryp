@@ -58,7 +58,8 @@ func (s *Server) isAllowedOrigin(origin string) bool {
 
 // SetupRouter configures all routes
 func (s *Server) SetupRouter() *gin.Engine {
-	r := gin.Default()
+	r := gin.New()
+	r.Use(gin.Recovery())
 	r.MaxMultipartMemory = 8 << 20 // 8MB — excess spills to temp files on disk
 
 	// CORS middleware — restrict to same origin (not wildcard)

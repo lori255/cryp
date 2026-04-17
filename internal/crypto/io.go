@@ -22,6 +22,7 @@ func CopyWithCacheDrop(encWriter io.Writer, src *os.File, dst *os.File) (int64, 
 	var total int64
 	var sinceLastDrop int64
 	var srcDropped int64
+	var dstDropped int64
 
 	for {
 		n, readErr := src.Read(buf)
@@ -37,8 +38,9 @@ func CopyWithCacheDrop(encWriter io.Writer, src *os.File, dst *os.File) (int64, 
 				srcDropped += sinceLastDrop
 				dst.Sync()
 				pos, _ := dst.Seek(0, io.SeekCurrent)
-				if pos > 0 {
-					unix.Fadvise(int(dst.Fd()), 0, pos, unix.FADV_DONTNEED)
+				if pos > dstDropped {
+					unix.Fadvise(int(dst.Fd()), dstDropped, pos-dstDropped, unix.FADV_DONTNEED)
+					dstDropped = pos
 				}
 				sinceLastDrop = 0
 			}
@@ -60,6 +62,7 @@ func StreamCopyWithOutputCacheDrop(encWriter io.Writer, src io.Reader, dst *os.F
 	buf := make([]byte, copyBufSize)
 	var total int64
 	var sinceLastDrop int64
+	var dstDropped int64
 
 	for {
 		n, readErr := src.Read(buf)
@@ -73,8 +76,9 @@ func StreamCopyWithOutputCacheDrop(encWriter io.Writer, src io.Reader, dst *os.F
 			if sinceLastDrop >= cacheDropInterval {
 				dst.Sync()
 				pos, _ := dst.Seek(0, io.SeekCurrent)
-				if pos > 0 {
-					unix.Fadvise(int(dst.Fd()), 0, pos, unix.FADV_DONTNEED)
+				if pos > dstDropped {
+					unix.Fadvise(int(dst.Fd()), dstDropped, pos-dstDropped, unix.FADV_DONTNEED)
+					dstDropped = pos
 				}
 				sinceLastDrop = 0
 			}

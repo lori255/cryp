@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import Artplayer from 'artplayer'
-import { X } from 'lucide-react'
+import { X, Maximize } from 'lucide-react'
 
 interface VideoPlayerProps {
   url: string
@@ -11,6 +11,54 @@ interface VideoPlayerProps {
 export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const artRef = useRef<Artplayer | null>(null)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const unlockOrientationRef = useRef<(() => void) | null>(null)
+
+  async function lockLandscapeOrientation() {
+    const orientationApi = screen.orientation as ScreenOrientation & {
+      lock?: (orientation: 'landscape' | 'portrait' | 'any' | 'natural') => Promise<void>
+      unlock?: () => void
+    }
+    if (!orientationApi?.lock) return null
+
+    try {
+      await orientationApi.lock('landscape')
+      return () => orientationApi.unlock?.()
+    } catch {
+      return null
+    }
+  }
+
+  async function requestNativeFullscreen(video: HTMLVideoElement | null) {
+    if (!video) return
+
+    const nativeVideo = video as HTMLVideoElement & {
+      webkitSupportsFullscreen?: boolean
+      webkitEnterFullscreen?: () => void
+      webkitSetPresentationMode?: (mode: 'inline' | 'fullscreen' | 'picture-in-picture') => void
+    }
+
+    unlockOrientationRef.current?.()
+    unlockOrientationRef.current = await lockLandscapeOrientation()
+
+    if (nativeVideo.webkitSupportsFullscreen && nativeVideo.webkitEnterFullscreen) {
+      nativeVideo.webkitEnterFullscreen()
+      return
+    }
+
+    if (nativeVideo.webkitSetPresentationMode) {
+      try {
+        nativeVideo.webkitSetPresentationMode('fullscreen')
+        return
+      } catch {
+        // Fall through to the standard API.
+      }
+    }
+
+    if (video.requestFullscreen) {
+      void video.requestFullscreen().catch(() => {})
+    }
+  }
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -33,12 +81,31 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       flip: true,
       playbackRate: true,
       aspectRatio: true,
-      fullscreen: true,
-      fullscreenWeb: true,
+      fullscreen: !isIOS,
+      fullscreenWeb: !isIOS,
       mutex: true,
       backdrop: true,
       hotkey: true,
       theme: '#3b82f6',
+      autoOrientation: isIOS,
+      controls: isIOS ? [{
+        name: 'ios-native-fullscreen',
+        position: 'right',
+        index: 20,
+        tooltip: '原生全屏',
+        html: '<div class="art-icon"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M7 3H3v4h2V5h2V3zm14 0h-4v2h2v2h2V3zM5 17H3v4h4v-2H5v-2zm16 0h-2v2h-2v2h4v-4z"/></svg></div>',
+        click: () => requestNativeFullscreen(videoRef.current),
+        mounted: (element: HTMLElement) => {
+          const nativeVideo = videoRef.current as (HTMLVideoElement & {
+            webkitSupportsFullscreen?: boolean
+            webkitEnterFullscreen?: () => void
+          }) | null
+
+          if (!nativeVideo?.webkitEnterFullscreen && !videoRef.current?.requestFullscreen) {
+            element.style.display = 'none'
+          }
+        },
+      }] : [],
       customType: {
         // Ensure playsinline for iOS
         m3u8: function (video: HTMLVideoElement) {
@@ -50,69 +117,87 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
 
     // Set playsinline on the video element for iOS
     const videoEl = art.video
+    videoRef.current = videoEl
     if (videoEl) {
       videoEl.setAttribute('playsinline', '')
       videoEl.setAttribute('webkit-playsinline', '')
+      videoEl.playsInline = true
 
-      let primedInitialSeek = false
-      const primeInitialSeek = () => {
-        if (primedInitialSeek || videoEl.currentTime > 0) {
-          primedInitialSeek = true
-          return
+      const releaseOrientationLock = () => {
+        unlockOrientationRef.current?.()
+        unlockOrientationRef.current = null
+      }
+      const handleFullscreenChange = () => {
+        if (!document.fullscreenElement) {
+          releaseOrientationLock()
         }
+      }
+      let stallCheckTimer: number | null = null
+      let hasRecoveredInitialStall = false
 
-        const applyNudge = () => {
-          if (primedInitialSeek || videoEl.currentTime > 0) {
-            primedInitialSeek = true
+      const clearStallCheck = () => {
+        if (stallCheckTimer !== null) {
+          window.clearTimeout(stallCheckTimer)
+          stallCheckTimer = null
+        }
+      }
+
+      const scheduleInitialStallRecovery = () => {
+        if (hasRecoveredInitialStall || videoEl.currentTime > 0) return
+
+        clearStallCheck()
+        stallCheckTimer = window.setTimeout(() => {
+          stallCheckTimer = null
+
+          if (hasRecoveredInitialStall || videoEl.paused || videoEl.currentTime > 0) {
             return
           }
           if (videoEl.readyState < HTMLMediaElement.HAVE_METADATA) {
+            scheduleInitialStallRecovery()
             return
           }
 
           const duration = Number.isFinite(videoEl.duration) ? videoEl.duration : 0
-          const targetTime = duration > 0 ? Math.min(0.001, duration) : 0.001
-          videoEl.currentTime = targetTime
-          primedInitialSeek = true
-        }
+          if (duration <= 0) return
 
-        if (videoEl.readyState >= HTMLMediaElement.HAVE_METADATA) {
-          applyNudge()
-          return
-        }
-
-        videoEl.addEventListener('loadedmetadata', applyNudge, { once: true })
+          hasRecoveredInitialStall = true
+          videoEl.currentTime = Math.min(0.1, duration)
+        }, 1000)
       }
 
-      const onPlaying = () => {
-        primedInitialSeek = true
+      const handleTimeUpdate = () => {
+        if (videoEl.currentTime > 0) {
+          clearStallCheck()
+        }
       }
 
-      videoEl.addEventListener('play', primeInitialSeek)
-      videoEl.addEventListener('playing', onPlaying)
+      const handlePause = () => {
+        clearStallCheck()
+      }
+
+      videoEl.addEventListener('webkitendfullscreen', releaseOrientationLock)
+      document.addEventListener('fullscreenchange', handleFullscreenChange)
+      videoEl.addEventListener('play', scheduleInitialStallRecovery)
+      videoEl.addEventListener('timeupdate', handleTimeUpdate)
+      videoEl.addEventListener('pause', handlePause)
 
       art.on('destroy', () => {
-        videoEl.removeEventListener('play', primeInitialSeek)
-        videoEl.removeEventListener('playing', onPlaying)
-      })
-    }
-
-    // On iOS PWA, native fullscreen API doesn't work.
-    // Override fullscreen button to use webkitEnterFullscreen on the <video> element
-    if (isIOS) {
-      art.on('fullscreen', (state) => {
-        const iosVideo = videoEl as HTMLVideoElement & {
-          webkitEnterFullscreen?: () => void
-        }
-        if (state && iosVideo?.webkitEnterFullscreen) {
-          iosVideo.webkitEnterFullscreen()
-        }
+        videoEl.removeEventListener('webkitendfullscreen', releaseOrientationLock)
+        document.removeEventListener('fullscreenchange', handleFullscreenChange)
+        videoEl.removeEventListener('play', scheduleInitialStallRecovery)
+        videoEl.removeEventListener('timeupdate', handleTimeUpdate)
+        videoEl.removeEventListener('pause', handlePause)
+        clearStallCheck()
+        releaseOrientationLock()
       })
     }
 
     artRef.current = art
 
     return () => {
+      videoRef.current = null
+      unlockOrientationRef.current?.()
+      unlockOrientationRef.current = null
       if (artRef.current) {
         artRef.current.destroy(false)
         artRef.current = null
@@ -157,9 +242,20 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       {/* Title bar */}
       <div className="flex items-center justify-between px-4 py-3 flex-shrink-0" onClick={(e) => e.stopPropagation()}>
         <h3 className="text-white font-medium truncate">{title}</h3>
-        <button onClick={onClose} className="p-2 text-gray-400 hover:text-white transition-colors">
-          <X className="w-6 h-6" />
-        </button>
+        <div className="flex items-center gap-1">
+          {/iPad|iPhone|iPod/.test(navigator.userAgent) && (
+            <button
+              onClick={() => requestNativeFullscreen(videoRef.current)}
+              className="p-2 text-gray-400 hover:text-white transition-colors"
+              title="原生全屏"
+            >
+              <Maximize className="w-5 h-5" />
+            </button>
+          )}
+          <button onClick={onClose} className="p-2 text-gray-400 hover:text-white transition-colors">
+            <X className="w-6 h-6" />
+          </button>
+        </div>
       </div>
 
       {/* Player */}

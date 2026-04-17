@@ -457,7 +457,7 @@ func (g *Generator) encryptFile(srcPath, outPath string, masterKey []byte) error
 		return err
 	}
 
-	if _, err := io.Copy(writer, src); err != nil {
+	if _, err := crypto.CopyWithCacheDrop(writer, src, out); err != nil {
 		os.Remove(outPath)
 		return err
 	}
@@ -466,6 +466,14 @@ func (g *Generator) encryptFile(srcPath, outPath string, masterKey []byte) error
 		os.Remove(outPath)
 		return err
 	}
+
+	if err := out.Sync(); err != nil {
+		os.Remove(outPath)
+		return err
+	}
+
+	crypto.DropFileCache(src)
+	crypto.DropFileCache(out)
 
 	return nil
 }
