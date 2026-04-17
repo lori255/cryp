@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { PhotoProvider } from 'react-photo-view'
 import { api, type FileItem, joinPath } from '../lib/api'
-import { Folder, ArrowLeft, Grid3x3, List, Upload, FolderPlus, Lock, ListTodo, FolderInput } from 'lucide-react'
+import { Folder, ArrowLeft, Grid3x3, List, Upload, FolderPlus, Lock, ListTodo, FolderInput, ArrowUpDown } from 'lucide-react'
 import VideoPlayer from '../components/VideoPlayer'
 import UploadDialog from '../components/UploadDialog'
 import CreateFolderDialog from '../components/CreateFolderDialog'
@@ -11,6 +11,34 @@ import ImportDialog from '../components/ImportDialog'
 import FileGridItem from '../components/FileGridItem'
 import FileListItem from '../components/FileListItem'
 import Breadcrumbs from '../components/Breadcrumbs'
+
+type SortField = 'name' | 'modTime' | 'size'
+type SortDirection = 'asc' | 'desc'
+
+const SORT_STORAGE_KEY = 'fileBrowserSort'
+
+function compareByField(a: FileItem, b: FileItem, field: SortField) {
+  switch (field) {
+    case 'modTime':
+      return (a.modTime || 0) - (b.modTime || 0)
+    case 'size':
+      return (a.size || 0) - (b.size || 0)
+    case 'name':
+    default:
+      return a.name.localeCompare(b.name, 'zh-CN', { numeric: true, sensitivity: 'base' })
+  }
+}
+
+function sortFiles(items: FileItem[], field: SortField, direction: SortDirection) {
+  return [...items].sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
+
+    const result = compareByField(a, b, field)
+    if (result !== 0) return direction === 'asc' ? result : -result
+
+    return a.name.localeCompare(b.name, 'zh-CN', { numeric: true, sensitivity: 'base' })
+  })
+}
 
 export default function FileBrowser() {
   const { id: vaultId } = useParams<{ id: string }>()
@@ -25,6 +53,26 @@ export default function FileBrowser() {
   const [showTasks, setShowTasks] = useState(false)
   const [showImport, setShowImport] = useState(false)
   const [error, setError] = useState('')
+  const [sortField, setSortField] = useState<SortField>(() => {
+    const raw = localStorage.getItem(SORT_STORAGE_KEY)
+    if (!raw) return 'name'
+    try {
+      const parsed = JSON.parse(raw) as { field?: SortField }
+      return parsed.field === 'modTime' || parsed.field === 'size' || parsed.field === 'name' ? parsed.field : 'name'
+    } catch {
+      return 'name'
+    }
+  })
+  const [sortDirection, setSortDirection] = useState<SortDirection>(() => {
+    const raw = localStorage.getItem(SORT_STORAGE_KEY)
+    if (!raw) return 'asc'
+    try {
+      const parsed = JSON.parse(raw) as { direction?: SortDirection }
+      return parsed.direction === 'desc' ? 'desc' : 'asc'
+    } catch {
+      return 'asc'
+    }
+  })
 
   const loadFiles = useCallback(async () => {
     if (!vaultId) return
@@ -32,11 +80,7 @@ export default function FileBrowser() {
     setError('')
     try {
       const data = await api.listFiles(vaultId, currentPath)
-      const sorted = (data.files || []).sort((a, b) => {
-        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
-        return a.name.localeCompare(b.name)
-      })
-      setFiles(sorted)
+      setFiles(data.files || [])
     } catch (err) {
       if (err instanceof Error && err.message.includes('session')) {
         navigate('/')
@@ -49,6 +93,11 @@ export default function FileBrowser() {
   }, [vaultId, currentPath, navigate])
 
   useEffect(() => { loadFiles() }, [loadFiles])
+  useEffect(() => {
+    localStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ field: sortField, direction: sortDirection }))
+  }, [sortField, sortDirection])
+
+  const sortedFiles = sortFiles(files, sortField, sortDirection)
 
   function navigateTo(path: string) {
     setFiles([])
@@ -83,6 +132,9 @@ export default function FileBrowser() {
     }
   }
 
+  function handleToggleDirection() {
+    setSortDirection((prev) => prev === 'asc' ? 'desc' : 'asc')
+  }
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -128,6 +180,33 @@ export default function FileBrowser() {
 
       {/* Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4">
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="text-xs text-gray-500">
+            {currentPath === '/' ? '根目录' : currentPath}
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-gray-500" htmlFor="file-sort">排序</label>
+            <select
+              id="file-sort"
+              value={sortField}
+              onChange={(e) => setSortField(e.target.value as SortField)}
+              className="h-9 rounded-lg border border-gray-800 bg-gray-950 px-3 text-sm text-gray-200 outline-none transition-colors hover:border-gray-700 focus:border-gray-600"
+            >
+              <option value="name">文件名称</option>
+              <option value="modTime">修改时间</option>
+              <option value="size">文件大小</option>
+            </select>
+            <button
+              onClick={handleToggleDirection}
+              className="inline-flex h-9 items-center gap-2 rounded-lg border border-gray-800 bg-gray-950 px-3 text-sm text-gray-200 transition-colors hover:border-gray-700"
+              title={sortDirection === 'asc' ? '当前升序' : '当前降序'}
+            >
+              <ArrowUpDown className="h-4 w-4" />
+              {sortDirection === 'asc' ? '升序' : '降序'}
+            </button>
+          </div>
+        </div>
+
         {loading ? (
           <div className="flex items-center justify-center py-20">
             <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent" />
@@ -150,7 +229,7 @@ export default function FileBrowser() {
           <PhotoProvider>
             {viewMode === 'grid' ? (
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
-                {files.map((file) => (
+                {sortedFiles.map((file) => (
                   <FileGridItem
                     key={file.name}
                     file={file}
@@ -164,7 +243,7 @@ export default function FileBrowser() {
               </div>
             ) : (
               <div className="space-y-1">
-                {files.map((file) => (
+                {sortedFiles.map((file) => (
                   <FileListItem
                     key={file.name}
                     file={file}

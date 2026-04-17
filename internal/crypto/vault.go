@@ -243,9 +243,14 @@ func (v *Vault) ListDirectory(virtualPath string) ([]FileInfo, error) {
 			// Check if it's a shortened directory (has dirid.c9r inside .c9s)
 			dirIDPath := filepath.Join(dirPath, name, DirIDFile)
 			if _, statErr := os.Stat(dirIDPath); statErr == nil {
+				info, infoErr := entry.Info()
+				if infoErr != nil {
+					continue
+				}
 				files = append(files, FileInfo{
-					Name:  decName,
-					IsDir: true,
+					Name:    decName,
+					IsDir:   true,
+					ModTime: info.ModTime().Unix(),
 				})
 				continue
 			}
@@ -275,9 +280,14 @@ func (v *Vault) ListDirectory(virtualPath string) ([]FileInfo, error) {
 				if decErr != nil {
 					continue
 				}
+				info, infoErr := entry.Info()
+				if infoErr != nil {
+					continue
+				}
 				files = append(files, FileInfo{
-					Name:  decName,
-					IsDir: true,
+					Name:    decName,
+					IsDir:   true,
+					ModTime: info.ModTime().Unix(),
 				})
 				continue
 			}
