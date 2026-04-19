@@ -78,6 +78,20 @@ func (d *DB) migrate() error {
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_tasks_vault ON tasks(vault_id);
+
+		CREATE TABLE IF NOT EXISTS file_index (
+			vault_id TEXT NOT NULL,
+			virtual_path TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			size INTEGER NOT NULL DEFAULT 0,
+			mod_time INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (vault_id, virtual_path)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_file_index_vault_hash ON file_index(vault_id, content_hash, size);
+		CREATE INDEX IF NOT EXISTS idx_file_index_vault_path ON file_index(vault_id, virtual_path);
 	`)
 	return err
 }
@@ -140,8 +154,22 @@ func (d *DB) ListVaults() ([]VaultRecord, error) {
 
 // DeleteVault removes a vault record
 func (d *DB) DeleteVault(id string) error {
-	_, err := d.Exec("DELETE FROM vaults WHERE id = ?", id)
-	return err
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM file_index WHERE vault_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM tasks WHERE vault_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM vaults WHERE id = ?", id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // TaskRecord represents a background task in the database
@@ -162,6 +190,25 @@ type TaskRecord struct {
 	StartedAt      int64  `json:"startedAt"`
 	CreatedAt      int64  `json:"createdAt"`
 	UpdatedAt      int64  `json:"updatedAt"`
+}
+
+// FileIndexRecord represents an indexed vault file for duplicate detection.
+type FileIndexRecord struct {
+	VaultID     string `json:"vaultId"`
+	VirtualPath string `json:"virtualPath"`
+	ContentHash string `json:"contentHash"`
+	Size        int64  `json:"size"`
+	ModTime     int64  `json:"modTime"`
+	CreatedAt   int64  `json:"createdAt"`
+	UpdatedAt   int64  `json:"updatedAt"`
+}
+
+// DuplicateGroupRow is a flattened duplicate-file row.
+type DuplicateGroupRow struct {
+	ContentHash string `json:"contentHash"`
+	VirtualPath string `json:"virtualPath"`
+	Size        int64  `json:"size"`
+	ModTime     int64  `json:"modTime"`
 }
 
 // CreateTask inserts a new task record
@@ -268,4 +315,80 @@ func (d *DB) DeleteCompletedTasks(vaultID string) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// UpsertFileIndex creates or updates an indexed file row.
+func (d *DB) UpsertFileIndex(record *FileIndexRecord) error {
+	now := time.Now().Unix()
+	if record.CreatedAt == 0 {
+		record.CreatedAt = now
+	}
+	record.UpdatedAt = now
+
+	_, err := d.Exec(
+		`INSERT INTO file_index (vault_id, virtual_path, content_hash, size, mod_time, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(vault_id, virtual_path) DO UPDATE SET
+			content_hash=excluded.content_hash,
+			size=excluded.size,
+			mod_time=excluded.mod_time,
+			updated_at=excluded.updated_at`,
+		record.VaultID, record.VirtualPath, record.ContentHash, record.Size, record.ModTime, record.CreatedAt, record.UpdatedAt,
+	)
+	return err
+}
+
+// DeleteFileIndex removes one indexed file row.
+func (d *DB) DeleteFileIndex(vaultID, virtualPath string) error {
+	_, err := d.Exec("DELETE FROM file_index WHERE vault_id=? AND virtual_path=?", vaultID, virtualPath)
+	return err
+}
+
+// DeleteFileIndexPrefix removes indexed rows for a directory tree.
+func (d *DB) DeleteFileIndexPrefix(vaultID, virtualPath string) error {
+	likePrefix := "/%"
+	if virtualPath != "/" {
+		likePrefix = virtualPath + "/%"
+	}
+	_, err := d.Exec("DELETE FROM file_index WHERE vault_id=? AND (virtual_path=? OR virtual_path LIKE ?)", vaultID, virtualPath, likePrefix)
+	return err
+}
+
+// ClearFileIndex removes all indexed files for a vault.
+func (d *DB) ClearFileIndex(vaultID string) error {
+	_, err := d.Exec("DELETE FROM file_index WHERE vault_id=?", vaultID)
+	return err
+}
+
+// ListDuplicateGroupRows returns flattened rows for duplicate files.
+func (d *DB) ListDuplicateGroupRows(vaultID string) ([]DuplicateGroupRow, error) {
+	rows, err := d.Query(
+		`SELECT fi.content_hash, fi.virtual_path, fi.size, fi.mod_time
+		 FROM file_index fi
+		 JOIN (
+		 	SELECT content_hash, size
+		 	FROM file_index
+		 	WHERE vault_id=? AND content_hash <> ''
+		 	GROUP BY content_hash, size
+		 	HAVING COUNT(*) > 1
+		 ) dup
+		 ON dup.content_hash = fi.content_hash AND dup.size = fi.size
+		 WHERE fi.vault_id=?
+		 ORDER BY fi.size DESC, fi.content_hash, fi.mod_time ASC, fi.virtual_path ASC`,
+		vaultID, vaultID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []DuplicateGroupRow
+	for rows.Next() {
+		var row DuplicateGroupRow
+		if err := rows.Scan(&row.ContentHash, &row.VirtualPath, &row.Size, &row.ModTime); err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
 }

@@ -2,6 +2,8 @@ package crypto
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +16,13 @@ const (
 	cacheDropInterval = 8 * 1024 * 1024 // 8MB - keep low to limit page cache in containers
 	copyBufSize       = 32 * 1024        // 32KB
 )
+
+// EncryptResult describes an encrypted file written into the vault.
+type EncryptResult struct {
+	PlaintextSize int64
+	ContentHash   string
+	ModTime       int64
+}
 
 // CopyWithCacheDrop copies src to dst through encWriter, periodically
 // dropping page cache on both files to limit memory usage during large file encryption.
@@ -104,27 +113,32 @@ func DropFileCache(f *os.File) {
 	unix.Fadvise(int(f.Fd()), 0, info.Size(), unix.FADV_DONTNEED)
 }
 
-// EncryptSingleFile encrypts a file from srcPath into the vault at virtualPath.
-// The output file is fsync'd before returning to ensure data durability.
-func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath string) error {
+// EncryptSingleFile encrypts a file from srcPath into the vault at virtualPath,
+// computing the plaintext SHA-256 hash while streaming.
+func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath string) (EncryptResult, error) {
+	var result EncryptResult
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
-		return err
+		return result, err
 	}
 	defer srcFile.Close()
 
+	if info, err := srcFile.Stat(); err == nil {
+		result.ModTime = info.ModTime().Unix()
+	}
+
 	encPath, err := vault.GetEncryptedFilePath(virtualPath)
 	if err != nil {
-		return err
+		return result, err
 	}
 
 	if err := os.MkdirAll(filepath.Dir(encPath), 0700); err != nil {
-		return err
+		return result, err
 	}
 
 	outFile, err := os.Create(encPath)
 	if err != nil {
-		return err
+		return result, err
 	}
 	defer outFile.Close()
 
@@ -133,47 +147,51 @@ func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath strin
 	contentKey := make([]byte, MasterKeySize)
 	if _, err := rand.Read(contentKey); err != nil {
 		os.Remove(encPath)
-		return err
+		return result, err
 	}
 
 	header, err := WriteFileHeader(outFile, keys.MasterKey, contentKey)
 	if err != nil {
 		os.Remove(encPath)
-		return err
+		return result, err
 	}
 
 	writer, err := NewEncryptingWriter(outFile, header.ContentKey, header.Nonce)
 	if err != nil {
 		os.Remove(encPath)
-		return err
+		return result, err
 	}
 
-	if _, err := CopyWithCacheDrop(writer, srcFile, outFile); err != nil {
+	hasher := sha256.New()
+	written, err := CopyWithCacheDrop(io.MultiWriter(writer, hasher), srcFile, outFile)
+	if err != nil {
 		os.Remove(encPath)
-		return err
+		return result, err
 	}
+	result.PlaintextSize = written
+	result.ContentHash = hex.EncodeToString(hasher.Sum(nil))
 
 	if err := writer.Close(); err != nil {
 		os.Remove(encPath)
-		return err
+		return result, err
 	}
 
 	// Fsync to ensure encrypted data is durable on disk before caller
 	// may delete the source file.
 	if err := outFile.Sync(); err != nil {
 		os.Remove(encPath)
-		return fmt.Errorf("fsync encrypted file: %w", err)
+		return result, fmt.Errorf("fsync encrypted file: %w", err)
 	}
 
 	DropFileCache(srcFile)
 	DropFileCache(outFile)
-	return nil
+	return result, nil
 }
 
 // ReleaseMemoryAfterLargeFile is a no-op kept for API compatibility.
 // With GOMEMLIMIT set, Go's GC automatically manages memory boundaries.
 // Manual runtime.GC() causes unnecessary Stop-The-World pauses.
-	func ReleaseMemoryAfterLargeFile() {
+func ReleaseMemoryAfterLargeFile() {
 	// Intentionally empty — rely on Go runtime + GOMEMLIMIT
 }
 

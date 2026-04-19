@@ -109,6 +109,9 @@ func (s *Server) SetupRouter() *gin.Engine {
 			vaultOps.POST("/files/upload", s.handleUploadFile)
 			vaultOps.POST("/files/mkdir", s.handleMkdir)
 			vaultOps.DELETE("/files", s.handleDeleteFile)
+			vaultOps.POST("/files/delete-batch", s.handleDeleteFilesBatch)
+			vaultOps.GET("/files/duplicates", s.handleListDuplicates)
+			vaultOps.POST("/files/index/rebuild", s.handleRebuildFileIndex)
 			vaultOps.GET("/thumbnail", s.handleThumbnail)
 			vaultOps.DELETE("", s.handleDeleteVault) // vault deletion requires auth
 

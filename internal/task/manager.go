@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -223,13 +224,32 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			_ = m.db.UpdateTask(t)
 
 			info, _ := entry.Info()
-			if err := crypto.EncryptSingleFile(vault, keys, entryPath, virtualPath); err != nil {
+			result, err := crypto.EncryptSingleFile(vault, keys, entryPath, virtualPath)
+			if err != nil {
 				// On failure (including cancellation), clean up the partially
 				// written encrypted file to avoid leaving corrupted data.
 				if encPath, resolveErr := vault.GetEncryptedFilePath(virtualPath); resolveErr == nil {
 					os.Remove(encPath)
 				}
 				return fmt.Errorf("encrypt %s: %w", virtualPath, err)
+			}
+
+			if err := m.db.UpsertFileIndex(&storage.FileIndexRecord{
+				VaultID:     vault.ID,
+				VirtualPath: virtualPath,
+				ContentHash: result.ContentHash,
+				Size:        result.PlaintextSize,
+				ModTime:     result.ModTime,
+			}); err != nil {
+				if encPath, resolveErr := vault.GetEncryptedFilePath(virtualPath); resolveErr == nil {
+					parentDir := filepath.Dir(encPath)
+					if strings.HasSuffix(parentDir, crypto.ShortNameDir) {
+						_ = os.RemoveAll(parentDir)
+					} else {
+						_ = os.Remove(encPath)
+					}
+				}
+				return fmt.Errorf("index %s: %w", virtualPath, err)
 			}
 
 			// Drop page cache for source file immediately after encryption.
@@ -246,8 +266,10 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 				m.thumbs.Enqueue(vault.ID, vault.Path, keys, virtualPath)
 			}
 			t.ProcessedFiles++
-			if info != nil {
+			if info != nil && info.Size() > 0 {
 				t.ProcessedBytes += info.Size()
+			} else {
+				t.ProcessedBytes += result.PlaintextSize
 			}
 			_ = m.db.UpdateTask(t)
 		}
@@ -301,4 +323,3 @@ func removeEmptyDirs(root string) {
 		os.Remove(dirs[i])
 	}
 }
-

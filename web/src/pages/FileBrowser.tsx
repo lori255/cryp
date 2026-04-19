@@ -2,12 +2,13 @@ import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { PhotoProvider } from 'react-photo-view'
 import { api, type FileItem, joinPath } from '../lib/api'
-import { Folder, ArrowLeft, Grid3x3, List, Upload, FolderPlus, Lock, ListTodo, FolderInput, ArrowUpDown } from 'lucide-react'
+import { Folder, ArrowLeft, Grid3x3, List, Upload, FolderPlus, Lock, ListTodo, FolderInput, ArrowUpDown, CopyMinus } from 'lucide-react'
 import VideoPlayer from '../components/VideoPlayer'
 import UploadDialog from '../components/UploadDialog'
 import CreateFolderDialog from '../components/CreateFolderDialog'
 import TaskPanel from '../components/TaskPanel'
 import ImportDialog from '../components/ImportDialog'
+import DuplicatePanel from '../components/DuplicatePanel'
 import FileGridItem from '../components/FileGridItem'
 import FileListItem from '../components/FileListItem'
 import Breadcrumbs from '../components/Breadcrumbs'
@@ -52,6 +53,7 @@ export default function FileBrowser() {
   const [showMkdir, setShowMkdir] = useState(false)
   const [showTasks, setShowTasks] = useState(false)
   const [showImport, setShowImport] = useState(false)
+  const [showDuplicates, setShowDuplicates] = useState(false)
   const [error, setError] = useState('')
   const [sortField, setSortField] = useState<SortField>(() => {
     const raw = localStorage.getItem(SORT_STORAGE_KEY)
@@ -162,6 +164,9 @@ export default function FileBrowser() {
             </button>
             <button onClick={() => setShowImport(true)} className="p-2 text-gray-400 hover:text-white transition-colors" title="导入目录">
               <FolderInput className="w-5 h-5" />
+            </button>
+            <button onClick={() => setShowDuplicates(true)} className="p-2 text-gray-400 hover:text-white transition-colors" title="重复文件">
+              <CopyMinus className="w-5 h-5" />
             </button>
             <button onClick={() => setShowTasks(true)} className="p-2 text-gray-400 hover:text-white transition-colors" title="任务列表">
               <ListTodo className="w-5 h-5" />
@@ -275,6 +280,9 @@ export default function FileBrowser() {
       )}
       {vaultId && (
         <TaskPanel vaultId={vaultId} open={showTasks} onClose={() => setShowTasks(false)} onRefresh={loadFiles} />
+      )}
+      {vaultId && (
+        <DuplicatePanel vaultId={vaultId} open={showDuplicates} onClose={() => setShowDuplicates(false)} onRefresh={loadFiles} />
       )}
     </div>
   )

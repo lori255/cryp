@@ -2,6 +2,8 @@ package api
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"mime"
@@ -13,6 +15,7 @@ import (
 	"strings"
 
 	"cryp/internal/crypto"
+	"cryp/internal/storage"
 	"cryp/internal/thumbnail"
 
 	"github.com/gin-gonic/gin"
@@ -344,9 +347,10 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 		return
 	}
 
+	hasher := sha256.New()
 	// Stream directly: multipart body -> encrypting writer -> output file
 	// Only drop output file cache (network stream has no page cache)
-	written, err := crypto.StreamCopyWithOutputCacheDrop(writer, part, outFile)
+	written, err := crypto.StreamCopyWithOutputCacheDrop(io.MultiWriter(writer, hasher), part, outFile)
 	if err != nil {
 		os.Remove(encPath)
 		if taskID != "" {
@@ -364,6 +368,19 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 
 	// Drop page cache for encrypted output file
 	crypto.DropFileCache(outFile)
+
+	modTime := outFileStatModTime(outFile)
+	if err := s.db.UpsertFileIndex(&storage.FileIndexRecord{
+		VaultID:     sess.VaultID,
+		VirtualPath: virtualPath,
+		ContentHash: hex.EncodeToString(hasher.Sum(nil)),
+		Size:        written,
+		ModTime:     modTime,
+	}); err != nil {
+		removeEncryptedPath(encPath)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to index file"})
+		return
+	}
 
 	if written > 100*1024*1024 {
 		crypto.ReleaseMemoryAfterLargeFile()
@@ -446,6 +463,7 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete directory"})
 			return
 		}
+		_ = s.db.DeleteFileIndexPrefix(sess.VaultID, path)
 	} else {
 		// For shortened names, encPath is .c9s/contents.c9r — remove the whole .c9s dir
 		parentDir := filepath.Dir(encPath)
@@ -460,6 +478,7 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 				return
 			}
 		}
+		_ = s.db.DeleteFileIndex(sess.VaultID, path)
 	}
 
 	// Clean up associated thumbnail if it exists
@@ -468,6 +487,174 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "deleted", "path": path})
+}
+
+func (s *Server) handleDeleteFilesBatch(c *gin.Context) {
+	sess := getSession(c)
+
+	var req struct {
+		Paths []string `json:"paths" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.Paths) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "paths required"})
+		return
+	}
+
+	vault := &crypto.Vault{
+		ID:   sess.VaultID,
+		Path: sess.VaultPath,
+		Keys: sess.Keys,
+	}
+
+	deleted := make([]string, 0, len(req.Paths))
+	failed := make(map[string]string)
+	for _, path := range req.Paths {
+		if path == "" {
+			continue
+		}
+
+		encPath, err := vault.GetEncryptedFilePath(path)
+		if err != nil {
+			failed[path] = "failed to resolve path"
+			continue
+		}
+
+		parentDir := filepath.Dir(encPath)
+		if strings.HasSuffix(parentDir, crypto.ShortNameDir) {
+			err = os.RemoveAll(parentDir)
+		} else {
+			err = os.Remove(encPath)
+		}
+		if err != nil {
+			failed[path] = "failed to delete file"
+			continue
+		}
+
+		_ = s.db.DeleteFileIndex(sess.VaultID, path)
+		if s.thumbs != nil {
+			s.thumbs.DeleteThumbnail(sess.VaultID, path)
+		}
+		deleted = append(deleted, path)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"deleted": deleted,
+		"failed":  failed,
+	})
+}
+
+func (s *Server) handleListDuplicates(c *gin.Context) {
+	sess := getSession(c)
+
+	rows, err := s.db.ListDuplicateGroupRows(sess.VaultID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list duplicates"})
+		return
+	}
+
+	type duplicateFileResp struct {
+		Path     string `json:"path"`
+		Name     string `json:"name"`
+		Size     int64  `json:"size"`
+		ModTime  int64  `json:"modTime"`
+		HasThumb bool   `json:"hasThumb,omitempty"`
+	}
+	type duplicateGroupResp struct {
+		ContentHash string              `json:"contentHash"`
+		Size        int64               `json:"size"`
+		Files       []duplicateFileResp `json:"files"`
+	}
+
+	groupsByHash := make(map[string]*duplicateGroupResp)
+	order := make([]string, 0)
+	for _, row := range rows {
+		group, ok := groupsByHash[row.ContentHash]
+		if !ok {
+			group = &duplicateGroupResp{
+				ContentHash: row.ContentHash,
+				Size:        row.Size,
+			}
+			groupsByHash[row.ContentHash] = group
+			order = append(order, row.ContentHash)
+		}
+
+		item := duplicateFileResp{
+			Path:    row.VirtualPath,
+			Name:    filepath.Base(row.VirtualPath),
+			Size:    row.Size,
+			ModTime: row.ModTime,
+		}
+		if s.thumbs != nil && thumbnail.IsVideo(item.Name) && s.thumbs.HasThumbnail(sess.VaultID, row.VirtualPath) {
+			item.HasThumb = true
+		}
+		group.Files = append(group.Files, item)
+	}
+
+	result := make([]duplicateGroupResp, 0, len(order))
+	for _, hash := range order {
+		result = append(result, *groupsByHash[hash])
+	}
+
+	c.JSON(http.StatusOK, gin.H{"groups": result})
+}
+
+func (s *Server) handleRebuildFileIndex(c *gin.Context) {
+	sess := getSession(c)
+
+	vault := &crypto.Vault{
+		ID:   sess.VaultID,
+		Path: sess.VaultPath,
+		Keys: sess.Keys,
+	}
+
+	if err := s.db.ClearFileIndex(sess.VaultID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clear file index"})
+		return
+	}
+
+	var indexed int
+	if err := vault.WalkFiles("/", func(virtualPath string, info crypto.FileInfo) error {
+		hash, err := vault.HashVirtualFile(virtualPath)
+		if err != nil {
+			return err
+		}
+		if err := s.db.UpsertFileIndex(&storage.FileIndexRecord{
+			VaultID:     sess.VaultID,
+			VirtualPath: virtualPath,
+			ContentHash: hash,
+			Size:        info.Size,
+			ModTime:     info.ModTime,
+		}); err != nil {
+			return err
+		}
+		indexed++
+		return nil
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild file index: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"indexed": indexed,
+		"message": "file index rebuilt",
+	})
+}
+
+func outFileStatModTime(file *os.File) int64 {
+	info, err := file.Stat()
+	if err != nil {
+		return 0
+	}
+	return info.ModTime().Unix()
+}
+
+func removeEncryptedPath(encPath string) {
+	parentDir := filepath.Dir(encPath)
+	if strings.HasSuffix(parentDir, crypto.ShortNameDir) {
+		_ = os.RemoveAll(parentDir)
+		return
+	}
+	_ = os.Remove(encPath)
 }
 
 func (s *Server) handleThumbnail(c *gin.Context) {

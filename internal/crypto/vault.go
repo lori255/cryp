@@ -326,6 +326,34 @@ type FileInfo struct {
 	ModTime      int64  `json:"modTime,omitempty"`
 }
 
+// WalkFiles recursively visits every file under virtualRoot.
+func (v *Vault) WalkFiles(virtualRoot string, fn func(string, FileInfo) error) error {
+	entries, err := v.ListDirectory(virtualRoot)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		childPath := filepath.Join(virtualRoot, entry.Name)
+		if !strings.HasPrefix(childPath, "/") {
+			childPath = "/" + childPath
+		}
+
+		if entry.IsDir {
+			if err := v.WalkFiles(childPath, fn); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := fn(childPath, entry); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // GetEncryptedFilePath returns the encrypted filesystem path for a virtual file path
 func (v *Vault) GetEncryptedFilePath(virtualPath string) (string, error) {
 	virtualPath = filepath.Clean(virtualPath)

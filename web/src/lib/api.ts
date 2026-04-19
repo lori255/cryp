@@ -8,6 +8,20 @@ export interface FileItem {
   hasThumb?: boolean;
 }
 
+export interface DuplicateFileItem {
+  path: string;
+  name: string;
+  size: number;
+  modTime: number;
+  hasThumb?: boolean;
+}
+
+export interface DuplicateGroup {
+  contentHash: string;
+  size: number;
+  files: DuplicateFileItem[];
+}
+
 export interface TaskRecord {
   id: string;
   vaultId: string;
@@ -168,6 +182,23 @@ class ApiClient {
   async deleteFile(vaultId: string, path: string) {
     return this.request(`/vaults/${vaultId}/files?path=${encodeURIComponent(path)}`, {
       method: 'DELETE',
+    });
+  }
+
+  async deleteFilesBulk(vaultId: string, paths: string[]) {
+    return this.request<{ deleted: string[]; failed: Record<string, string> }>(`/vaults/${vaultId}/files/delete-batch`, {
+      method: 'POST',
+      body: JSON.stringify({ paths }),
+    });
+  }
+
+  async listDuplicates(vaultId: string) {
+    return this.request<{ groups: DuplicateGroup[] }>(`/vaults/${vaultId}/files/duplicates`);
+  }
+
+  async rebuildFileIndex(vaultId: string) {
+    return this.request<{ indexed: number; message: string }>(`/vaults/${vaultId}/files/index/rebuild`, {
+      method: 'POST',
     });
   }
 
