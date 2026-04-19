@@ -25,7 +25,7 @@ export interface DuplicateGroup {
 export interface TaskRecord {
   id: string;
   vaultId: string;
-  type: 'import' | 'upload';
+  type: 'import' | 'upload' | 'index';
   status: 'pending' | 'running' | 'done' | 'error' | 'cancelled';
   totalFiles: number;
   processedFiles: number;
@@ -115,9 +115,17 @@ class ApiClient {
     return this.request(`/vaults/${id}`, { method: 'DELETE' });
   }
 
-  async listFiles(vaultId: string, path: string) {
-    return this.request<{ path: string; files: FileItem[] }>(
-      `/vaults/${vaultId}/files?path=${encodeURIComponent(path)}`,
+  async listFiles(
+    vaultId: string,
+    path: string,
+    options?: { offset?: number; limit?: number; sortField?: 'name' | 'modTime' | 'size'; sortDirection?: 'asc' | 'desc' },
+  ) {
+    const offset = options?.offset ?? 0;
+    const limit = options?.limit ?? 100;
+    const sortField = options?.sortField ?? 'name';
+    const sortDirection = options?.sortDirection ?? 'asc';
+    return this.request<{ path: string; files: FileItem[]; hasMore: boolean; nextOffset: number }>(
+      `/vaults/${vaultId}/files?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}&sortField=${sortField}&sortDirection=${sortDirection}`,
     );
   }
 
@@ -192,12 +200,14 @@ class ApiClient {
     });
   }
 
-  async listDuplicates(vaultId: string) {
-    return this.request<{ groups: DuplicateGroup[] }>(`/vaults/${vaultId}/files/duplicates`);
+  async listDuplicates(vaultId: string, offset = 0, limit = 20) {
+    return this.request<{ groups: DuplicateGroup[]; hasMore: boolean; nextOffset: number }>(
+      `/vaults/${vaultId}/files/duplicates?offset=${offset}&limit=${limit}`,
+    );
   }
 
   async rebuildFileIndex(vaultId: string) {
-    return this.request<{ indexed: number; message: string }>(`/vaults/${vaultId}/files/index/rebuild`, {
+    return this.request<{ taskId: string; message: string }>(`/vaults/${vaultId}/files/index/rebuild`, {
       method: 'POST',
     });
   }

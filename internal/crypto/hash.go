@@ -10,7 +10,7 @@ import (
 
 // HashVirtualFile returns the SHA-256 hash of a decrypted vault file.
 func (v *Vault) HashVirtualFile(virtualPath string) (string, error) {
-	encPath, err := v.GetEncryptedFilePath(virtualPath)
+	encPath, err := v.ResolveExistingFilePath(virtualPath)
 	if err != nil {
 		return "", err
 	}

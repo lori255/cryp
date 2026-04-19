@@ -10,10 +10,12 @@ interface DuplicatePanelProps {
   open: boolean
   onClose: () => void
   onRefresh?: () => void
+  onOpenTasks?: () => void
 }
 
 type SelectionMap = Record<string, boolean>
 type KeeperMap = Record<string, string>
+const DUPLICATE_PAGE_SIZE = 20
 
 function buildDefaultState(groups: DuplicateGroup[]): { selections: SelectionMap; keepers: KeeperMap } {
   const selections: SelectionMap = {}
@@ -35,15 +37,18 @@ function buildDefaultState(groups: DuplicateGroup[]): { selections: SelectionMap
   return { selections, keepers }
 }
 
-export default function DuplicatePanel({ vaultId, open, onClose, onRefresh }: DuplicatePanelProps) {
+export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOpenTasks }: DuplicatePanelProps) {
   const [groups, setGroups] = useState<DuplicateGroup[]>([])
   const [loading, setLoading] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [rebuilding, setRebuilding] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [selections, setSelections] = useState<SelectionMap>({})
   const [keepers, setKeepers] = useState<KeeperMap>({})
+  const [hasMore, setHasMore] = useState(false)
+  const [nextOffset, setNextOffset] = useState(0)
   const [activeVideo, setActiveVideo] = useState<{ url: string; title: string } | null>(null)
 
   useEffect(() => {
@@ -55,16 +60,38 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh }: Du
     setLoading(true)
     setError('')
     try {
-      const data = await api.listDuplicates(vaultId)
+      const data = await api.listDuplicates(vaultId, 0, DUPLICATE_PAGE_SIZE)
       const nextGroups = data.groups || []
       const defaults = buildDefaultState(nextGroups)
       setGroups(nextGroups)
       setSelections(defaults.selections)
       setKeepers(defaults.keepers)
+      setHasMore(Boolean(data.hasMore))
+      setNextOffset(data.nextOffset ?? nextGroups.length)
     } catch (err) {
       setError(err instanceof Error ? err.message : '查重结果加载失败')
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function loadMoreGroups() {
+    if (loadingMore || loading || !hasMore) return
+    setLoadingMore(true)
+    setError('')
+    try {
+      const data = await api.listDuplicates(vaultId, nextOffset, DUPLICATE_PAGE_SIZE)
+      const appendedGroups = data.groups || []
+      const defaults = buildDefaultState(appendedGroups)
+      setGroups((prev) => [...prev, ...appendedGroups])
+      setSelections((prev) => ({ ...prev, ...defaults.selections }))
+      setKeepers((prev) => ({ ...prev, ...defaults.keepers }))
+      setHasMore(Boolean(data.hasMore))
+      setNextOffset(data.nextOffset ?? nextOffset + appendedGroups.length)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '加载更多重复文件失败')
+    } finally {
+      setLoadingMore(false)
     }
   }
 
@@ -73,12 +100,11 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh }: Du
     setError('')
     setMessage('')
     try {
-      const data = await api.rebuildFileIndex(vaultId)
-      setMessage(`索引补全完成，共处理 ${data.indexed} 个文件`)
-      await loadGroups()
-      onRefresh?.()
+      await api.rebuildFileIndex(vaultId)
+      setMessage('重建索引任务已加入任务列表')
+      onOpenTasks?.()
     } catch (err) {
-      setError(err instanceof Error ? err.message : '索引补全失败')
+      setError(err instanceof Error ? err.message : '重建索引失败')
     } finally {
       setRebuilding(false)
     }
@@ -166,7 +192,7 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh }: Du
           <div className="flex items-center gap-2">
             <CopyMinus className="w-5 h-5 text-amber-400" />
             <h2 className="text-lg font-semibold text-white">重复文件</h2>
-            {(loading || rebuilding || deleting) && <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />}
+            {(loading || loadingMore || rebuilding || deleting) && <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />}
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -180,7 +206,7 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh }: Du
               disabled={rebuilding || loading || deleting}
               className="inline-flex items-center gap-1 px-3 py-1.5 text-xs rounded-lg border border-gray-800 text-gray-300 hover:border-gray-700 disabled:opacity-50"
             >
-              <ScanSearch className="w-3.5 h-3.5" /> 补全老文件索引
+              <ScanSearch className="w-3.5 h-3.5" /> 重建索引
             </button>
             <button onClick={onClose} className="p-1 text-gray-400 hover:text-white">
               <X className="w-5 h-5" />
@@ -195,14 +221,14 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh }: Du
           <div className="flex items-center gap-2">
             <button
               onClick={selectAllDuplicates}
-              disabled={groups.length === 0 || loading}
+              disabled={groups.length === 0 || loading || loadingMore}
               className="inline-flex items-center gap-1 px-3 py-2 text-sm rounded-lg border border-gray-800 text-gray-300 hover:border-gray-700 disabled:opacity-50"
             >
               <ShieldCheck className="w-4 h-4" /> 一键选择重复文件
             </button>
             <button
               onClick={handleDeleteSelected}
-              disabled={selectedSummary.count === 0 || deleting || loading}
+              disabled={selectedSummary.count === 0 || deleting || loading || loadingMore}
               className="inline-flex items-center gap-1 px-3 py-2 text-sm rounded-lg bg-red-500/15 text-red-300 hover:bg-red-500/20 disabled:opacity-50"
             >
               <Trash2 className="w-4 h-4" /> 删除已选
@@ -222,7 +248,7 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh }: Du
             <div className="text-center py-20">
               <CopyMinus className="w-12 h-12 text-gray-700 mx-auto mb-4" />
               <p className="text-gray-400">当前没有重复文件</p>
-              <p className="text-sm text-gray-500 mt-2">如果保险库里有老文件，先点“补全老文件索引”再查。</p>
+              <p className="text-sm text-gray-500 mt-2">如果保险库里有老文件，先点“重建索引”再查。</p>
             </div>
           ) : (
             <PhotoProvider>
@@ -280,6 +306,18 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh }: Du
                   </section>
                 )
               })}
+              {hasMore && (
+                <div className="flex justify-center pt-2">
+                  <button
+                    onClick={() => void loadMoreGroups()}
+                    disabled={loadingMore}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-800 text-sm text-gray-200 hover:border-gray-700 disabled:opacity-50"
+                  >
+                    {loadingMore && <Loader2 className="w-4 h-4 animate-spin" />}
+                    {loadingMore ? '加载中...' : '加载更多重复组'}
+                  </button>
+                </div>
+              )}
             </PhotoProvider>
           )}
         </div>

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { api, type TaskRecord, formatSize, formatETA } from '../lib/api'
-import { X, FolderInput, Upload, Trash2, XCircle, ListTodo, Loader2 } from 'lucide-react'
+import { X, FolderInput, Upload, Trash2, XCircle, ListTodo, Loader2, ScanSearch } from 'lucide-react'
 
 interface TaskPanelProps {
   vaultId: string
@@ -162,10 +162,12 @@ function TaskItem({ task: t, onCancel, onDelete }: {
         <div className="flex items-center gap-2.5">
           {t.type === 'import'
             ? <FolderInput className="w-5 h-5 text-amber-500 flex-shrink-0" />
-            : <Upload className="w-5 h-5 text-blue-500 flex-shrink-0" />}
+            : t.type === 'index'
+              ? <ScanSearch className="w-5 h-5 text-cyan-400 flex-shrink-0" />
+              : <Upload className="w-5 h-5 text-blue-500 flex-shrink-0" />}
           <div>
             <p className="text-sm font-medium text-white">
-              {t.type === 'import' ? '导入加密' : '文件上传'}
+              {t.type === 'import' ? '导入加密' : t.type === 'index' ? '重建索引' : '文件上传'}
             </p>
             {t.sourcePath && (
               <p className="text-xs text-gray-500 truncate max-w-[240px]">{t.sourcePath}</p>

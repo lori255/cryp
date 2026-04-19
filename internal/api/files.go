@@ -11,11 +11,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
 	"cryp/internal/crypto"
 	"cryp/internal/storage"
+	"cryp/internal/task"
 	"cryp/internal/thumbnail"
 
 	"github.com/gin-gonic/gin"
@@ -25,6 +27,16 @@ import (
 func (s *Server) handleListFiles(c *gin.Context) {
 	sess := getSession(c)
 	path := c.DefaultQuery("path", "/")
+	sortField := c.DefaultQuery("sortField", "name")
+	sortDirection := c.DefaultQuery("sortDirection", "asc")
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
 
 	vault := &crypto.Vault{
 		ID:   sess.VaultID,
@@ -42,6 +54,52 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		files = []crypto.FileInfo{}
 	}
 
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].IsDir != files[j].IsDir {
+			return files[i].IsDir
+		}
+
+		var result int
+		switch sortField {
+		case "modTime":
+			switch {
+			case files[i].ModTime < files[j].ModTime:
+				result = -1
+			case files[i].ModTime > files[j].ModTime:
+				result = 1
+			}
+		case "size":
+			switch {
+			case files[i].Size < files[j].Size:
+				result = -1
+			case files[i].Size > files[j].Size:
+				result = 1
+			}
+		default:
+			result = strings.Compare(strings.ToLower(files[i].Name), strings.ToLower(files[j].Name))
+		}
+
+		if result == 0 {
+			result = strings.Compare(strings.ToLower(files[i].Name), strings.ToLower(files[j].Name))
+		}
+
+		if sortDirection == "desc" && result != 0 {
+			return result > 0
+		}
+		return result < 0
+	})
+
+	start := offset
+	if start > len(files) {
+		start = len(files)
+	}
+	end := start + limit
+	if end > len(files) {
+		end = len(files)
+	}
+	pageFiles := files[start:end]
+	hasMore := end < len(files)
+
 	// Build response with thumbnail availability
 	type fileResp struct {
 		Name     string `json:"name"`
@@ -51,8 +109,8 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		HasThumb bool   `json:"hasThumb,omitempty"`
 	}
 
-	result := make([]fileResp, len(files))
-	for i, f := range files {
+	result := make([]fileResp, len(pageFiles))
+	for i, f := range pageFiles {
 		fullPath := path
 		if fullPath == "/" {
 			fullPath = "/" + f.Name
@@ -71,8 +129,10 @@ func (s *Server) handleListFiles(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"path":  path,
-		"files": result,
+		"path":       path,
+		"files":      result,
+		"hasMore":    hasMore,
+		"nextOffset": end,
 	})
 }
 
@@ -90,7 +150,7 @@ func (s *Server) handleFileContent(c *gin.Context) {
 		Keys: sess.Keys,
 	}
 
-	encPath, err := vault.GetEncryptedFilePath(path)
+	encPath, err := vault.ResolveExistingFilePath(path)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve path"})
 		return
@@ -446,38 +506,19 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 		Keys: sess.Keys,
 	}
 
-	encPath, err := vault.GetEncryptedFilePath(path)
+	isDir, err := deleteVirtualPath(vault, path)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve path"})
-		return
-	}
-
-	info, err := os.Stat(encPath)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
-		return
-	}
-
-	if info.IsDir() {
-		if err := os.RemoveAll(encPath); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete directory"})
+		if os.IsNotExist(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
 			return
 		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete file"})
+		return
+	}
+
+	if isDir {
 		_ = s.db.DeleteFileIndexPrefix(sess.VaultID, path)
 	} else {
-		// For shortened names, encPath is .c9s/contents.c9r — remove the whole .c9s dir
-		parentDir := filepath.Dir(encPath)
-		if strings.HasSuffix(parentDir, crypto.ShortNameDir) {
-			if err := os.RemoveAll(parentDir); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete file"})
-				return
-			}
-		} else {
-			if err := os.Remove(encPath); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete file"})
-				return
-			}
-		}
 		_ = s.db.DeleteFileIndex(sess.VaultID, path)
 	}
 
@@ -513,24 +554,21 @@ func (s *Server) handleDeleteFilesBatch(c *gin.Context) {
 			continue
 		}
 
-		encPath, err := vault.GetEncryptedFilePath(path)
+		isDir, err := deleteVirtualPath(vault, path)
 		if err != nil {
-			failed[path] = "failed to resolve path"
+			if os.IsNotExist(err) {
+				failed[path] = "file not found"
+			} else {
+				failed[path] = "failed to delete file"
+			}
 			continue
 		}
 
-		parentDir := filepath.Dir(encPath)
-		if strings.HasSuffix(parentDir, crypto.ShortNameDir) {
-			err = os.RemoveAll(parentDir)
+		if isDir {
+			_ = s.db.DeleteFileIndexPrefix(sess.VaultID, path)
 		} else {
-			err = os.Remove(encPath)
+			_ = s.db.DeleteFileIndex(sess.VaultID, path)
 		}
-		if err != nil {
-			failed[path] = "failed to delete file"
-			continue
-		}
-
-		_ = s.db.DeleteFileIndex(sess.VaultID, path)
 		if s.thumbs != nil {
 			s.thumbs.DeleteThumbnail(sess.VaultID, path)
 		}
@@ -545,8 +583,16 @@ func (s *Server) handleDeleteFilesBatch(c *gin.Context) {
 
 func (s *Server) handleListDuplicates(c *gin.Context) {
 	sess := getSession(c)
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
 
-	rows, err := s.db.ListDuplicateGroupRows(sess.VaultID)
+	rows, hasMore, err := s.db.ListDuplicateGroupRows(sess.VaultID, offset, limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list duplicates"})
 		return
@@ -595,48 +641,29 @@ func (s *Server) handleListDuplicates(c *gin.Context) {
 		result = append(result, *groupsByHash[hash])
 	}
 
-	c.JSON(http.StatusOK, gin.H{"groups": result})
+	c.JSON(http.StatusOK, gin.H{
+		"groups":     result,
+		"hasMore":    hasMore,
+		"nextOffset": offset + len(result),
+	})
 }
 
 func (s *Server) handleRebuildFileIndex(c *gin.Context) {
 	sess := getSession(c)
 
-	vault := &crypto.Vault{
-		ID:   sess.VaultID,
-		Path: sess.VaultPath,
-		Keys: sess.Keys,
-	}
-
-	if err := s.db.ClearFileIndex(sess.VaultID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clear file index"})
+	taskID, err := task.GenerateID()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate task id"})
 		return
 	}
-
-	var indexed int
-	if err := vault.WalkFiles("/", func(virtualPath string, info crypto.FileInfo) error {
-		hash, err := vault.HashVirtualFile(virtualPath)
-		if err != nil {
-			return err
-		}
-		if err := s.db.UpsertFileIndex(&storage.FileIndexRecord{
-			VaultID:     sess.VaultID,
-			VirtualPath: virtualPath,
-			ContentHash: hash,
-			Size:        info.Size,
-			ModTime:     info.ModTime,
-		}); err != nil {
-			return err
-		}
-		indexed++
-		return nil
-	}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild file index: " + err.Error()})
+	if err := s.tasks.StartRebuildIndex(taskID, sess.VaultID, sess.VaultPath, sess.Keys); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start rebuild task: " + err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"indexed": indexed,
-		"message": "file index rebuilt",
+		"taskId":  taskID,
+		"message": "rebuild index task started",
 	})
 }
 
@@ -655,6 +682,29 @@ func removeEncryptedPath(encPath string) {
 		return
 	}
 	_ = os.Remove(encPath)
+}
+
+func deleteVirtualPath(vault *crypto.Vault, virtualPath string) (bool, error) {
+	encPath, err := vault.ResolveExistingFilePath(virtualPath)
+	if err != nil {
+		return false, err
+	}
+
+	info, err := os.Stat(encPath)
+	if err != nil {
+		return false, err
+	}
+
+	if info.IsDir() {
+		return true, os.RemoveAll(encPath)
+	}
+
+	parentDir := filepath.Dir(encPath)
+	if strings.HasSuffix(parentDir, crypto.ShortNameDir) {
+		return false, os.RemoveAll(parentDir)
+	}
+
+	return false, os.Remove(encPath)
 }
 
 func (s *Server) handleThumbnail(c *gin.Context) {

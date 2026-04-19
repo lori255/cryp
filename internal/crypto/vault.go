@@ -383,6 +383,48 @@ func (v *Vault) GetEncryptedFilePath(virtualPath string) (string, error) {
 	return filepath.Join(dirPath, encName+EncryptedExt), nil
 }
 
+// ResolveExistingFilePath returns the encrypted filesystem path for an existing
+// virtual path without creating any short-name metadata as a side effect.
+func (v *Vault) ResolveExistingFilePath(virtualPath string) (string, error) {
+	virtualPath = filepath.Clean(virtualPath)
+	dir := filepath.Dir(virtualPath)
+	name := filepath.Base(virtualPath)
+
+	dirPath, dirID, err := v.ResolvePath(dir)
+	if err != nil {
+		return "", err
+	}
+
+	encName, err := EncryptFileName(v.Keys.MACKey, name, dirID)
+	if err != nil {
+		return "", err
+	}
+
+	fsName, isShort := shortenEncName(encName)
+	if isShort {
+		fullEncName, err := readShortNameFile(dirPath, fsName)
+		if err != nil {
+			return filepath.Join(dirPath, fsName, "contents.c9r"), nil
+		}
+		if fullEncName != encName {
+			return filepath.Join(dirPath, fsName, "contents.c9r"), nil
+		}
+
+		shortDir := filepath.Join(dirPath, fsName)
+		if _, err := os.Stat(filepath.Join(shortDir, DirIDFile)); err == nil {
+			return shortDir, nil
+		}
+		return filepath.Join(shortDir, "contents.c9r"), nil
+	}
+
+	dirCandidate := filepath.Join(dirPath, encName)
+	if _, err := os.Stat(filepath.Join(dirCandidate, DirIDFile)); err == nil {
+		return dirCandidate, nil
+	}
+
+	return filepath.Join(dirPath, encName+EncryptedExt), nil
+}
+
 // CreateEncryptedDirectory creates a new encrypted directory
 func (v *Vault) CreateEncryptedDirectory(virtualPath string) error {
 	virtualPath = filepath.Clean(virtualPath)

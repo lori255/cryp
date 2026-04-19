@@ -28,6 +28,8 @@ type Manager struct {
 	thumbs  ThumbEnqueuer
 }
 
+const errTaskCancelled = "task cancelled"
+
 // NewManager creates a new task manager and recovers interrupted tasks
 func NewManager(db *storage.DB) *Manager {
 	m := &Manager{
@@ -89,6 +91,42 @@ func (m *Manager) StartImport(taskID, vaultID, vaultPath string, keys *crypto.Va
 	m.mu.Unlock()
 
 	go m.runImport(t, vaultPath, keys, cancel)
+	return nil
+}
+
+// StartRebuildIndex starts a background task that rebuilds the vault file index.
+func (m *Manager) StartRebuildIndex(taskID, vaultID, vaultPath string, keys *crypto.VaultKeys) error {
+	vault := &crypto.Vault{
+		ID:   vaultID,
+		Path: vaultPath,
+		Keys: keys,
+	}
+
+	totalFiles, totalBytes, err := countVaultFiles(vault)
+	if err != nil {
+		return fmt.Errorf("count vault files: %w", err)
+	}
+
+	t := &storage.TaskRecord{
+		ID:         taskID,
+		VaultID:    vaultID,
+		Type:       "index",
+		Status:     "running",
+		TotalFiles: totalFiles,
+		TotalBytes: totalBytes,
+		StartedAt:  time.Now().Unix(),
+	}
+
+	if err := m.db.CreateTask(t); err != nil {
+		return fmt.Errorf("create task: %w", err)
+	}
+
+	cancel := make(chan struct{})
+	m.mu.Lock()
+	m.running[taskID] = cancel
+	m.mu.Unlock()
+
+	go m.runRebuildIndex(t, vault, cancel)
 	return nil
 }
 
@@ -179,8 +217,13 @@ func (m *Manager) runImport(t *storage.TaskRecord, vaultPath string, keys *crypt
 
 	err := m.encryptDirRecursive(vault, keys, t, t.SourcePath, t.DestPath, cancel)
 	if err != nil {
-		t.Status = "error"
-		t.ErrorMsg = err.Error()
+		if err.Error() == errTaskCancelled {
+			t.Status = "cancelled"
+			t.ErrorMsg = ""
+		} else {
+			t.Status = "error"
+			t.ErrorMsg = err.Error()
+		}
 	} else {
 		t.Status = "done"
 	}
@@ -195,6 +238,66 @@ func (m *Manager) runImport(t *storage.TaskRecord, vaultPath string, keys *crypt
 	crypto.ReleaseMemoryAfterLargeFile()
 }
 
+func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, cancel chan struct{}) {
+	defer func() {
+		m.mu.Lock()
+		delete(m.running, t.ID)
+		m.mu.Unlock()
+	}()
+
+	if err := m.db.ClearFileIndex(t.VaultID); err != nil {
+		t.Status = "error"
+		t.ErrorMsg = err.Error()
+		_ = m.db.UpdateTask(t)
+		return
+	}
+
+	err := vault.WalkFiles("/", func(virtualPath string, info crypto.FileInfo) error {
+		select {
+		case <-cancel:
+			return fmt.Errorf(errTaskCancelled)
+		default:
+		}
+
+		t.CurrentFile = virtualPath
+		_ = m.db.UpdateTask(t)
+
+		hash, err := vault.HashVirtualFile(virtualPath)
+		if err != nil {
+			return fmt.Errorf("hash %s: %w", virtualPath, err)
+		}
+
+		if err := m.db.UpsertFileIndex(&storage.FileIndexRecord{
+			VaultID:     t.VaultID,
+			VirtualPath: virtualPath,
+			ContentHash: hash,
+			Size:        info.Size,
+			ModTime:     info.ModTime,
+		}); err != nil {
+			return fmt.Errorf("index %s: %w", virtualPath, err)
+		}
+
+		t.ProcessedFiles++
+		t.ProcessedBytes += info.Size
+		return m.db.UpdateTask(t)
+	})
+
+	if err != nil {
+		if err.Error() == errTaskCancelled {
+			t.Status = "cancelled"
+			t.ErrorMsg = ""
+		} else {
+			t.Status = "error"
+			t.ErrorMsg = err.Error()
+		}
+	} else {
+		t.Status = "done"
+		t.CurrentFile = ""
+	}
+
+	_ = m.db.UpdateTask(t)
+}
+
 func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKeys, t *storage.TaskRecord, srcPath, destPath string, cancel chan struct{}) error {
 	entries, err := os.ReadDir(srcPath)
 	if err != nil {
@@ -205,7 +308,7 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 		// Check cancellation
 		select {
 		case <-cancel:
-			return fmt.Errorf("task cancelled")
+			return fmt.Errorf(errTaskCancelled)
 		default:
 		}
 
@@ -275,6 +378,22 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 		}
 	}
 	return nil
+}
+
+func countVaultFiles(vault *crypto.Vault) (int, int64, error) {
+	count := 0
+	var totalBytes int64
+
+	err := vault.WalkFiles("/", func(_ string, info crypto.FileInfo) error {
+		count++
+		totalBytes += info.Size
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return count, totalBytes, nil
 }
 
 func countFiles(dir string) (int, int64, error) {

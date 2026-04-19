@@ -360,8 +360,12 @@ func (d *DB) ClearFileIndex(vaultID string) error {
 	return err
 }
 
-// ListDuplicateGroupRows returns flattened rows for duplicate files.
-func (d *DB) ListDuplicateGroupRows(vaultID string) ([]DuplicateGroupRow, error) {
+// ListDuplicateGroupRows returns flattened rows for duplicate files in paged groups.
+func (d *DB) ListDuplicateGroupRows(vaultID string, offset, limit int) ([]DuplicateGroupRow, bool, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
 	rows, err := d.Query(
 		`SELECT fi.content_hash, fi.virtual_path, fi.size, fi.mod_time
 		 FROM file_index fi
@@ -371,24 +375,62 @@ func (d *DB) ListDuplicateGroupRows(vaultID string) ([]DuplicateGroupRow, error)
 		 	WHERE vault_id=? AND content_hash <> ''
 		 	GROUP BY content_hash, size
 		 	HAVING COUNT(*) > 1
+		 	ORDER BY size DESC, content_hash
+		 	LIMIT ? OFFSET ?
 		 ) dup
 		 ON dup.content_hash = fi.content_hash AND dup.size = fi.size
 		 WHERE fi.vault_id=?
 		 ORDER BY fi.size DESC, fi.content_hash, fi.mod_time ASC, fi.virtual_path ASC`,
-		vaultID, vaultID,
+		vaultID, limit+1, offset, vaultID,
 	)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
 
 	var result []DuplicateGroupRow
+	groupCount := 0
+	lastHash := ""
 	for rows.Next() {
 		var row DuplicateGroupRow
 		if err := rows.Scan(&row.ContentHash, &row.VirtualPath, &row.Size, &row.ModTime); err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		if row.ContentHash != lastHash {
+			groupCount++
+			lastHash = row.ContentHash
 		}
 		result = append(result, row)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+
+	hasMore := groupCount > limit
+	if !hasMore {
+		return result, false, nil
+	}
+
+	extraHash := ""
+	seenGroups := 0
+	for _, row := range result {
+		if row.ContentHash != extraHash {
+			seenGroups++
+			if seenGroups > limit {
+				extraHash = row.ContentHash
+				break
+			}
+			extraHash = row.ContentHash
+		}
+	}
+
+	trimmed := result[:0]
+	for _, row := range result {
+		if hasMore && row.ContentHash == extraHash {
+			break
+		}
+		trimmed = append(trimmed, row)
+	}
+
+	return trimmed, true, nil
 }

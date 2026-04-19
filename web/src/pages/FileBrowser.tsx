@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { PhotoProvider } from 'react-photo-view'
 import { api, type FileItem, joinPath } from '../lib/api'
@@ -18,28 +18,7 @@ type SortDirection = 'asc' | 'desc'
 
 const SORT_STORAGE_KEY = 'fileBrowserSort'
 
-function compareByField(a: FileItem, b: FileItem, field: SortField) {
-  switch (field) {
-    case 'modTime':
-      return (a.modTime || 0) - (b.modTime || 0)
-    case 'size':
-      return (a.size || 0) - (b.size || 0)
-    case 'name':
-    default:
-      return a.name.localeCompare(b.name, 'zh-CN', { numeric: true, sensitivity: 'base' })
-  }
-}
-
-function sortFiles(items: FileItem[], field: SortField, direction: SortDirection) {
-  return [...items].sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
-
-    const result = compareByField(a, b, field)
-    if (result !== 0) return direction === 'asc' ? result : -result
-
-    return a.name.localeCompare(b.name, 'zh-CN', { numeric: true, sensitivity: 'base' })
-  })
-}
+const PAGE_SIZE = 100
 
 export default function FileBrowser() {
   const { id: vaultId } = useParams<{ id: string }>()
@@ -47,6 +26,9 @@ export default function FileBrowser() {
   const [currentPath, setCurrentPath] = useState('/')
   const [files, setFiles] = useState<FileItem[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [hasMore, setHasMore] = useState(false)
+  const [nextOffset, setNextOffset] = useState(0)
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid')
   const [activeVideo, setActiveVideo] = useState<{ url: string; title: string } | null>(null)
   const [showUpload, setShowUpload] = useState(false)
@@ -75,14 +57,27 @@ export default function FileBrowser() {
       return 'asc'
     }
   })
+  const loadMoreRef = useRef<HTMLDivElement | null>(null)
 
-  const loadFiles = useCallback(async () => {
+  const loadFiles = useCallback(async (offset = 0, append = false) => {
     if (!vaultId) return
-    setLoading(true)
-    setError('')
+    if (append) {
+      setLoadingMore(true)
+    } else {
+      setLoading(true)
+      setError('')
+    }
     try {
-      const data = await api.listFiles(vaultId, currentPath)
-      setFiles(data.files || [])
+      const data = await api.listFiles(vaultId, currentPath, {
+        offset,
+        limit: PAGE_SIZE,
+        sortField,
+        sortDirection,
+      })
+      const nextFiles = data.files || []
+      setFiles((prev) => append ? [...prev, ...nextFiles] : nextFiles)
+      setHasMore(Boolean(data.hasMore))
+      setNextOffset(data.nextOffset ?? (offset + nextFiles.length))
     } catch (err) {
       if (err instanceof Error && err.message.includes('session')) {
         navigate('/')
@@ -90,16 +85,39 @@ export default function FileBrowser() {
       }
       setError(err instanceof Error ? err.message : '加载失败')
     } finally {
-      setLoading(false)
+      if (append) {
+        setLoadingMore(false)
+      } else {
+        setLoading(false)
+      }
     }
-  }, [vaultId, currentPath, navigate])
+  }, [vaultId, currentPath, navigate, sortField, sortDirection])
 
-  useEffect(() => { loadFiles() }, [loadFiles])
+  useEffect(() => {
+    setFiles([])
+    setHasMore(false)
+    setNextOffset(0)
+    void loadFiles(0, false)
+  }, [loadFiles])
   useEffect(() => {
     localStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ field: sortField, direction: sortDirection }))
   }, [sortField, sortDirection])
 
-  const sortedFiles = sortFiles(files, sortField, sortDirection)
+  useEffect(() => {
+    if (!hasMore || loading || loadingMore) return
+    const target = loadMoreRef.current
+    if (!target) return
+
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[0]
+      if (entry?.isIntersecting) {
+        void loadFiles(nextOffset, true)
+      }
+    }, { rootMargin: '200px 0px' })
+
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [hasMore, loading, loadingMore, nextOffset, loadFiles])
 
   function navigateTo(path: string) {
     setFiles([])
@@ -219,7 +237,7 @@ export default function FileBrowser() {
         ) : error ? (
           <div className="text-center py-20">
             <p className="text-red-400">{error}</p>
-            <button onClick={loadFiles} className="mt-4 text-blue-500 hover:text-blue-400">重试</button>
+            <button onClick={() => void loadFiles(0, false)} className="mt-4 text-blue-500 hover:text-blue-400">重试</button>
           </div>
         ) : files.length === 0 ? (
           <div className="text-center py-20">
@@ -234,7 +252,7 @@ export default function FileBrowser() {
           <PhotoProvider>
             {viewMode === 'grid' ? (
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
-                {sortedFiles.map((file) => (
+                {files.map((file) => (
                   <FileGridItem
                     key={file.name}
                     file={file}
@@ -248,7 +266,7 @@ export default function FileBrowser() {
               </div>
             ) : (
               <div className="space-y-1">
-                {sortedFiles.map((file) => (
+                {files.map((file) => (
                   <FileListItem
                     key={file.name}
                     file={file}
@@ -259,6 +277,11 @@ export default function FileBrowser() {
                     onDelete={handleDelete}
                   />
                 ))}
+              </div>
+            )}
+            {(hasMore || loadingMore) && (
+              <div ref={loadMoreRef} className="flex items-center justify-center py-6 text-sm text-gray-500">
+                {loadingMore ? '加载更多文件中...' : '继续下滑加载更多'}
               </div>
             )}
           </PhotoProvider>
@@ -282,7 +305,13 @@ export default function FileBrowser() {
         <TaskPanel vaultId={vaultId} open={showTasks} onClose={() => setShowTasks(false)} onRefresh={loadFiles} />
       )}
       {vaultId && (
-        <DuplicatePanel vaultId={vaultId} open={showDuplicates} onClose={() => setShowDuplicates(false)} onRefresh={loadFiles} />
+        <DuplicatePanel
+          vaultId={vaultId}
+          open={showDuplicates}
+          onClose={() => setShowDuplicates(false)}
+          onRefresh={loadFiles}
+          onOpenTasks={() => setShowTasks(true)}
+        />
       )}
     </div>
   )
