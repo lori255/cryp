@@ -597,6 +597,11 @@ func (s *Server) handleListDuplicates(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list duplicates"})
 		return
 	}
+	stats, err := s.db.GetDuplicateStats(sess.VaultID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load duplicate stats"})
+		return
+	}
 
 	type duplicateFileResp struct {
 		Path     string `json:"path"`
@@ -645,6 +650,7 @@ func (s *Server) handleListDuplicates(c *gin.Context) {
 		"groups":     result,
 		"hasMore":    hasMore,
 		"nextOffset": offset + len(result),
+		"stats":      stats,
 	})
 }
 

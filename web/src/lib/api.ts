@@ -22,6 +22,14 @@ export interface DuplicateGroup {
   files: DuplicateFileItem[];
 }
 
+export interface DuplicateStats {
+  groupCount: number;
+  fileCount: number;
+  duplicateFileCount: number;
+  totalBytes: number;
+  duplicateTotalBytes: number;
+}
+
 export interface TaskRecord {
   id: string;
   vaultId: string;
@@ -201,7 +209,7 @@ class ApiClient {
   }
 
   async listDuplicates(vaultId: string, offset = 0, limit = 20) {
-    return this.request<{ groups: DuplicateGroup[]; hasMore: boolean; nextOffset: number }>(
+    return this.request<{ groups: DuplicateGroup[]; hasMore: boolean; nextOffset: number; stats: DuplicateStats }>(
       `/vaults/${vaultId}/files/duplicates?offset=${offset}&limit=${limit}`,
     );
   }

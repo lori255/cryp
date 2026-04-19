@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { PhotoProvider, PhotoView } from 'react-photo-view'
-import { X, CopyMinus, Loader2, RefreshCw, Trash2, ScanSearch, Image as ImageIcon, Film, File as FileIcon, ShieldCheck } from 'lucide-react'
+import { X, CopyMinus, Loader2, RefreshCw, Trash2, ScanSearch, Image as ImageIcon, Film, File as FileIcon, ShieldCheck, ChevronDown, ChevronRight } from 'lucide-react'
 import VideoPlayer from './VideoPlayer'
-import { api, type DuplicateGroup, type DuplicateFileItem, formatDate, formatSize, isImage, isVideo } from '../lib/api'
+import { api, type DuplicateGroup, type DuplicateFileItem, type DuplicateStats, formatDate, formatSize, isImage, isVideo } from '../lib/api'
 import { useImagePreviewSrc } from '../lib/useImagePreviewSrc'
 
 interface DuplicatePanelProps {
@@ -15,6 +15,7 @@ interface DuplicatePanelProps {
 
 type SelectionMap = Record<string, boolean>
 type KeeperMap = Record<string, string>
+type ExpandedMap = Record<string, boolean>
 const DUPLICATE_PAGE_SIZE = 20
 
 function buildDefaultState(groups: DuplicateGroup[]): { selections: SelectionMap; keepers: KeeperMap } {
@@ -47,6 +48,14 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
   const [message, setMessage] = useState('')
   const [selections, setSelections] = useState<SelectionMap>({})
   const [keepers, setKeepers] = useState<KeeperMap>({})
+  const [expanded, setExpanded] = useState<ExpandedMap>({})
+  const [stats, setStats] = useState<DuplicateStats>({
+    groupCount: 0,
+    fileCount: 0,
+    duplicateFileCount: 0,
+    totalBytes: 0,
+    duplicateTotalBytes: 0,
+  })
   const [hasMore, setHasMore] = useState(false)
   const [nextOffset, setNextOffset] = useState(0)
   const [activeVideo, setActiveVideo] = useState<{ url: string; title: string } | null>(null)
@@ -66,6 +75,14 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
       setGroups(nextGroups)
       setSelections(defaults.selections)
       setKeepers(defaults.keepers)
+      setExpanded({})
+      setStats(data.stats ?? {
+        groupCount: 0,
+        fileCount: 0,
+        duplicateFileCount: 0,
+        totalBytes: 0,
+        duplicateTotalBytes: 0,
+      })
       setHasMore(Boolean(data.hasMore))
       setNextOffset(data.nextOffset ?? nextGroups.length)
     } catch (err) {
@@ -86,6 +103,7 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
       setGroups((prev) => [...prev, ...appendedGroups])
       setSelections((prev) => ({ ...prev, ...defaults.selections }))
       setKeepers((prev) => ({ ...prev, ...defaults.keepers }))
+      setStats(data.stats ?? stats)
       setHasMore(Boolean(data.hasMore))
       setNextOffset(data.nextOffset ?? nextOffset + appendedGroups.length)
     } catch (err) {
@@ -182,6 +200,10 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
     return { count, bytes }
   }, [groups, selections])
 
+  function toggleExpanded(hash: string) {
+    setExpanded((prev) => ({ ...prev, [hash]: !prev[hash] }))
+  }
+
   if (!open) return null
 
   return (
@@ -216,7 +238,10 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
 
         <div className="px-4 py-3 border-b border-gray-800 flex flex-wrap items-center justify-between gap-3 flex-shrink-0">
           <div className="text-sm text-gray-400">
-            已选 {selectedSummary.count} 个重复文件，可释放 {formatSize(selectedSummary.bytes)}
+            已选 {selectedSummary.count} / 总重复 {stats.duplicateFileCount} 个文件，可释放 {formatSize(selectedSummary.bytes)} / {formatSize(stats.duplicateTotalBytes)}
+            <div className="text-xs text-gray-500 mt-1">
+              共 {stats.groupCount} 个重复组，涉及 {stats.fileCount} 个文件
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -258,51 +283,75 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
                 const duplicates = group.files.filter((file) => file.path !== keeper.path)
                 const selectedCount = duplicates.filter((file) => selections[file.path]).length
                 const reclaimable = duplicates.filter((file) => selections[file.path]).reduce((sum, file) => sum + file.size, 0)
+                const isExpanded = Boolean(expanded[group.contentHash])
 
                 return (
                   <section key={group.contentHash} className="bg-gray-900 border border-gray-800 rounded-2xl p-4 space-y-4">
                     <div className="flex flex-wrap items-center justify-between gap-3">
-                      <div>
-                        <h3 className="text-white font-medium">重复组 {group.files.length} 个文件</h3>
-                        <p className="text-xs text-gray-500">
-                          单文件大小 {formatSize(group.size)}，当前选中 {selectedCount} 个，可释放 {formatSize(reclaimable)}
-                        </p>
-                      </div>
                       <button
-                        onClick={() => selectGroupDuplicates(group)}
-                        className="inline-flex items-center gap-1 px-3 py-1.5 text-xs rounded-lg border border-gray-800 text-gray-300 hover:border-gray-700"
+                        onClick={() => toggleExpanded(group.contentHash)}
+                        className="flex min-w-0 flex-1 items-start gap-3 text-left"
                       >
-                        <ShieldCheck className="w-3.5 h-3.5" /> 选择本组重复项
+                        <span className="mt-0.5 text-gray-500">
+                          {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                        </span>
+                        <div className="min-w-0">
+                          <h3 className="text-white font-medium">重复组 {group.files.length} 个文件</h3>
+                          <p className="text-xs text-gray-400 truncate">保留：{keeper.path}</p>
+                          <p className="text-xs text-gray-500">
+                            单文件大小 {formatSize(group.size)}，当前选中 {selectedCount} 个，可释放 {formatSize(reclaimable)}
+                          </p>
+                        </div>
                       </button>
+                      <div className="flex items-center gap-2">
+                        {!isExpanded && (
+                          <button
+                            onClick={() => toggleExpanded(group.contentHash)}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 text-xs rounded-lg border border-gray-800 text-gray-300 hover:border-gray-700"
+                          >
+                            预览
+                          </button>
+                        )}
+                        <button
+                          onClick={() => selectGroupDuplicates(group)}
+                          className="inline-flex items-center gap-1 px-3 py-1.5 text-xs rounded-lg border border-gray-800 text-gray-300 hover:border-gray-700"
+                        >
+                          <ShieldCheck className="w-3.5 h-3.5" /> 选择本组重复项
+                        </button>
+                      </div>
                     </div>
 
-                    <div className="space-y-2">
-                      <div className="text-xs uppercase tracking-[0.2em] text-green-400">保留文件</div>
-                      <DuplicateFileCard
-                        vaultId={vaultId}
-                        file={keeper}
-                        isKeeper
-                        selected={false}
-                        onPreviewVideo={(url, title) => setActiveVideo({ url, title })}
-                      />
-                    </div>
-
-                    <div className="space-y-3">
-                      <div className="text-xs uppercase tracking-[0.2em] text-amber-300">重复文件</div>
-                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-                        {duplicates.map((file) => (
+                    {isExpanded && (
+                      <>
+                        <div className="space-y-2">
+                          <div className="text-xs uppercase tracking-[0.2em] text-green-400">保留文件</div>
                           <DuplicateFileCard
-                            key={file.path}
                             vaultId={vaultId}
-                            file={file}
-                            selected={Boolean(selections[file.path])}
-                            onSelectedChange={(checked) => setSelections((prev) => ({ ...prev, [file.path]: checked }))}
-                            onMakeKeeper={() => setKeeper(group, file.path)}
+                            file={keeper}
+                            isKeeper
+                            selected={false}
                             onPreviewVideo={(url, title) => setActiveVideo({ url, title })}
                           />
-                        ))}
-                      </div>
-                    </div>
+                        </div>
+
+                        <div className="space-y-3">
+                          <div className="text-xs uppercase tracking-[0.2em] text-amber-300">重复文件</div>
+                          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                            {duplicates.map((file) => (
+                              <DuplicateFileCard
+                                key={file.path}
+                                vaultId={vaultId}
+                                file={file}
+                                selected={Boolean(selections[file.path])}
+                                onSelectedChange={(checked) => setSelections((prev) => ({ ...prev, [file.path]: checked }))}
+                                onMakeKeeper={() => setKeeper(group, file.path)}
+                                onPreviewVideo={(url, title) => setActiveVideo({ url, title })}
+                              />
+                            ))}
+                          </div>
+                        </div>
+                      </>
+                    )}
                   </section>
                 )
               })}

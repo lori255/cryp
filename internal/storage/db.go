@@ -211,6 +211,15 @@ type DuplicateGroupRow struct {
 	ModTime     int64  `json:"modTime"`
 }
 
+// DuplicateStats summarizes duplicate files for a vault.
+type DuplicateStats struct {
+	GroupCount          int   `json:"groupCount"`
+	FileCount           int   `json:"fileCount"`
+	DuplicateFileCount  int   `json:"duplicateFileCount"`
+	TotalBytes          int64 `json:"totalBytes"`
+	DuplicateTotalBytes int64 `json:"duplicateTotalBytes"`
+}
+
 // CreateTask inserts a new task record
 func (d *DB) CreateTask(t *TaskRecord) error {
 	now := time.Now().Unix()
@@ -433,4 +442,30 @@ func (d *DB) ListDuplicateGroupRows(vaultID string, offset, limit int) ([]Duplic
 	}
 
 	return trimmed, true, nil
+}
+
+// GetDuplicateStats returns overall duplicate statistics for a vault.
+func (d *DB) GetDuplicateStats(vaultID string) (*DuplicateStats, error) {
+	row := d.QueryRow(
+		`SELECT
+			COUNT(*) AS group_count,
+			COALESCE(SUM(file_count), 0) AS file_count,
+			COALESCE(SUM(size * file_count), 0) AS total_bytes,
+			COALESCE(SUM(file_count - 1), 0) AS duplicate_file_count,
+			COALESCE(SUM(size * (file_count - 1)), 0) AS duplicate_total_bytes
+		 FROM (
+			SELECT content_hash, size, COUNT(*) AS file_count
+			FROM file_index
+			WHERE vault_id=? AND content_hash <> ''
+			GROUP BY content_hash, size
+			HAVING COUNT(*) > 1
+		 ) dup`,
+		vaultID,
+	)
+
+	var stats DuplicateStats
+	if err := row.Scan(&stats.GroupCount, &stats.FileCount, &stats.TotalBytes, &stats.DuplicateFileCount, &stats.DuplicateTotalBytes); err != nil {
+		return nil, err
+	}
+	return &stats, nil
 }
