@@ -145,6 +145,7 @@ function TaskItem({ task: t, onCancel, onDelete }: {
 }) {
   const pct = t.totalFiles > 0 ? Math.round((t.processedFiles / t.totalFiles) * 100) : 0
   const isActive = t.status === 'running'
+  const hasKnownTotal = t.totalFiles > 0
 
   const statusConfig: Record<string, { label: string; color: string }> = {
     pending: { label: '等待中', color: 'bg-yellow-500/20 text-yellow-400' },
@@ -179,7 +180,7 @@ function TaskItem({ task: t, onCancel, onDelete }: {
         </span>
       </div>
 
-      {(isActive || t.status === 'done') && (
+      {(isActive || t.status === 'done') && hasKnownTotal && (
         <div>
           <div className="flex justify-between text-xs text-gray-400 mb-1">
             <span>已处理 {t.processedFiles}/{t.totalFiles} 文件</span>
@@ -197,6 +198,13 @@ function TaskItem({ task: t, onCancel, onDelete }: {
               <span>{formatETA(t.startedAt, t.processedBytes, t.totalBytes)}</span>
             )}
           </div>
+        </div>
+      )}
+
+      {(isActive || t.status === 'done') && !hasKnownTotal && (
+        <div className="flex justify-between text-xs text-gray-500">
+          <span>已处理 {t.processedFiles} 个文件</span>
+          <span>{formatSize(t.processedBytes)}</span>
         </div>
       )}
 

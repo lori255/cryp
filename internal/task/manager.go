@@ -102,18 +102,11 @@ func (m *Manager) StartRebuildIndex(taskID, vaultID, vaultPath string, keys *cry
 		Keys: keys,
 	}
 
-	totalFiles, totalBytes, err := countVaultFiles(vault)
-	if err != nil {
-		return fmt.Errorf("count vault files: %w", err)
-	}
-
 	t := &storage.TaskRecord{
 		ID:         taskID,
 		VaultID:    vaultID,
 		Type:       "index",
 		Status:     "running",
-		TotalFiles: totalFiles,
-		TotalBytes: totalBytes,
 		StartedAt:  time.Now().Unix(),
 	}
 
@@ -292,6 +285,8 @@ func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, ca
 		}
 	} else {
 		t.Status = "done"
+		t.TotalFiles = t.ProcessedFiles
+		t.TotalBytes = t.ProcessedBytes
 		t.CurrentFile = ""
 	}
 
@@ -378,22 +373,6 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 		}
 	}
 	return nil
-}
-
-func countVaultFiles(vault *crypto.Vault) (int, int64, error) {
-	count := 0
-	var totalBytes int64
-
-	err := vault.WalkFiles("/", func(_ string, info crypto.FileInfo) error {
-		count++
-		totalBytes += info.Size
-		return nil
-	})
-	if err != nil {
-		return 0, 0, err
-	}
-
-	return count, totalBytes, nil
 }
 
 func countFiles(dir string) (int, int64, error) {
