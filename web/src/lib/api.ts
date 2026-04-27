@@ -132,7 +132,7 @@ class ApiClient {
     const limit = options?.limit ?? 100;
     const sortField = options?.sortField ?? 'name';
     const sortDirection = options?.sortDirection ?? 'asc';
-    return this.request<{ path: string; files: FileItem[]; hasMore: boolean; nextOffset: number }>(
+    return this.request<{ path: string; files: FileItem[]; hasMore: boolean; nextOffset: number; indexRequired?: boolean }>(
       `/vaults/${vaultId}/files?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}&sortField=${sortField}&sortDirection=${sortDirection}`,
     );
   }
@@ -209,7 +209,7 @@ class ApiClient {
   }
 
   async listDuplicates(vaultId: string, offset = 0, limit = 20) {
-    return this.request<{ groups: DuplicateGroup[]; hasMore: boolean; nextOffset: number; stats: DuplicateStats }>(
+    return this.request<{ groups: DuplicateGroup[]; hasMore: boolean; nextOffset: number; stats: DuplicateStats; indexRequired?: boolean }>(
       `/vaults/${vaultId}/files/duplicates?offset=${offset}&limit=${limit}`,
     );
   }

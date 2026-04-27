@@ -285,11 +285,14 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			if err := vault.CreateEncryptedDirectory(virtualPath); err != nil {
 				return fmt.Errorf("create dir %s: %w", virtualPath, err)
 			}
-			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, true, 0, 0, ""); err != nil {
+			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, true, false, 0, 0, ""); err != nil {
 				return fmt.Errorf("index dir %s: %w", virtualPath, err)
 			}
 			if err := m.encryptDirRecursive(vault, keys, t, entryPath, virtualPath, cancel); err != nil {
 				return err
+			}
+			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, true, true, 0, 0, ""); err != nil {
+				return fmt.Errorf("index dir complete %s: %w", virtualPath, err)
 			}
 		} else {
 			t.CurrentFile = entry.Name()
@@ -307,7 +310,7 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			}
 
 			protectedHash := crypto.ProtectContentHash(keys.MACKey, vault.ID, result.ContentHash)
-			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, false, result.PlaintextSize, result.ModTime, protectedHash); err != nil {
+			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, false, false, result.PlaintextSize, result.ModTime, protectedHash); err != nil {
 				return fmt.Errorf("index entry %s: %w", virtualPath, err)
 			}
 
@@ -343,13 +346,12 @@ func (m *Manager) rebuildEntryIndex(vault *crypto.Vault, t *storage.TaskRecord, 
 	default:
 	}
 
-	if err := m.upsertEntry(vault.Keys.MACKey, vault.ID, dirPath, true, 0, 0, ""); err != nil {
-		return fmt.Errorf("index dir %s: %w", dirPath, err)
-	}
-
 	entries, err := vault.ListDirectory(dirPath)
 	if err != nil {
 		return err
+	}
+	if err := m.upsertEntry(vault.Keys.MACKey, vault.ID, dirPath, true, true, 0, 0, ""); err != nil {
+		return fmt.Errorf("index dir %s: %w", dirPath, err)
 	}
 
 	for _, entry := range entries {
@@ -376,7 +378,7 @@ func (m *Manager) rebuildEntryIndex(vault *crypto.Vault, t *storage.TaskRecord, 
 		}
 		protectedHash := crypto.ProtectContentHash(vault.Keys.MACKey, t.VaultID, hash)
 
-		if err := m.upsertEntry(vault.Keys.MACKey, t.VaultID, virtualPath, false, entry.Size, entry.ModTime, protectedHash); err != nil {
+		if err := m.upsertEntry(vault.Keys.MACKey, t.VaultID, virtualPath, false, false, entry.Size, entry.ModTime, protectedHash); err != nil {
 			return fmt.Errorf("index entry %s: %w", virtualPath, err)
 		}
 
@@ -390,15 +392,15 @@ func (m *Manager) rebuildEntryIndex(vault *crypto.Vault, t *storage.TaskRecord, 
 	return nil
 }
 
-func (m *Manager) upsertEntry(macKey []byte, vaultID, virtualPath string, isDir bool, size, modTime int64, protectedHash string) error {
-	record, err := buildEntryRecord(macKey, vaultID, virtualPath, isDir, size, modTime, protectedHash)
+func (m *Manager) upsertEntry(macKey []byte, vaultID, virtualPath string, isDir bool, childrenIndexed bool, size, modTime int64, protectedHash string) error {
+	record, err := buildEntryRecord(macKey, vaultID, virtualPath, isDir, childrenIndexed, size, modTime, protectedHash)
 	if err != nil {
 		return err
 	}
 	return m.db.UpsertEntry(record)
 }
 
-func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, size, modTime int64, protectedHash string) (*storage.EntryRecord, error) {
+func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, childrenIndexed bool, size, modTime int64, protectedHash string) (*storage.EntryRecord, error) {
 	normalized := crypto.NormalizeVirtualPath(virtualPath)
 	pathKey, err := crypto.EncryptIndexPath(macKey, vaultID, normalized)
 	if err != nil {
@@ -421,14 +423,15 @@ func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, si
 		size = 0
 	}
 	return &storage.EntryRecord{
-		VaultID:     vaultID,
-		PathKey:     pathKey,
-		ParentKey:   parentKey,
-		NameKey:     nameKey,
-		IsDir:       isDir,
-		ContentHash: protectedHash,
-		Size:        size,
-		ModTime:     modTime,
+		VaultID:         vaultID,
+		PathKey:         pathKey,
+		ParentKey:       parentKey,
+		NameKey:         nameKey,
+		IsDir:           isDir,
+		ChildrenIndexed: childrenIndexed,
+		ContentHash:     protectedHash,
+		Size:            size,
+		ModTime:         modTime,
 	}, nil
 }
 

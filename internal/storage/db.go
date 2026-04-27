@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -85,6 +86,7 @@ func (d *DB) migrate() error {
 			parent_key TEXT NOT NULL,
 			name_key TEXT NOT NULL,
 			is_dir INTEGER NOT NULL DEFAULT 0,
+			children_indexed INTEGER NOT NULL DEFAULT 0,
 			content_hash TEXT NOT NULL DEFAULT '',
 			size INTEGER NOT NULL DEFAULT 0,
 			mod_time INTEGER NOT NULL DEFAULT 0,
@@ -105,8 +107,15 @@ func (d *DB) migrate() error {
 	`); err != nil {
 		return err
 	}
+	if _, err := d.Exec("ALTER TABLE vault_entries ADD COLUMN children_indexed INTEGER NOT NULL DEFAULT 0"); err != nil && !isDuplicateColumnErr(err) {
+		return err
+	}
 
 	return d.migratePathPrivacy()
+}
+
+func isDuplicateColumnErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column name")
 }
 
 func (d *DB) migratePathPrivacy() error {
@@ -245,16 +254,17 @@ type TaskRecord struct {
 // EntryRecord represents one indexed file or directory. Path-bearing fields are
 // deterministic encrypted keys, not plaintext paths.
 type EntryRecord struct {
-	VaultID     string `json:"vaultId"`
-	PathKey     string `json:"pathKey"`
-	ParentKey   string `json:"parentKey"`
-	NameKey     string `json:"nameKey"`
-	IsDir       bool   `json:"isDir"`
-	ContentHash string `json:"contentHash"`
-	Size        int64  `json:"size"`
-	ModTime     int64  `json:"modTime"`
-	CreatedAt   int64  `json:"createdAt"`
-	UpdatedAt   int64  `json:"updatedAt"`
+	VaultID         string `json:"vaultId"`
+	PathKey         string `json:"pathKey"`
+	ParentKey       string `json:"parentKey"`
+	NameKey         string `json:"nameKey"`
+	IsDir           bool   `json:"isDir"`
+	ChildrenIndexed bool   `json:"childrenIndexed"`
+	ContentHash     string `json:"contentHash"`
+	Size            int64  `json:"size"`
+	ModTime         int64  `json:"modTime"`
+	CreatedAt       int64  `json:"createdAt"`
+	UpdatedAt       int64  `json:"updatedAt"`
 }
 
 // DuplicateGroupRow is a flattened duplicate-file row.
@@ -398,40 +408,50 @@ func (d *DB) UpsertEntry(record *EntryRecord) error {
 	if record.IsDir {
 		isDir = 1
 	}
+	childrenIndexed := 0
+	if record.ChildrenIndexed {
+		childrenIndexed = 1
+	}
 
 	_, err := d.Exec(
-		`INSERT INTO vault_entries (vault_id, path_key, parent_key, name_key, is_dir, content_hash, size, mod_time, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO vault_entries (vault_id, path_key, parent_key, name_key, is_dir, children_indexed, content_hash, size, mod_time, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(vault_id, path_key) DO UPDATE SET
 			parent_key=excluded.parent_key,
 			name_key=excluded.name_key,
 			is_dir=excluded.is_dir,
+			children_indexed=excluded.children_indexed,
 			content_hash=excluded.content_hash,
 			size=excluded.size,
 			mod_time=excluded.mod_time,
 			updated_at=excluded.updated_at`,
-		record.VaultID, record.PathKey, record.ParentKey, record.NameKey, isDir, record.ContentHash, record.Size, record.ModTime, record.CreatedAt, record.UpdatedAt,
+		record.VaultID, record.PathKey, record.ParentKey, record.NameKey, isDir, childrenIndexed, record.ContentHash, record.Size, record.ModTime, record.CreatedAt, record.UpdatedAt,
 	)
 	return err
 }
 
-// EntryExists reports whether an indexed file or directory row exists.
-func (d *DB) EntryExists(vaultID, pathKey string) (bool, error) {
-	var exists int
-	err := d.QueryRow("SELECT 1 FROM vault_entries WHERE vault_id=? AND path_key=? LIMIT 1", vaultID, pathKey).Scan(&exists)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
+// GetEntry retrieves one indexed file or directory row.
+func (d *DB) GetEntry(vaultID, pathKey string) (*EntryRecord, error) {
+	var e EntryRecord
+	var isDir, childrenIndexed int
+	err := d.QueryRow(
+		`SELECT vault_id, path_key, parent_key, name_key, is_dir, children_indexed, content_hash, size, mod_time, created_at, updated_at
+		 FROM vault_entries
+		 WHERE vault_id=? AND path_key=?`,
+		vaultID, pathKey,
+	).Scan(&e.VaultID, &e.PathKey, &e.ParentKey, &e.NameKey, &isDir, &childrenIndexed, &e.ContentHash, &e.Size, &e.ModTime, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return true, nil
+	e.IsDir = isDir != 0
+	e.ChildrenIndexed = childrenIndexed != 0
+	return &e, nil
 }
 
 // ListChildEntries returns direct indexed children for a parent directory key.
 func (d *DB) ListChildEntries(vaultID, parentKey string) ([]EntryRecord, error) {
 	rows, err := d.Query(
-		`SELECT vault_id, path_key, parent_key, name_key, is_dir, content_hash, size, mod_time, created_at, updated_at
+		`SELECT vault_id, path_key, parent_key, name_key, is_dir, children_indexed, content_hash, size, mod_time, created_at, updated_at
 		 FROM vault_entries
 		 WHERE vault_id=? AND parent_key=?`,
 		vaultID, parentKey,
@@ -444,11 +464,12 @@ func (d *DB) ListChildEntries(vaultID, parentKey string) ([]EntryRecord, error) 
 	var entries []EntryRecord
 	for rows.Next() {
 		var e EntryRecord
-		var isDir int
-		if err := rows.Scan(&e.VaultID, &e.PathKey, &e.ParentKey, &e.NameKey, &isDir, &e.ContentHash, &e.Size, &e.ModTime, &e.CreatedAt, &e.UpdatedAt); err != nil {
+		var isDir, childrenIndexed int
+		if err := rows.Scan(&e.VaultID, &e.PathKey, &e.ParentKey, &e.NameKey, &isDir, &childrenIndexed, &e.ContentHash, &e.Size, &e.ModTime, &e.CreatedAt, &e.UpdatedAt); err != nil {
 			return nil, err
 		}
 		e.IsDir = isDir != 0
+		e.ChildrenIndexed = childrenIndexed != 0
 		entries = append(entries, e)
 	}
 	return entries, rows.Err()
@@ -486,7 +507,7 @@ func (d *DB) ListDuplicateGroupRows(vaultID string, offset, limit int) ([]Duplic
 		 ) dup
 		 ON dup.content_hash = fi.content_hash AND dup.size = fi.size
 		 WHERE fi.vault_id=?
-		 ORDER BY fi.size DESC, fi.content_hash, fi.mod_time ASC, fi.virtual_path ASC`,
+		 ORDER BY fi.size DESC, fi.content_hash, fi.mod_time ASC, fi.path_key ASC`,
 		vaultID, limit+1, offset, vaultID,
 	)
 	if err != nil {

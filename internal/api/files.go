@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -39,30 +40,20 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		limit = 100
 	}
 
-	vault := &crypto.Vault{
-		ID:   sess.VaultID,
-		Path: sess.VaultPath,
-		Keys: sess.Keys,
-	}
-
 	files, ok, err := s.listIndexedFiles(sess, path)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list indexed directory: " + err.Error()})
 		return
 	}
 	if !ok {
-		files, err = vault.ListDirectory(path)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list directory: " + err.Error()})
-			return
-		}
-		if files == nil {
-			files = []crypto.FileInfo{}
-		}
-		if err := s.indexDirectoryListing(sess.Keys.MACKey, sess.VaultID, path, files); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update directory index"})
-			return
-		}
+		c.JSON(http.StatusOK, gin.H{
+			"path":          path,
+			"files":         []fileListResp{},
+			"hasMore":       false,
+			"nextOffset":    0,
+			"indexRequired": true,
+		})
+		return
 	}
 
 	sort.Slice(files, func(i, j int) bool {
@@ -111,16 +102,7 @@ func (s *Server) handleListFiles(c *gin.Context) {
 	pageFiles := files[start:end]
 	hasMore := end < len(files)
 
-	// Build response with thumbnail availability
-	type fileResp struct {
-		Name     string `json:"name"`
-		IsDir    bool   `json:"isDir"`
-		Size     int64  `json:"size,omitempty"`
-		ModTime  int64  `json:"modTime,omitempty"`
-		HasThumb bool   `json:"hasThumb,omitempty"`
-	}
-
-	result := make([]fileResp, len(pageFiles))
+	result := make([]fileListResp, len(pageFiles))
 	for i, f := range pageFiles {
 		fullPath := path
 		if fullPath == "/" {
@@ -128,7 +110,7 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		} else {
 			fullPath = path + "/" + f.Name
 		}
-		result[i] = fileResp{
+		result[i] = fileListResp{
 			Name:    f.Name,
 			IsDir:   f.IsDir,
 			Size:    f.Size,
@@ -145,6 +127,14 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		"hasMore":    hasMore,
 		"nextOffset": end,
 	})
+}
+
+type fileListResp struct {
+	Name     string `json:"name"`
+	IsDir    bool   `json:"isDir"`
+	Size     int64  `json:"size,omitempty"`
+	ModTime  int64  `json:"modTime,omitempty"`
+	HasThumb bool   `json:"hasThumb,omitempty"`
 }
 
 func (s *Server) handleFileContent(c *gin.Context) {
@@ -442,7 +432,7 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 
 	modTime := outFileStatModTime(outFile)
 	protectedHash := crypto.ProtectContentHash(sess.Keys.MACKey, sess.VaultID, hex.EncodeToString(hasher.Sum(nil)))
-	if err := s.upsertEntry(sess.Keys.MACKey, sess.VaultID, virtualPath, false, written, modTime, protectedHash); err != nil {
+	if err := s.upsertEntry(sess.Keys.MACKey, sess.VaultID, virtualPath, false, false, written, modTime, protectedHash); err != nil {
 		removeEncryptedPath(encPath)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to index file"})
 		return
@@ -494,7 +484,7 @@ func (s *Server) handleMkdir(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create directory: " + err.Error()})
 		return
 	}
-	if err := s.upsertEntry(sess.Keys.MACKey, sess.VaultID, req.Path, true, 0, 0, ""); err != nil {
+	if err := s.upsertEntry(sess.Keys.MACKey, sess.VaultID, req.Path, true, true, 0, 0, ""); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to index directory"})
 		return
 	}
@@ -574,24 +564,6 @@ func (s *Server) handleListDuplicates(c *gin.Context) {
 	sess := getSession(c)
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
-	if offset < 0 {
-		offset = 0
-	}
-	if limit <= 0 || limit > 100 {
-		limit = 20
-	}
-
-	rows, hasMore, err := s.db.ListDuplicateGroupRows(sess.VaultID, offset, limit)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list duplicates"})
-		return
-	}
-	stats, err := s.db.GetDuplicateStats(sess.VaultID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load duplicate stats"})
-		return
-	}
-
 	type duplicateFileResp struct {
 		Path     string `json:"path"`
 		Name     string `json:"name"`
@@ -603,6 +575,45 @@ func (s *Server) handleListDuplicates(c *gin.Context) {
 		ContentHash string              `json:"contentHash"`
 		Size        int64               `json:"size"`
 		Files       []duplicateFileResp `json:"files"`
+	}
+
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+
+	rootKey, err := crypto.EncryptIndexPath(sess.Keys.MACKey, sess.VaultID, "/")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check file index"})
+		return
+	}
+	rootEntry, err := s.db.GetEntry(sess.VaultID, rootKey)
+	if err == sql.ErrNoRows || (err == nil && (!rootEntry.IsDir || !rootEntry.ChildrenIndexed)) {
+		c.JSON(http.StatusOK, gin.H{
+			"groups":        []duplicateGroupResp{},
+			"hasMore":       false,
+			"nextOffset":    0,
+			"indexRequired": true,
+			"stats":         storage.DuplicateStats{},
+		})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check file index"})
+		return
+	}
+
+	rows, hasMore, err := s.db.ListDuplicateGroupRows(sess.VaultID, offset, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list duplicates"})
+		return
+	}
+	stats, err := s.db.GetDuplicateStats(sess.VaultID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load duplicate stats"})
+		return
 	}
 
 	groupsByHash := make(map[string]*duplicateGroupResp)
@@ -846,21 +857,20 @@ func (s *Server) listIndexedFiles(sess *session.Session, virtualPath string) ([]
 		return nil, false, err
 	}
 
-	currentKey, err := crypto.EncryptIndexPath(sess.Keys.MACKey, sess.VaultID, virtualPath)
+	current, err := s.db.GetEntry(sess.VaultID, parentKey)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
 	if err != nil {
 		return nil, false, err
 	}
-	currentExists, err := s.db.EntryExists(sess.VaultID, currentKey)
-	if err != nil {
-		return nil, false, err
+	if !current.IsDir || !current.ChildrenIndexed {
+		return nil, false, nil
 	}
 
 	entries, err := s.db.ListChildEntries(sess.VaultID, parentKey)
 	if err != nil {
 		return nil, false, err
-	}
-	if len(entries) == 0 && !currentExists {
-		return nil, false, nil
 	}
 
 	files := make([]crypto.FileInfo, 0, len(entries))
@@ -879,28 +889,15 @@ func (s *Server) listIndexedFiles(sess *session.Session, virtualPath string) ([]
 	return files, true, nil
 }
 
-func (s *Server) indexDirectoryListing(macKey []byte, vaultID, virtualPath string, files []crypto.FileInfo) error {
-	if err := s.upsertEntry(macKey, vaultID, virtualPath, true, 0, 0, ""); err != nil {
-		return err
-	}
-	for _, file := range files {
-		childPath := joinVirtualPath(virtualPath, file.Name)
-		if err := s.upsertEntry(macKey, vaultID, childPath, file.IsDir, file.Size, file.ModTime, ""); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Server) upsertEntry(macKey []byte, vaultID, virtualPath string, isDir bool, size, modTime int64, protectedHash string) error {
-	record, err := buildEntryRecord(macKey, vaultID, virtualPath, isDir, size, modTime, protectedHash)
+func (s *Server) upsertEntry(macKey []byte, vaultID, virtualPath string, isDir bool, childrenIndexed bool, size, modTime int64, protectedHash string) error {
+	record, err := buildEntryRecord(macKey, vaultID, virtualPath, isDir, childrenIndexed, size, modTime, protectedHash)
 	if err != nil {
 		return err
 	}
 	return s.db.UpsertEntry(record)
 }
 
-func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, size, modTime int64, protectedHash string) (*storage.EntryRecord, error) {
+func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, childrenIndexed bool, size, modTime int64, protectedHash string) (*storage.EntryRecord, error) {
 	normalized := crypto.NormalizeVirtualPath(virtualPath)
 	pathKey, err := crypto.EncryptIndexPath(macKey, vaultID, normalized)
 	if err != nil {
@@ -923,13 +920,14 @@ func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, si
 		size = 0
 	}
 	return &storage.EntryRecord{
-		VaultID:     vaultID,
-		PathKey:     pathKey,
-		ParentKey:   parentKey,
-		NameKey:     nameKey,
-		IsDir:       isDir,
-		ContentHash: protectedHash,
-		Size:        size,
-		ModTime:     modTime,
+		VaultID:         vaultID,
+		PathKey:         pathKey,
+		ParentKey:       parentKey,
+		NameKey:         nameKey,
+		IsDir:           isDir,
+		ChildrenIndexed: childrenIndexed,
+		ContentHash:     protectedHash,
+		Size:            size,
+		ModTime:         modTime,
 	}, nil
 }

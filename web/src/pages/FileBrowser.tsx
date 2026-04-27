@@ -36,6 +36,7 @@ export default function FileBrowser() {
   const [showTasks, setShowTasks] = useState(false)
   const [showImport, setShowImport] = useState(false)
   const [showDuplicates, setShowDuplicates] = useState(false)
+  const [indexRequired, setIndexRequired] = useState(false)
   const [error, setError] = useState('')
   const [sortField, setSortField] = useState<SortField>(() => {
     const raw = localStorage.getItem(SORT_STORAGE_KEY)
@@ -75,6 +76,7 @@ export default function FileBrowser() {
         sortDirection,
       })
       const nextFiles = data.files || []
+      setIndexRequired(Boolean(data.indexRequired))
       setFiles((prev) => append ? [...prev, ...nextFiles] : nextFiles)
       setHasMore(Boolean(data.hasMore))
       setNextOffset(data.nextOffset ?? (offset + nextFiles.length))
@@ -149,6 +151,17 @@ export default function FileBrowser() {
       loadFiles()
     } catch (err) {
       setError(err instanceof Error ? err.message : '删除失败')
+    }
+  }
+
+  async function handleRebuildIndex() {
+    if (!vaultId) return
+    setError('')
+    try {
+      await api.rebuildFileIndex(vaultId)
+      setShowTasks(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '重建索引失败')
     }
   }
 
@@ -238,6 +251,12 @@ export default function FileBrowser() {
           <div className="text-center py-20">
             <p className="text-red-400">{error}</p>
             <button onClick={() => void loadFiles(0, false)} className="mt-4 text-blue-500 hover:text-blue-400">重试</button>
+          </div>
+        ) : indexRequired ? (
+          <div className="text-center py-20">
+            <Folder className="w-12 h-12 text-gray-700 mx-auto mb-4" />
+            <p className="text-gray-400">此目录尚未建立索引</p>
+            <button onClick={handleRebuildIndex} className="mt-4 text-blue-500 hover:text-blue-400 text-sm">重建索引</button>
           </div>
         ) : files.length === 0 ? (
           <div className="text-center py-20">

@@ -167,6 +167,10 @@ func (s *Server) handleCreateVault(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save vault record"})
 		return
 	}
+	if err := s.upsertEntry(keys.MACKey, id, "/", true, true, 0, 0, ""); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize vault index"})
+		return
+	}
 
 	// Auto-login after creation
 	sessionID, err := s.sessions.Create(id, vaultPath, keys)

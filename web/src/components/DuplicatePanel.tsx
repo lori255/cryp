@@ -46,6 +46,7 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
   const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
+  const [indexRequired, setIndexRequired] = useState(false)
   const [selections, setSelections] = useState<SelectionMap>({})
   const [keepers, setKeepers] = useState<KeeperMap>({})
   const [expanded, setExpanded] = useState<ExpandedMap>({})
@@ -72,6 +73,7 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
       const data = await api.listDuplicates(vaultId, 0, DUPLICATE_PAGE_SIZE)
       const nextGroups = data.groups || []
       const defaults = buildDefaultState(nextGroups)
+      setIndexRequired(Boolean(data.indexRequired))
       setGroups(nextGroups)
       setSelections(defaults.selections)
       setKeepers(defaults.keepers)
@@ -100,6 +102,7 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
       const data = await api.listDuplicates(vaultId, nextOffset, DUPLICATE_PAGE_SIZE)
       const appendedGroups = data.groups || []
       const defaults = buildDefaultState(appendedGroups)
+      setIndexRequired(Boolean(data.indexRequired))
       setGroups((prev) => [...prev, ...appendedGroups])
       setSelections((prev) => ({ ...prev, ...defaults.selections }))
       setKeepers((prev) => ({ ...prev, ...defaults.keepers }))
@@ -268,6 +271,12 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
           {loading ? (
             <div className="flex items-center justify-center py-20">
               <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent" />
+            </div>
+          ) : indexRequired ? (
+            <div className="text-center py-20">
+              <CopyMinus className="w-12 h-12 text-gray-700 mx-auto mb-4" />
+              <p className="text-gray-400">文件索引尚未完成</p>
+              <p className="text-sm text-gray-500 mt-2">请先点“重建索引”，完成后再查看重复文件。</p>
             </div>
           ) : groups.length === 0 ? (
             <div className="text-center py-20">
