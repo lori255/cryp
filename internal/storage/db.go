@@ -49,7 +49,7 @@ func NewDB(dataDir string) (*DB, error) {
 }
 
 func (d *DB) migrate() error {
-	_, err := d.Exec(`
+	if _, err := d.Exec(`
 		CREATE TABLE IF NOT EXISTS vaults (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
@@ -92,8 +92,56 @@ func (d *DB) migrate() error {
 
 		CREATE INDEX IF NOT EXISTS idx_file_index_vault_hash ON file_index(vault_id, content_hash, size);
 		CREATE INDEX IF NOT EXISTS idx_file_index_vault_path ON file_index(vault_id, virtual_path);
-	`)
-	return err
+
+		CREATE TABLE IF NOT EXISTS app_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`); err != nil {
+		return err
+	}
+
+	return d.migratePathPrivacy()
+}
+
+func (d *DB) migratePathPrivacy() error {
+	const migrationKey = "path_privacy_v1"
+	var value string
+	err := d.QueryRow("SELECT value FROM app_meta WHERE key=?", migrationKey).Scan(&value)
+	if err == nil && value == "done" {
+		return nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Existing rows used plaintext virtual paths. They cannot be encrypted
+	// without the vault password, so remove them and let users rebuild the
+	// duplicate index after login.
+	if _, err := tx.Exec("DELETE FROM file_index"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE tasks SET current_file='', error_msg='', source_path='', dest_path=''"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, 'done')", migrationKey); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Physically rewrite the database so deleted plaintext metadata is not
+	// left in free pages. Ignore failure; the logical migration is complete.
+	_, _ = d.Exec("VACUUM")
+	_, _ = d.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return nil
 }
 
 // CreateVault inserts a new vault record
@@ -232,7 +280,7 @@ func (d *DB) CreateTask(t *TaskRecord) error {
 	_, err := d.Exec(
 		`INSERT INTO tasks (id, vault_id, type, status, total_files, processed_files, total_bytes, processed_bytes, current_file, error_msg, source_path, dest_path, delete_source, started_at, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.VaultID, t.Type, t.Status, t.TotalFiles, t.ProcessedFiles, t.TotalBytes, t.ProcessedBytes, t.CurrentFile, t.ErrorMsg, t.SourcePath, t.DestPath, delSrc, t.StartedAt, t.CreatedAt, t.UpdatedAt,
+		t.ID, t.VaultID, t.Type, t.Status, t.TotalFiles, t.ProcessedFiles, t.TotalBytes, t.ProcessedBytes, "", taskErrorForStorage(t), "", "", delSrc, t.StartedAt, t.CreatedAt, t.UpdatedAt,
 	)
 	return err
 }
@@ -246,9 +294,16 @@ func (d *DB) UpdateTask(t *TaskRecord) error {
 	}
 	_, err := d.Exec(
 		`UPDATE tasks SET status=?, total_files=?, processed_files=?, total_bytes=?, processed_bytes=?, current_file=?, error_msg=?, started_at=?, updated_at=?, delete_source=? WHERE id=?`,
-		t.Status, t.TotalFiles, t.ProcessedFiles, t.TotalBytes, t.ProcessedBytes, t.CurrentFile, t.ErrorMsg, t.StartedAt, t.UpdatedAt, delSrc, t.ID,
+		t.Status, t.TotalFiles, t.ProcessedFiles, t.TotalBytes, t.ProcessedBytes, "", taskErrorForStorage(t), t.StartedAt, t.UpdatedAt, delSrc, t.ID,
 	)
 	return err
+}
+
+func taskErrorForStorage(t *TaskRecord) string {
+	if t != nil && t.Status == "error" && t.ErrorMsg != "" {
+		return "task failed"
+	}
+	return ""
 }
 
 // GetTask retrieves a task by ID
@@ -350,16 +405,6 @@ func (d *DB) UpsertFileIndex(record *FileIndexRecord) error {
 // DeleteFileIndex removes one indexed file row.
 func (d *DB) DeleteFileIndex(vaultID, virtualPath string) error {
 	_, err := d.Exec("DELETE FROM file_index WHERE vault_id=? AND virtual_path=?", vaultID, virtualPath)
-	return err
-}
-
-// DeleteFileIndexPrefix removes indexed rows for a directory tree.
-func (d *DB) DeleteFileIndexPrefix(vaultID, virtualPath string) error {
-	likePrefix := "/%"
-	if virtualPath != "/" {
-		likePrefix = virtualPath + "/%"
-	}
-	_, err := d.Exec("DELETE FROM file_index WHERE vault_id=? AND (virtual_path=? OR virtual_path LIKE ?)", vaultID, virtualPath, likePrefix)
 	return err
 }
 

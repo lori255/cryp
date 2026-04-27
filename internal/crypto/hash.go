@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -9,6 +10,19 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// ProtectContentHash converts a plaintext content SHA-256 hex string into a
+// keyed digest before it is stored in SQLite metadata. Equal files still group
+// together inside the same vault, but the database no longer exposes a raw
+// hash that can be compared against known files without the vault key.
+func ProtectContentHash(macKey []byte, vaultID, plaintextHash string) string {
+	mac := hmac.New(sha256.New, macKey)
+	mac.Write([]byte("cryp:file-content-hash:v1:"))
+	mac.Write([]byte(vaultID))
+	mac.Write([]byte{0})
+	mac.Write([]byte(plaintextHash))
+	return hex.EncodeToString(mac.Sum(nil))
+}
 
 // HashVirtualFile returns the SHA-256 hash of a decrypted vault file.
 func (v *Vault) HashVirtualFile(virtualPath string) (string, error) {

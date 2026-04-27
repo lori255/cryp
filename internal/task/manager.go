@@ -103,11 +103,11 @@ func (m *Manager) StartRebuildIndex(taskID, vaultID, vaultPath string, keys *cry
 	}
 
 	t := &storage.TaskRecord{
-		ID:         taskID,
-		VaultID:    vaultID,
-		Type:       "index",
-		Status:     "running",
-		StartedAt:  time.Now().Unix(),
+		ID:        taskID,
+		VaultID:   vaultID,
+		Type:      "index",
+		Status:    "running",
+		StartedAt: time.Now().Unix(),
 	}
 
 	if err := m.db.CreateTask(t); err != nil {
@@ -260,10 +260,15 @@ func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, ca
 			return fmt.Errorf("hash %s: %w", virtualPath, err)
 		}
 
+		indexPath, err := crypto.EncryptIndexPath(vault.Keys.MACKey, t.VaultID, virtualPath)
+		if err != nil {
+			return fmt.Errorf("encrypt index path %s: %w", virtualPath, err)
+		}
+
 		if err := m.db.UpsertFileIndex(&storage.FileIndexRecord{
 			VaultID:     t.VaultID,
-			VirtualPath: virtualPath,
-			ContentHash: hash,
+			VirtualPath: indexPath,
+			ContentHash: crypto.ProtectContentHash(vault.Keys.MACKey, t.VaultID, hash),
 			Size:        info.Size,
 			ModTime:     info.ModTime,
 		}); err != nil {
@@ -332,10 +337,23 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 				return fmt.Errorf("encrypt %s: %w", virtualPath, err)
 			}
 
+			indexPath, err := crypto.EncryptIndexPath(keys.MACKey, vault.ID, virtualPath)
+			if err != nil {
+				if encPath, resolveErr := vault.GetEncryptedFilePath(virtualPath); resolveErr == nil {
+					parentDir := filepath.Dir(encPath)
+					if strings.HasSuffix(parentDir, crypto.ShortNameDir) {
+						_ = os.RemoveAll(parentDir)
+					} else {
+						_ = os.Remove(encPath)
+					}
+				}
+				return fmt.Errorf("encrypt index path: %w", err)
+			}
+
 			if err := m.db.UpsertFileIndex(&storage.FileIndexRecord{
 				VaultID:     vault.ID,
-				VirtualPath: virtualPath,
-				ContentHash: result.ContentHash,
+				VirtualPath: indexPath,
+				ContentHash: crypto.ProtectContentHash(keys.MACKey, vault.ID, result.ContentHash),
 				Size:        result.PlaintextSize,
 				ModTime:     result.ModTime,
 			}); err != nil {

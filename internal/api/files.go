@@ -430,10 +430,17 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 	crypto.DropFileCache(outFile)
 
 	modTime := outFileStatModTime(outFile)
+	indexPath, err := crypto.EncryptIndexPath(sess.Keys.MACKey, sess.VaultID, virtualPath)
+	if err != nil {
+		removeEncryptedPath(encPath)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt index path"})
+		return
+	}
+
 	if err := s.db.UpsertFileIndex(&storage.FileIndexRecord{
 		VaultID:     sess.VaultID,
-		VirtualPath: virtualPath,
-		ContentHash: hex.EncodeToString(hasher.Sum(nil)),
+		VirtualPath: indexPath,
+		ContentHash: crypto.ProtectContentHash(sess.Keys.MACKey, sess.VaultID, hex.EncodeToString(hasher.Sum(nil))),
 		Size:        written,
 		ModTime:     modTime,
 	}); err != nil {
@@ -506,25 +513,13 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 		Keys: sess.Keys,
 	}
 
-	isDir, err := deleteVirtualPath(vault, path)
-	if err != nil {
+	if err := s.deleteVirtualPathWithCleanup(vault, sess.Keys.MACKey, sess.VaultID, path); err != nil {
 		if os.IsNotExist(err) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete file"})
 		return
-	}
-
-	if isDir {
-		_ = s.db.DeleteFileIndexPrefix(sess.VaultID, path)
-	} else {
-		_ = s.db.DeleteFileIndex(sess.VaultID, path)
-	}
-
-	// Clean up associated thumbnail if it exists
-	if s.thumbs != nil {
-		s.thumbs.DeleteThumbnail(sess.VaultID, path)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "deleted", "path": path})
@@ -554,8 +549,7 @@ func (s *Server) handleDeleteFilesBatch(c *gin.Context) {
 			continue
 		}
 
-		isDir, err := deleteVirtualPath(vault, path)
-		if err != nil {
+		if err := s.deleteVirtualPathWithCleanup(vault, sess.Keys.MACKey, sess.VaultID, path); err != nil {
 			if os.IsNotExist(err) {
 				failed[path] = "file not found"
 			} else {
@@ -564,14 +558,6 @@ func (s *Server) handleDeleteFilesBatch(c *gin.Context) {
 			continue
 		}
 
-		if isDir {
-			_ = s.db.DeleteFileIndexPrefix(sess.VaultID, path)
-		} else {
-			_ = s.db.DeleteFileIndex(sess.VaultID, path)
-		}
-		if s.thumbs != nil {
-			s.thumbs.DeleteThumbnail(sess.VaultID, path)
-		}
 		deleted = append(deleted, path)
 	}
 
@@ -629,13 +615,18 @@ func (s *Server) handleListDuplicates(c *gin.Context) {
 			order = append(order, row.ContentHash)
 		}
 
+		virtualPath, err := crypto.DecryptIndexPath(sess.Keys.MACKey, sess.VaultID, row.VirtualPath)
+		if err != nil {
+			continue
+		}
+
 		item := duplicateFileResp{
-			Path:    row.VirtualPath,
-			Name:    filepath.Base(row.VirtualPath),
+			Path:    virtualPath,
+			Name:    filepath.Base(virtualPath),
 			Size:    row.Size,
 			ModTime: row.ModTime,
 		}
-		if s.thumbs != nil && thumbnail.IsVideo(item.Name) && s.thumbs.HasThumbnail(sess.VaultID, row.VirtualPath) {
+		if s.thumbs != nil && thumbnail.IsVideo(item.Name) && s.thumbs.HasThumbnail(sess.VaultID, virtualPath) {
 			item.HasThumb = true
 		}
 		group.Files = append(group.Files, item)
@@ -688,6 +679,63 @@ func removeEncryptedPath(encPath string) {
 		return
 	}
 	_ = os.Remove(encPath)
+}
+
+func (s *Server) deleteVirtualPathWithCleanup(vault *crypto.Vault, macKey []byte, vaultID, virtualPath string) error {
+	encPath, err := vault.ResolveExistingFilePath(virtualPath)
+	if err != nil {
+		return err
+	}
+
+	info, err := os.Stat(encPath)
+	if err != nil {
+		return err
+	}
+
+	if !info.IsDir() {
+		if _, err := deleteVirtualPath(vault, virtualPath); err != nil {
+			return err
+		}
+		if err := s.cleanupDeletedFileMetadata(macKey, vaultID, virtualPath); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	files, err := vault.ListDirectory(virtualPath)
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		childPath := joinVirtualPath(virtualPath, file.Name)
+		if err := s.deleteVirtualPathWithCleanup(vault, macKey, vaultID, childPath); err != nil {
+			return err
+		}
+	}
+
+	_, err = deleteVirtualPath(vault, virtualPath)
+	return err
+}
+
+func (s *Server) cleanupDeletedFileMetadata(macKey []byte, vaultID, virtualPath string) error {
+	indexPath, err := crypto.EncryptIndexPath(macKey, vaultID, virtualPath)
+	if err != nil {
+		return err
+	}
+	if err := s.db.DeleteFileIndex(vaultID, indexPath); err != nil {
+		return err
+	}
+	if s.thumbs != nil {
+		s.thumbs.DeleteThumbnail(vaultID, crypto.NormalizeVirtualPath(virtualPath))
+	}
+	return nil
+}
+
+func joinVirtualPath(parent, name string) string {
+	if parent == "/" {
+		return "/" + name
+	}
+	return parent + "/" + name
 }
 
 func deleteVirtualPath(vault *crypto.Vault, virtualPath string) (bool, error) {

@@ -7,6 +7,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 )
 
 // AES-SIV (RFC 5297) implementation for deterministic filename encryption.
@@ -60,6 +62,37 @@ func DecryptFileName(macKey []byte, encryptedName string, dirID string) (string,
 	}
 
 	return string(plaintext), nil
+}
+
+// EncryptIndexPath encrypts a plaintext virtual path before it is stored in
+// SQLite metadata. It is deterministic so the encrypted value can be used as a
+// stable primary key, but it cannot be read without the vault MAC key.
+func EncryptIndexPath(macKey []byte, vaultID, virtualPath string) (string, error) {
+	return EncryptFileName(macKey, normalizeIndexPath(virtualPath), indexPathAAD(vaultID))
+}
+
+// DecryptIndexPath decrypts a virtual path stored by EncryptIndexPath.
+func DecryptIndexPath(macKey []byte, vaultID, encryptedPath string) (string, error) {
+	return DecryptFileName(macKey, encryptedPath, indexPathAAD(vaultID))
+}
+
+func NormalizeVirtualPath(virtualPath string) string {
+	return normalizeIndexPath(virtualPath)
+}
+
+func indexPathAAD(vaultID string) string {
+	return "cryp:file-index-path:v1:" + vaultID
+}
+
+func normalizeIndexPath(virtualPath string) string {
+	cleaned := filepath.Clean(virtualPath)
+	if cleaned == "." {
+		return "/"
+	}
+	if !strings.HasPrefix(cleaned, "/") {
+		return "/" + cleaned
+	}
+	return cleaned
 }
 
 // sivKeys holds the two AES keys used in SIV mode
