@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -238,47 +237,14 @@ func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, ca
 		m.mu.Unlock()
 	}()
 
-	if err := m.db.ClearFileIndex(t.VaultID); err != nil {
+	if err := m.db.ClearEntries(t.VaultID); err != nil {
 		t.Status = "error"
 		t.ErrorMsg = err.Error()
 		_ = m.db.UpdateTask(t)
 		return
 	}
 
-	err := vault.WalkFiles("/", func(virtualPath string, info crypto.FileInfo) error {
-		select {
-		case <-cancel:
-			return fmt.Errorf(errTaskCancelled)
-		default:
-		}
-
-		t.CurrentFile = virtualPath
-		_ = m.db.UpdateTask(t)
-
-		hash, err := vault.HashVirtualFile(virtualPath)
-		if err != nil {
-			return fmt.Errorf("hash %s: %w", virtualPath, err)
-		}
-
-		indexPath, err := crypto.EncryptIndexPath(vault.Keys.MACKey, t.VaultID, virtualPath)
-		if err != nil {
-			return fmt.Errorf("encrypt index path %s: %w", virtualPath, err)
-		}
-
-		if err := m.db.UpsertFileIndex(&storage.FileIndexRecord{
-			VaultID:     t.VaultID,
-			VirtualPath: indexPath,
-			ContentHash: crypto.ProtectContentHash(vault.Keys.MACKey, t.VaultID, hash),
-			Size:        info.Size,
-			ModTime:     info.ModTime,
-		}); err != nil {
-			return fmt.Errorf("index %s: %w", virtualPath, err)
-		}
-
-		t.ProcessedFiles++
-		t.ProcessedBytes += info.Size
-		return m.db.UpdateTask(t)
-	})
+	err := m.rebuildEntryIndex(vault, t, "/", cancel)
 
 	if err != nil {
 		if err.Error() == errTaskCancelled {
@@ -319,6 +285,9 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			if err := vault.CreateEncryptedDirectory(virtualPath); err != nil {
 				return fmt.Errorf("create dir %s: %w", virtualPath, err)
 			}
+			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, true, 0, 0, ""); err != nil {
+				return fmt.Errorf("index dir %s: %w", virtualPath, err)
+			}
 			if err := m.encryptDirRecursive(vault, keys, t, entryPath, virtualPath, cancel); err != nil {
 				return err
 			}
@@ -337,35 +306,9 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 				return fmt.Errorf("encrypt %s: %w", virtualPath, err)
 			}
 
-			indexPath, err := crypto.EncryptIndexPath(keys.MACKey, vault.ID, virtualPath)
-			if err != nil {
-				if encPath, resolveErr := vault.GetEncryptedFilePath(virtualPath); resolveErr == nil {
-					parentDir := filepath.Dir(encPath)
-					if strings.HasSuffix(parentDir, crypto.ShortNameDir) {
-						_ = os.RemoveAll(parentDir)
-					} else {
-						_ = os.Remove(encPath)
-					}
-				}
-				return fmt.Errorf("encrypt index path: %w", err)
-			}
-
-			if err := m.db.UpsertFileIndex(&storage.FileIndexRecord{
-				VaultID:     vault.ID,
-				VirtualPath: indexPath,
-				ContentHash: crypto.ProtectContentHash(keys.MACKey, vault.ID, result.ContentHash),
-				Size:        result.PlaintextSize,
-				ModTime:     result.ModTime,
-			}); err != nil {
-				if encPath, resolveErr := vault.GetEncryptedFilePath(virtualPath); resolveErr == nil {
-					parentDir := filepath.Dir(encPath)
-					if strings.HasSuffix(parentDir, crypto.ShortNameDir) {
-						_ = os.RemoveAll(parentDir)
-					} else {
-						_ = os.Remove(encPath)
-					}
-				}
-				return fmt.Errorf("index %s: %w", virtualPath, err)
+			protectedHash := crypto.ProtectContentHash(keys.MACKey, vault.ID, result.ContentHash)
+			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, false, result.PlaintextSize, result.ModTime, protectedHash); err != nil {
+				return fmt.Errorf("index entry %s: %w", virtualPath, err)
 			}
 
 			// Drop page cache for source file immediately after encryption.
@@ -391,6 +334,109 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 		}
 	}
 	return nil
+}
+
+func (m *Manager) rebuildEntryIndex(vault *crypto.Vault, t *storage.TaskRecord, dirPath string, cancel chan struct{}) error {
+	select {
+	case <-cancel:
+		return fmt.Errorf(errTaskCancelled)
+	default:
+	}
+
+	if err := m.upsertEntry(vault.Keys.MACKey, vault.ID, dirPath, true, 0, 0, ""); err != nil {
+		return fmt.Errorf("index dir %s: %w", dirPath, err)
+	}
+
+	entries, err := vault.ListDirectory(dirPath)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		select {
+		case <-cancel:
+			return fmt.Errorf(errTaskCancelled)
+		default:
+		}
+
+		virtualPath := joinVirtualPath(dirPath, entry.Name)
+		if entry.IsDir {
+			if err := m.rebuildEntryIndex(vault, t, virtualPath, cancel); err != nil {
+				return err
+			}
+			continue
+		}
+
+		t.CurrentFile = virtualPath
+		_ = m.db.UpdateTask(t)
+
+		hash, err := vault.HashVirtualFile(virtualPath)
+		if err != nil {
+			return fmt.Errorf("hash %s: %w", virtualPath, err)
+		}
+		protectedHash := crypto.ProtectContentHash(vault.Keys.MACKey, t.VaultID, hash)
+
+		if err := m.upsertEntry(vault.Keys.MACKey, t.VaultID, virtualPath, false, entry.Size, entry.ModTime, protectedHash); err != nil {
+			return fmt.Errorf("index entry %s: %w", virtualPath, err)
+		}
+
+		t.ProcessedFiles++
+		t.ProcessedBytes += entry.Size
+		if err := m.db.UpdateTask(t); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) upsertEntry(macKey []byte, vaultID, virtualPath string, isDir bool, size, modTime int64, protectedHash string) error {
+	record, err := buildEntryRecord(macKey, vaultID, virtualPath, isDir, size, modTime, protectedHash)
+	if err != nil {
+		return err
+	}
+	return m.db.UpsertEntry(record)
+}
+
+func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, size, modTime int64, protectedHash string) (*storage.EntryRecord, error) {
+	normalized := crypto.NormalizeVirtualPath(virtualPath)
+	pathKey, err := crypto.EncryptIndexPath(macKey, vaultID, normalized)
+	if err != nil {
+		return nil, err
+	}
+	parent := crypto.ParentVirtualPath(normalized)
+	parentKey := ""
+	if parent != "" {
+		parentKey, err = crypto.EncryptIndexPath(macKey, vaultID, parent)
+		if err != nil {
+			return nil, err
+		}
+	}
+	nameKey, err := crypto.EncryptEntryNameKey(macKey, vaultID, parentKey, crypto.BaseVirtualName(normalized))
+	if err != nil {
+		return nil, err
+	}
+	if isDir {
+		protectedHash = ""
+		size = 0
+	}
+	return &storage.EntryRecord{
+		VaultID:     vaultID,
+		PathKey:     pathKey,
+		ParentKey:   parentKey,
+		NameKey:     nameKey,
+		IsDir:       isDir,
+		ContentHash: protectedHash,
+		Size:        size,
+		ModTime:     modTime,
+	}, nil
+}
+
+func joinVirtualPath(parent, name string) string {
+	if parent == "/" {
+		return "/" + name
+	}
+	return parent + "/" + name
 }
 
 func countFiles(dir string) (int, int64, error) {

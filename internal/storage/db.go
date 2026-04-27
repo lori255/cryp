@@ -79,24 +79,29 @@ func (d *DB) migrate() error {
 
 		CREATE INDEX IF NOT EXISTS idx_tasks_vault ON tasks(vault_id);
 
-		CREATE TABLE IF NOT EXISTS file_index (
+		CREATE TABLE IF NOT EXISTS vault_entries (
 			vault_id TEXT NOT NULL,
-			virtual_path TEXT NOT NULL,
-			content_hash TEXT NOT NULL,
+			path_key TEXT NOT NULL,
+			parent_key TEXT NOT NULL,
+			name_key TEXT NOT NULL,
+			is_dir INTEGER NOT NULL DEFAULT 0,
+			content_hash TEXT NOT NULL DEFAULT '',
 			size INTEGER NOT NULL DEFAULT 0,
 			mod_time INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL,
-			PRIMARY KEY (vault_id, virtual_path)
+			PRIMARY KEY (vault_id, path_key)
 		);
 
-		CREATE INDEX IF NOT EXISTS idx_file_index_vault_hash ON file_index(vault_id, content_hash, size);
-		CREATE INDEX IF NOT EXISTS idx_file_index_vault_path ON file_index(vault_id, virtual_path);
+		CREATE INDEX IF NOT EXISTS idx_vault_entries_parent ON vault_entries(vault_id, parent_key, is_dir);
+		CREATE INDEX IF NOT EXISTS idx_vault_entries_hash ON vault_entries(vault_id, content_hash, size);
 
 		CREATE TABLE IF NOT EXISTS app_meta (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
+
+		DROP TABLE IF EXISTS file_index;
 	`); err != nil {
 		return err
 	}
@@ -121,12 +126,9 @@ func (d *DB) migratePathPrivacy() error {
 	}
 	defer tx.Rollback()
 
-	// Existing rows used plaintext virtual paths. They cannot be encrypted
-	// without the vault password, so remove them and let users rebuild the
-	// duplicate index after login.
-	if _, err := tx.Exec("DELETE FROM file_index"); err != nil {
-		return err
-	}
+	// Existing task rows may contain plaintext path/error text from older
+	// versions. Entry metadata is stored in vault_entries and is built after
+	// login with vault keys.
 	if _, err := tx.Exec("UPDATE tasks SET current_file='', error_msg='', source_path='', dest_path=''"); err != nil {
 		return err
 	}
@@ -208,7 +210,7 @@ func (d *DB) DeleteVault(id string) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec("DELETE FROM file_index WHERE vault_id = ?", id); err != nil {
+	if _, err := tx.Exec("DELETE FROM vault_entries WHERE vault_id = ?", id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM tasks WHERE vault_id = ?", id); err != nil {
@@ -240,10 +242,14 @@ type TaskRecord struct {
 	UpdatedAt      int64  `json:"updatedAt"`
 }
 
-// FileIndexRecord represents an indexed vault file for duplicate detection.
-type FileIndexRecord struct {
+// EntryRecord represents one indexed file or directory. Path-bearing fields are
+// deterministic encrypted keys, not plaintext paths.
+type EntryRecord struct {
 	VaultID     string `json:"vaultId"`
-	VirtualPath string `json:"virtualPath"`
+	PathKey     string `json:"pathKey"`
+	ParentKey   string `json:"parentKey"`
+	NameKey     string `json:"nameKey"`
+	IsDir       bool   `json:"isDir"`
 	ContentHash string `json:"contentHash"`
 	Size        int64  `json:"size"`
 	ModTime     int64  `json:"modTime"`
@@ -381,36 +387,82 @@ func (d *DB) DeleteCompletedTasks(vaultID string) (int64, error) {
 	return result.RowsAffected()
 }
 
-// UpsertFileIndex creates or updates an indexed file row.
-func (d *DB) UpsertFileIndex(record *FileIndexRecord) error {
+// UpsertEntry creates or updates an indexed file or directory row.
+func (d *DB) UpsertEntry(record *EntryRecord) error {
 	now := time.Now().Unix()
 	if record.CreatedAt == 0 {
 		record.CreatedAt = now
 	}
 	record.UpdatedAt = now
+	isDir := 0
+	if record.IsDir {
+		isDir = 1
+	}
 
 	_, err := d.Exec(
-		`INSERT INTO file_index (vault_id, virtual_path, content_hash, size, mod_time, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(vault_id, virtual_path) DO UPDATE SET
+		`INSERT INTO vault_entries (vault_id, path_key, parent_key, name_key, is_dir, content_hash, size, mod_time, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(vault_id, path_key) DO UPDATE SET
+			parent_key=excluded.parent_key,
+			name_key=excluded.name_key,
+			is_dir=excluded.is_dir,
 			content_hash=excluded.content_hash,
 			size=excluded.size,
 			mod_time=excluded.mod_time,
 			updated_at=excluded.updated_at`,
-		record.VaultID, record.VirtualPath, record.ContentHash, record.Size, record.ModTime, record.CreatedAt, record.UpdatedAt,
+		record.VaultID, record.PathKey, record.ParentKey, record.NameKey, isDir, record.ContentHash, record.Size, record.ModTime, record.CreatedAt, record.UpdatedAt,
 	)
 	return err
 }
 
-// DeleteFileIndex removes one indexed file row.
-func (d *DB) DeleteFileIndex(vaultID, virtualPath string) error {
-	_, err := d.Exec("DELETE FROM file_index WHERE vault_id=? AND virtual_path=?", vaultID, virtualPath)
+// EntryExists reports whether an indexed file or directory row exists.
+func (d *DB) EntryExists(vaultID, pathKey string) (bool, error) {
+	var exists int
+	err := d.QueryRow("SELECT 1 FROM vault_entries WHERE vault_id=? AND path_key=? LIMIT 1", vaultID, pathKey).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ListChildEntries returns direct indexed children for a parent directory key.
+func (d *DB) ListChildEntries(vaultID, parentKey string) ([]EntryRecord, error) {
+	rows, err := d.Query(
+		`SELECT vault_id, path_key, parent_key, name_key, is_dir, content_hash, size, mod_time, created_at, updated_at
+		 FROM vault_entries
+		 WHERE vault_id=? AND parent_key=?`,
+		vaultID, parentKey,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []EntryRecord
+	for rows.Next() {
+		var e EntryRecord
+		var isDir int
+		if err := rows.Scan(&e.VaultID, &e.PathKey, &e.ParentKey, &e.NameKey, &isDir, &e.ContentHash, &e.Size, &e.ModTime, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		e.IsDir = isDir != 0
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// DeleteEntry removes one indexed file or directory row.
+func (d *DB) DeleteEntry(vaultID, pathKey string) error {
+	_, err := d.Exec("DELETE FROM vault_entries WHERE vault_id=? AND path_key=?", vaultID, pathKey)
 	return err
 }
 
-// ClearFileIndex removes all indexed files for a vault.
-func (d *DB) ClearFileIndex(vaultID string) error {
-	_, err := d.Exec("DELETE FROM file_index WHERE vault_id=?", vaultID)
+// ClearEntries removes all indexed entries for a vault.
+func (d *DB) ClearEntries(vaultID string) error {
+	_, err := d.Exec("DELETE FROM vault_entries WHERE vault_id=?", vaultID)
 	return err
 }
 
@@ -421,12 +473,12 @@ func (d *DB) ListDuplicateGroupRows(vaultID string, offset, limit int) ([]Duplic
 	}
 
 	rows, err := d.Query(
-		`SELECT fi.content_hash, fi.virtual_path, fi.size, fi.mod_time
-		 FROM file_index fi
+		`SELECT fi.content_hash, fi.path_key, fi.size, fi.mod_time
+		 FROM vault_entries fi
 		 JOIN (
 		 	SELECT content_hash, size
-		 	FROM file_index
-		 	WHERE vault_id=? AND content_hash <> ''
+		 	FROM vault_entries
+		 	WHERE vault_id=? AND is_dir=0 AND content_hash <> ''
 		 	GROUP BY content_hash, size
 		 	HAVING COUNT(*) > 1
 		 	ORDER BY size DESC, content_hash
@@ -497,14 +549,14 @@ func (d *DB) GetDuplicateStats(vaultID string) (*DuplicateStats, error) {
 			COALESCE(SUM(file_count), 0) AS file_count,
 			COALESCE(SUM(size * file_count), 0) AS total_bytes,
 			COALESCE(SUM(file_count - 1), 0) AS duplicate_file_count,
-			COALESCE(SUM(size * (file_count - 1)), 0) AS duplicate_total_bytes
-		 FROM (
-			SELECT content_hash, size, COUNT(*) AS file_count
-			FROM file_index
-			WHERE vault_id=? AND content_hash <> ''
-			GROUP BY content_hash, size
-			HAVING COUNT(*) > 1
-		 ) dup`,
+				COALESCE(SUM(size * (file_count - 1)), 0) AS duplicate_total_bytes
+			 FROM (
+				SELECT content_hash, size, COUNT(*) AS file_count
+				FROM vault_entries
+				WHERE vault_id=? AND is_dir=0 AND content_hash <> ''
+				GROUP BY content_hash, size
+				HAVING COUNT(*) > 1
+			 ) dup`,
 		vaultID,
 	)
 

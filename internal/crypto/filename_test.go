@@ -78,3 +78,24 @@ func TestProtectContentHashIsDeterministicAndKeyed(t *testing.T) {
 		t.Fatalf("protected hash should be scoped by vault id")
 	}
 }
+
+func TestVirtualPathHelpers(t *testing.T) {
+	cases := []struct {
+		path   string
+		parent string
+		base   string
+	}{
+		{"/", "", "/"},
+		{"docs/report.pdf", "/docs", "report.pdf"},
+		{"/docs/report.pdf", "/docs", "report.pdf"},
+		{"/docs", "/", "docs"},
+	}
+	for _, tc := range cases {
+		if got := ParentVirtualPath(tc.path); got != tc.parent {
+			t.Fatalf("ParentVirtualPath(%q) = %q, want %q", tc.path, got, tc.parent)
+		}
+		if got := BaseVirtualName(tc.path); got != tc.base {
+			t.Fatalf("BaseVirtualName(%q) = %q, want %q", tc.path, got, tc.base)
+		}
+	}
+}

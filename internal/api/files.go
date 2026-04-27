@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"cryp/internal/crypto"
+	"cryp/internal/session"
 	"cryp/internal/storage"
 	"cryp/internal/task"
 	"cryp/internal/thumbnail"
@@ -26,7 +27,7 @@ import (
 
 func (s *Server) handleListFiles(c *gin.Context) {
 	sess := getSession(c)
-	path := c.DefaultQuery("path", "/")
+	path := crypto.NormalizeVirtualPath(c.DefaultQuery("path", "/"))
 	sortField := c.DefaultQuery("sortField", "name")
 	sortDirection := c.DefaultQuery("sortDirection", "asc")
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
@@ -44,14 +45,24 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		Keys: sess.Keys,
 	}
 
-	files, err := vault.ListDirectory(path)
+	files, ok, err := s.listIndexedFiles(sess, path)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list directory: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list indexed directory: " + err.Error()})
 		return
 	}
-
-	if files == nil {
-		files = []crypto.FileInfo{}
+	if !ok {
+		files, err = vault.ListDirectory(path)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list directory: " + err.Error()})
+			return
+		}
+		if files == nil {
+			files = []crypto.FileInfo{}
+		}
+		if err := s.indexDirectoryListing(sess.Keys.MACKey, sess.VaultID, path, files); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update directory index"})
+			return
+		}
 	}
 
 	sort.Slice(files, func(i, j int) bool {
@@ -430,20 +441,8 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 	crypto.DropFileCache(outFile)
 
 	modTime := outFileStatModTime(outFile)
-	indexPath, err := crypto.EncryptIndexPath(sess.Keys.MACKey, sess.VaultID, virtualPath)
-	if err != nil {
-		removeEncryptedPath(encPath)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt index path"})
-		return
-	}
-
-	if err := s.db.UpsertFileIndex(&storage.FileIndexRecord{
-		VaultID:     sess.VaultID,
-		VirtualPath: indexPath,
-		ContentHash: crypto.ProtectContentHash(sess.Keys.MACKey, sess.VaultID, hex.EncodeToString(hasher.Sum(nil))),
-		Size:        written,
-		ModTime:     modTime,
-	}); err != nil {
+	protectedHash := crypto.ProtectContentHash(sess.Keys.MACKey, sess.VaultID, hex.EncodeToString(hasher.Sum(nil)))
+	if err := s.upsertEntry(sess.Keys.MACKey, sess.VaultID, virtualPath, false, written, modTime, protectedHash); err != nil {
 		removeEncryptedPath(encPath)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to index file"})
 		return
@@ -493,6 +492,10 @@ func (s *Server) handleMkdir(c *gin.Context) {
 
 	if err := vault.CreateEncryptedDirectory(req.Path); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create directory: " + err.Error()})
+		return
+	}
+	if err := s.upsertEntry(sess.Keys.MACKey, sess.VaultID, req.Path, true, 0, 0, ""); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to index directory"})
 		return
 	}
 
@@ -713,8 +716,10 @@ func (s *Server) deleteVirtualPathWithCleanup(vault *crypto.Vault, macKey []byte
 		}
 	}
 
-	_, err = deleteVirtualPath(vault, virtualPath)
-	return err
+	if _, err := deleteVirtualPath(vault, virtualPath); err != nil {
+		return err
+	}
+	return s.cleanupDeletedDirectoryMetadata(macKey, vaultID, virtualPath)
 }
 
 func (s *Server) cleanupDeletedFileMetadata(macKey []byte, vaultID, virtualPath string) error {
@@ -722,13 +727,21 @@ func (s *Server) cleanupDeletedFileMetadata(macKey []byte, vaultID, virtualPath 
 	if err != nil {
 		return err
 	}
-	if err := s.db.DeleteFileIndex(vaultID, indexPath); err != nil {
+	if err := s.db.DeleteEntry(vaultID, indexPath); err != nil {
 		return err
 	}
 	if s.thumbs != nil {
 		s.thumbs.DeleteThumbnail(vaultID, crypto.NormalizeVirtualPath(virtualPath))
 	}
 	return nil
+}
+
+func (s *Server) cleanupDeletedDirectoryMetadata(macKey []byte, vaultID, virtualPath string) error {
+	indexPath, err := crypto.EncryptIndexPath(macKey, vaultID, virtualPath)
+	if err != nil {
+		return err
+	}
+	return s.db.DeleteEntry(vaultID, indexPath)
 }
 
 func joinVirtualPath(parent, name string) string {
@@ -825,4 +838,98 @@ func getContentType(ext string) string {
 		return t
 	}
 	return "application/octet-stream"
+}
+
+func (s *Server) listIndexedFiles(sess *session.Session, virtualPath string) ([]crypto.FileInfo, bool, error) {
+	parentKey, err := crypto.EncryptIndexPath(sess.Keys.MACKey, sess.VaultID, virtualPath)
+	if err != nil {
+		return nil, false, err
+	}
+
+	currentKey, err := crypto.EncryptIndexPath(sess.Keys.MACKey, sess.VaultID, virtualPath)
+	if err != nil {
+		return nil, false, err
+	}
+	currentExists, err := s.db.EntryExists(sess.VaultID, currentKey)
+	if err != nil {
+		return nil, false, err
+	}
+
+	entries, err := s.db.ListChildEntries(sess.VaultID, parentKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(entries) == 0 && !currentExists {
+		return nil, false, nil
+	}
+
+	files := make([]crypto.FileInfo, 0, len(entries))
+	for _, entry := range entries {
+		path, err := crypto.DecryptIndexPath(sess.Keys.MACKey, sess.VaultID, entry.PathKey)
+		if err != nil {
+			return nil, false, err
+		}
+		files = append(files, crypto.FileInfo{
+			Name:    crypto.BaseVirtualName(path),
+			IsDir:   entry.IsDir,
+			Size:    entry.Size,
+			ModTime: entry.ModTime,
+		})
+	}
+	return files, true, nil
+}
+
+func (s *Server) indexDirectoryListing(macKey []byte, vaultID, virtualPath string, files []crypto.FileInfo) error {
+	if err := s.upsertEntry(macKey, vaultID, virtualPath, true, 0, 0, ""); err != nil {
+		return err
+	}
+	for _, file := range files {
+		childPath := joinVirtualPath(virtualPath, file.Name)
+		if err := s.upsertEntry(macKey, vaultID, childPath, file.IsDir, file.Size, file.ModTime, ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) upsertEntry(macKey []byte, vaultID, virtualPath string, isDir bool, size, modTime int64, protectedHash string) error {
+	record, err := buildEntryRecord(macKey, vaultID, virtualPath, isDir, size, modTime, protectedHash)
+	if err != nil {
+		return err
+	}
+	return s.db.UpsertEntry(record)
+}
+
+func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, size, modTime int64, protectedHash string) (*storage.EntryRecord, error) {
+	normalized := crypto.NormalizeVirtualPath(virtualPath)
+	pathKey, err := crypto.EncryptIndexPath(macKey, vaultID, normalized)
+	if err != nil {
+		return nil, err
+	}
+	parent := crypto.ParentVirtualPath(normalized)
+	parentKey := ""
+	if parent != "" {
+		parentKey, err = crypto.EncryptIndexPath(macKey, vaultID, parent)
+		if err != nil {
+			return nil, err
+		}
+	}
+	nameKey, err := crypto.EncryptEntryNameKey(macKey, vaultID, parentKey, crypto.BaseVirtualName(normalized))
+	if err != nil {
+		return nil, err
+	}
+	if isDir {
+		protectedHash = ""
+		size = 0
+	}
+	return &storage.EntryRecord{
+		VaultID:     vaultID,
+		PathKey:     pathKey,
+		ParentKey:   parentKey,
+		NameKey:     nameKey,
+		IsDir:       isDir,
+		ContentHash: protectedHash,
+		Size:        size,
+		ModTime:     modTime,
+	}, nil
 }

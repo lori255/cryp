@@ -76,8 +76,35 @@ func DecryptIndexPath(macKey []byte, vaultID, encryptedPath string) (string, err
 	return DecryptFileName(macKey, encryptedPath, indexPathAAD(vaultID))
 }
 
+func EncryptEntryNameKey(macKey []byte, vaultID, parentKey, name string) (string, error) {
+	if name == "" {
+		name = "/"
+	}
+	return EncryptFileName(macKey, name, "cryp:entry-name:v1:"+vaultID+":"+parentKey)
+}
+
 func NormalizeVirtualPath(virtualPath string) string {
 	return normalizeIndexPath(virtualPath)
+}
+
+func ParentVirtualPath(virtualPath string) string {
+	normalized := normalizeIndexPath(virtualPath)
+	if normalized == "/" {
+		return ""
+	}
+	parent := filepath.Dir(normalized)
+	if parent == "." {
+		return "/"
+	}
+	return parent
+}
+
+func BaseVirtualName(virtualPath string) string {
+	normalized := normalizeIndexPath(virtualPath)
+	if normalized == "/" {
+		return "/"
+	}
+	return filepath.Base(normalized)
 }
 
 func indexPathAAD(vaultID string) string {
