@@ -14,7 +14,7 @@ export default function FileListItem({ file, vaultId, currentPath, onOpenDir, on
 }) {
   const filePath = joinPath(currentPath, file.name)
   const contentUrl = api.getContentUrl(vaultId, filePath)
-  const { src: previewUrl } = useImagePreviewSrc(file.name, contentUrl)
+  const { src: previewUrl } = useImagePreviewSrc(file.name, contentUrl, api.getThumbnailUrl(vaultId, filePath))
 
   function handleClick() {
     if (file.isDir) {

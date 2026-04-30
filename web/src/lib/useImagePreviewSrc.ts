@@ -69,7 +69,26 @@ function isApplePlatform(): boolean {
   return isIOS || isMac
 }
 
-export function useImagePreviewSrc(fileName: string, contentUrl: string): {
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+async function fetchThumbnailBlob(thumbnailUrl: string, shouldCancel: () => boolean): Promise<Blob> {
+  const attempts = 12
+  for (let i = 0; i < attempts; i++) {
+    const res = await fetch(thumbnailUrl, { credentials: 'include' })
+    if (res.ok) {
+      return res.blob()
+    }
+    if (res.status !== 404 || i === attempts - 1 || shouldCancel()) {
+      throw new Error(`failed to fetch thumbnail: ${res.status}`)
+    }
+    await wait(800)
+  }
+  throw new Error('thumbnail unavailable')
+}
+
+export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbnailUrl?: string): {
   src: string
   status: 'loading' | 'ready' | 'unavailable'
   onPreviewError: () => void
@@ -106,6 +125,45 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string): {
       setStatus('ready')
       return () => {
         cancelled = true
+      }
+    }
+
+    if (thumbnailUrl) {
+      const run = async () => {
+        try {
+          setStatus('loading')
+          setSrc('')
+          const outputBlob = await fetchThumbnailBlob(thumbnailUrl, () => cancelled)
+          const objectUrl = URL.createObjectURL(outputBlob)
+
+          if (cancelled) {
+            URL.revokeObjectURL(objectUrl)
+            return
+          }
+
+          if (objectUrlRef.current) {
+            URL.revokeObjectURL(objectUrlRef.current)
+          }
+          objectUrlRef.current = objectUrl
+          setSrc(objectUrl)
+          setStatus('ready')
+        } catch (err) {
+          if (!cancelled) {
+            console.warn('HEIF thumbnail failed', err)
+            setSrc('')
+            setStatus('unavailable')
+          }
+        }
+      }
+
+      void run()
+
+      return () => {
+        cancelled = true
+        if (objectUrlRef.current) {
+          URL.revokeObjectURL(objectUrlRef.current)
+          objectUrlRef.current = null
+        }
       }
     }
 
@@ -168,7 +226,7 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string): {
         objectUrlRef.current = null
       }
     }
-  }, [fileName, contentUrl, forceConvert])
+  }, [fileName, contentUrl, thumbnailUrl, forceConvert])
 
   return {
     src,

@@ -406,7 +406,11 @@ function DuplicateFileCard({
   onPreviewVideo: (url: string, title: string) => void
 }) {
   const contentUrl = api.getContentUrl(vaultId, file.path)
-  const { src: previewSrc, status: previewStatus, onPreviewError } = useImagePreviewSrc(file.name, contentUrl)
+  const { src: previewSrc, status: previewStatus, onPreviewError } = useImagePreviewSrc(
+    file.name,
+    contentUrl,
+    api.getThumbnailUrl(vaultId, file.path),
+  )
 
   return (
     <article className={`rounded-xl border p-3 ${isKeeper ? 'border-green-500/30 bg-green-500/5' : 'border-gray-800 bg-gray-950/60'}`}>
