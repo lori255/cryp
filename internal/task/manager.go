@@ -323,8 +323,8 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 				_ = os.Remove(entryPath)
 			}
 
-			// Enqueue video thumbnail generation
-			if m.thumbs != nil && thumbnail.IsVideo(entry.Name()) {
+			// Enqueue thumbnail generation for supported expensive previews.
+			if m.thumbs != nil && (thumbnail.IsVideo(entry.Name()) || thumbnail.IsHEIF(entry.Name())) {
 				m.thumbs.Enqueue(vault.ID, vault.Path, keys, virtualPath)
 			}
 			t.ProcessedFiles++

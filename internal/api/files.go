@@ -607,7 +607,7 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 	}
 
 	// Enqueue video thumbnail generation
-	if s.thumbs != nil && thumbnail.IsVideo(fileName) {
+	if s.thumbs != nil && (thumbnail.IsVideo(fileName) || thumbnail.IsHEIF(fileName)) {
 		s.thumbs.Enqueue(sess.VaultID, sess.VaultPath, sess.Keys, virtualPath)
 	}
 	c.JSON(http.StatusOK, gin.H{

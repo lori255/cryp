@@ -20,7 +20,7 @@ RUN CGO_ENABLED=1 go build -tags embed -ldflags='-s -w' -o /cryp ./cmd/server/
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates ffmpeg libheif-examples && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -s /bin/bash cryp
 WORKDIR /app
 
