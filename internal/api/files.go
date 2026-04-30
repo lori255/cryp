@@ -1,6 +1,7 @@
 package api
 
 import (
+	"archive/zip"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -10,6 +11,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -233,6 +235,159 @@ func (s *Server) handleFileContent(c *gin.Context) {
 
 	// Drop page cache after serving
 	crypto.DropFileCache(file)
+}
+
+func (s *Server) handleDownloadFile(c *gin.Context) {
+	sess := getSession(c)
+	rawPath := c.Query("path")
+	if rawPath == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path required"})
+		return
+	}
+	path := crypto.NormalizeVirtualPath(rawPath)
+
+	vault := &crypto.Vault{
+		ID:   sess.VaultID,
+		Path: sess.VaultPath,
+		Keys: sess.Keys,
+	}
+
+	encPath, err := vault.ResolveExistingFilePath(path)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+		return
+	}
+	info, err := os.Stat(encPath)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+		return
+	}
+
+	if !info.IsDir() {
+		if err := s.downloadSingleFile(c, vault, path); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to download file"})
+		}
+		return
+	}
+
+	zipName := downloadBaseName(path)
+	if zipName == "" {
+		zipName = "vault"
+	}
+	c.Header("Content-Type", "application/zip")
+	c.Header("Content-Disposition", contentDisposition(zipName+".zip"))
+	c.Status(http.StatusOK)
+
+	zw := zip.NewWriter(c.Writer)
+	defer zw.Close()
+
+	if err := s.writeDirectoryZip(zw, vault, path, zipName); err != nil {
+		return
+	}
+}
+
+func (s *Server) downloadSingleFile(c *gin.Context, vault *crypto.Vault, virtualPath string) error {
+	file, reader, plaintextSize, err := openDecryptedVirtualFile(vault, virtualPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	defer reader.Release()
+	defer crypto.DropFileCache(file)
+
+	name := downloadBaseName(virtualPath)
+	c.Header("Content-Type", getContentType(strings.ToLower(filepath.Ext(name))))
+	c.Header("Content-Length", strconv.FormatInt(plaintextSize, 10))
+	c.Header("Content-Disposition", contentDisposition(name))
+	c.Header("Accept-Ranges", "none")
+	c.Status(http.StatusOK)
+
+	bufp := crypto.CopyBufPool.Get().(*[]byte)
+	defer crypto.CopyBufPool.Put(bufp)
+	_, err = io.CopyBuffer(c.Writer, reader, *bufp)
+	return err
+}
+
+func (s *Server) writeDirectoryZip(zw *zip.Writer, vault *crypto.Vault, virtualPath, zipPath string) error {
+	files, err := vault.ListDirectory(virtualPath)
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 && zipPath != "" {
+		if _, err := zw.Create(safeZipPath(zipPath) + "/"); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	for _, file := range files {
+		childVirtualPath := joinVirtualPath(virtualPath, file.Name)
+		childZipPath := safeZipPath(pathJoinZip(zipPath, file.Name))
+		if file.IsDir {
+			if err := s.writeDirectoryZip(zw, vault, childVirtualPath, childZipPath); err != nil {
+				return err
+			}
+			continue
+		}
+
+		writer, err := zw.Create(childZipPath)
+		if err != nil {
+			return err
+		}
+		if err := streamDecryptedVirtualFile(vault, childVirtualPath, writer); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func streamDecryptedVirtualFile(vault *crypto.Vault, virtualPath string, dst io.Writer) error {
+	file, reader, _, err := openDecryptedVirtualFile(vault, virtualPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	defer reader.Release()
+	defer crypto.DropFileCache(file)
+
+	bufp := crypto.CopyBufPool.Get().(*[]byte)
+	defer crypto.CopyBufPool.Put(bufp)
+	_, err = io.CopyBuffer(dst, reader, *bufp)
+	return err
+}
+
+func openDecryptedVirtualFile(vault *crypto.Vault, virtualPath string) (*os.File, *crypto.DecryptingReader, int64, error) {
+	encPath, err := vault.ResolveExistingFilePath(virtualPath)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	file, err := os.Open(encPath)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	unix.Fadvise(int(file.Fd()), 0, 0, unix.FADV_SEQUENTIAL|unix.FADV_NOREUSE)
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, nil, 0, err
+	}
+
+	header, err := crypto.ReadFileHeader(file, vault.Keys.MasterKey)
+	if err != nil {
+		file.Close()
+		return nil, nil, 0, err
+	}
+
+	reader, err := crypto.NewDecryptingReader(file, header.ContentKey, header.Nonce)
+	if err != nil {
+		file.Close()
+		return nil, nil, 0, err
+	}
+
+	return file, reader, crypto.CipherSize2PlaintextSize(fileInfo.Size()), nil
 }
 
 func (s *Server) handleRangeRequest(c *gin.Context, file *os.File, header *crypto.FileHeader, totalSize int64, contentType string, rangeHeader string) {
@@ -762,6 +917,41 @@ func joinVirtualPath(parent, name string) string {
 	return parent + "/" + name
 }
 
+func downloadBaseName(virtualPath string) string {
+	normalized := crypto.NormalizeVirtualPath(virtualPath)
+	if normalized == "/" {
+		return ""
+	}
+	return crypto.BaseVirtualName(normalized)
+}
+
+func contentDisposition(filename string) string {
+	fallback := strings.NewReplacer("\\", "_", "\"", "_", "\r", "_", "\n", "_").Replace(filename)
+	if fallback == "" {
+		fallback = "download"
+	}
+	return fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", fallback, url.PathEscape(filename))
+}
+
+func pathJoinZip(parent, name string) string {
+	if parent == "" {
+		return name
+	}
+	return parent + "/" + name
+}
+
+func safeZipPath(p string) string {
+	parts := strings.Split(strings.ReplaceAll(p, "\\", "/"), "/")
+	clean := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			continue
+		}
+		clean = append(clean, part)
+	}
+	return strings.Join(clean, "/")
+}
+
 func deleteVirtualPath(vault *crypto.Vault, virtualPath string) (bool, error) {
 	encPath, err := vault.ResolveExistingFilePath(virtualPath)
 	if err != nil {
@@ -834,6 +1024,27 @@ func getContentType(ext string) string {
 		".mkv":  "video/x-matroska",
 		".avi":  "video/x-msvideo",
 		".mov":  "video/quicktime",
+		".m4v":  "video/x-m4v",
+		".flv":  "video/x-flv",
+		".wmv":  "video/x-ms-wmv",
+		".mpg":  "video/mpeg",
+		".mpeg": "video/mpeg",
+		".3gp":  "video/3gpp",
+		".3g2":  "video/3gpp2",
+		".ts":   "video/mp2t",
+		".mts":  "video/mp2t",
+		".m2ts": "video/mp2t",
+		".vob":  "video/dvd",
+		".ogv":  "video/ogg",
+		".asf":  "video/x-ms-asf",
+		".rm":   "application/vnd.rn-realmedia",
+		".rmvb": "application/vnd.rn-realmedia-vbr",
+		".divx": "video/divx",
+		".f4v":  "video/x-f4v",
+		".mxf":  "application/mxf",
+		".h264": "video/h264",
+		".h265": "video/h265",
+		".hevc": "video/h265",
 		".mp3":  "audio/mpeg",
 		".wav":  "audio/wav",
 		".ogg":  "audio/ogg",

@@ -154,6 +154,16 @@ export default function FileBrowser() {
     }
   }
 
+  function handleDownload(file: FileItem) {
+    if (!vaultId) return
+    const link = document.createElement('a')
+    link.href = api.getDownloadUrl(vaultId, getFilePath(file.name))
+    link.rel = 'noopener'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+  }
+
   async function handleRebuildIndex() {
     if (!vaultId) return
     setError('')
@@ -280,6 +290,7 @@ export default function FileBrowser() {
                     onOpenDir={openDir}
                     onPlayVideo={(url, title) => setActiveVideo({ url, title })}
                     onDelete={handleDelete}
+                    onDownload={handleDownload}
                   />
                 ))}
               </div>
@@ -294,6 +305,7 @@ export default function FileBrowser() {
                     onOpenDir={openDir}
                     onPlayVideo={(url, title) => setActiveVideo({ url, title })}
                     onDelete={handleDelete}
+                    onDownload={handleDownload}
                   />
                 ))}
               </div>

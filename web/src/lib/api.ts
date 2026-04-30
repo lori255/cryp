@@ -141,6 +141,10 @@ class ApiClient {
     return `${API_BASE}/vaults/${vaultId}/files/content?path=${encodeURIComponent(path)}`;
   }
 
+  getDownloadUrl(vaultId: string, path: string): string {
+    return `${API_BASE}/vaults/${vaultId}/files/download?path=${encodeURIComponent(path)}`;
+  }
+
   getThumbnailUrl(vaultId: string, path: string): string {
     return `${API_BASE}/vaults/${vaultId}/thumbnail?path=${encodeURIComponent(path)}`;
   }
@@ -277,7 +281,7 @@ export const isImage = (name: string): boolean =>
   /\.(jpg|jpeg|png|gif|webp|bmp|svg|ico|avif|heic|heif)$/i.test(name);
 
 export const isVideo = (name: string): boolean =>
-  /\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/i.test(name);
+  /\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv|mpg|mpeg|3gp|3g2|ts|mts|m2ts|vob|ogv|asf|rm|rmvb|divx|f4v|mxf|h264|h265|hevc)$/i.test(name);
 
 export const isAudio = (name: string): boolean =>
   /\.(mp3|wav|ogg|flac|aac|m4a|wma)$/i.test(name);

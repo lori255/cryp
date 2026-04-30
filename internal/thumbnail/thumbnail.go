@@ -30,6 +30,11 @@ const (
 var videoExtensions = map[string]bool{
 	".mp4": true, ".webm": true, ".mkv": true, ".avi": true,
 	".mov": true, ".m4v": true, ".flv": true, ".wmv": true,
+	".mpg": true, ".mpeg": true, ".3gp": true, ".3g2": true,
+	".ts": true, ".mts": true, ".m2ts": true, ".vob": true,
+	".ogv": true, ".asf": true, ".rm": true, ".rmvb": true,
+	".divx": true, ".f4v": true, ".mxf": true, ".h264": true,
+	".h265": true, ".hevc": true,
 }
 
 // IsVideo checks if a filename has a video extension

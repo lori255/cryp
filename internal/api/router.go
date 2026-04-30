@@ -106,6 +106,7 @@ func (s *Server) SetupRouter() *gin.Engine {
 		{
 			vaultOps.GET("/files", s.handleListFiles)
 			vaultOps.GET("/files/content", s.handleFileContent)
+			vaultOps.GET("/files/download", s.handleDownloadFile)
 			vaultOps.POST("/files/upload", s.handleUploadFile)
 			vaultOps.POST("/files/mkdir", s.handleMkdir)
 			vaultOps.DELETE("/files", s.handleDeleteFile)
