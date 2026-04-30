@@ -20,12 +20,13 @@ import (
 )
 
 const (
-	thumbDir     = "thumbnails"
-	thumbWidth   = 320
-	thumbHeight  = 180
-	queueSize    = 1000
-	maxRetries   = 1
-	failCooldown = 5 * time.Minute
+	thumbDir      = "thumbnails"
+	thumbWidth    = 320
+	thumbHeight   = 180
+	imageThumbMax = 1024
+	queueSize     = 1000
+	maxRetries    = 1
+	failCooldown  = 5 * time.Minute
 )
 
 // videoExtensions lists supported video file extensions
@@ -338,7 +339,11 @@ func (g *Generator) DeleteThumbnail(vaultID, virtualPath string) {
 
 // thumbPath returns the on-disk path for a thumbnail
 func (g *Generator) thumbPath(vaultID, virtualPath string) string {
-	hash := sha256.Sum256([]byte(virtualPath))
+	cacheKey := virtualPath
+	if IsHEIF(virtualPath) {
+		cacheKey += "\x00heif-v2"
+	}
+	hash := sha256.Sum256([]byte(cacheKey))
 	name := fmt.Sprintf("%x.c9r", hash)
 	return filepath.Join(g.vaultDir, vaultID, thumbDir, name)
 }
@@ -496,9 +501,9 @@ func (g *Generator) generateHEIF(job thumbJob) error {
 	ffmpegArgs := []string{
 		"-i", fullJPEGPath,
 		"-frames:v", "1",
-		"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black",
-			thumbWidth, thumbHeight, thumbWidth, thumbHeight),
-		"-q:v", "5",
+		"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease",
+			imageThumbMax, imageThumbMax),
+		"-q:v", "3",
 		"-f", "image2",
 		"-y", thumbTmp,
 	}
