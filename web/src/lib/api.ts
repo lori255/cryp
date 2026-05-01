@@ -141,6 +141,14 @@ class ApiClient {
     return `${API_BASE}/vaults/${vaultId}/files/content?path=${encodeURIComponent(path)}`;
   }
 
+  getHlsUrl(vaultId: string, path: string): string {
+    return `${API_BASE}/vaults/${vaultId}/files/hls?path=${encodeURIComponent(path)}`;
+  }
+
+  getVideoUrl(vaultId: string, path: string): string {
+    return this.getHlsUrl(vaultId, path);
+  }
+
   getDownloadUrl(vaultId: string, path: string): string {
     return `${API_BASE}/vaults/${vaultId}/files/download?path=${encodeURIComponent(path)}`;
   }

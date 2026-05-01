@@ -1,6 +1,7 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Artplayer from 'artplayer'
-import { X, Maximize } from 'lucide-react'
+import Hls from 'hls.js'
+import { AlertCircle, Maximize, X } from 'lucide-react'
 
 interface VideoPlayerProps {
   url: string
@@ -9,10 +10,17 @@ interface VideoPlayerProps {
 }
 
 export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
+  const [currentUrl, setCurrentUrl] = useState(url)
+  const [error, setError] = useState('')
   const containerRef = useRef<HTMLDivElement>(null)
   const artRef = useRef<Artplayer | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const unlockOrientationRef = useRef<(() => void) | null>(null)
+
+  useEffect(() => {
+    setCurrentUrl(url)
+    setError('')
+  }, [url])
 
   async function lockLandscapeOrientation() {
     const orientationApi = screen.orientation as ScreenOrientation & {
@@ -64,10 +72,17 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     if (!containerRef.current) return
 
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+    const hlsInstances: Hls[] = []
+    const destroyHlsInstances = () => {
+      while (hlsInstances.length > 0) {
+        hlsInstances.pop()?.destroy()
+      }
+    }
 
     const art = new Artplayer({
       container: containerRef.current,
-      url,
+      url: currentUrl,
+      type: currentUrl.includes('/files/hls') || currentUrl.includes('.m3u8') ? 'm3u8' : undefined,
       volume: 0.7,
       isLive: false,
       muted: false,
@@ -107,10 +122,38 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
         },
       }] : [],
       customType: {
-        // Ensure playsinline for iOS
-        m3u8: function (video: HTMLVideoElement) {
+        m3u8: function (video: HTMLVideoElement, sourceUrl: string) {
           video.setAttribute('playsinline', '')
           video.setAttribute('webkit-playsinline', '')
+
+          if (Hls.isSupported()) {
+            const hls = new Hls({
+              enableWorker: true,
+              lowLatencyMode: false,
+              backBufferLength: 30,
+              manifestLoadingMaxRetry: 2,
+              manifestLoadingRetryDelay: 1000,
+              manifestLoadingMaxRetryTimeout: 5000,
+              levelLoadingMaxRetry: 2,
+              levelLoadingRetryDelay: 1000,
+              fragLoadingMaxRetry: 3,
+              fragLoadingRetryDelay: 1000,
+            })
+            hls.loadSource(sourceUrl)
+            hls.attachMedia(video)
+            hlsInstances.push(hls)
+            hls.on(Hls.Events.ERROR, (_, data) => {
+              if (data.fatal) {
+                destroyHlsInstances()
+                setError('视频转码播放失败')
+              }
+            })
+            return
+          }
+
+          if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = sourceUrl
+          }
         },
       },
     })
@@ -134,6 +177,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       }
       let stallCheckTimer: number | null = null
       let hasRecoveredInitialStall = false
+      let hasTriedHlsFallback = currentUrl.includes('/files/hls')
 
       const clearStallCheck = () => {
         if (stallCheckTimer !== null) {
@@ -175,18 +219,34 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
         clearStallCheck()
       }
 
+      const handleVideoError = () => {
+        clearStallCheck()
+        if (!hasTriedHlsFallback && currentUrl.includes('/files/content')) {
+          hasTriedHlsFallback = true
+          setError('')
+          setCurrentUrl(currentUrl.replace('/files/content', '/files/hls'))
+          return
+        }
+        setError('视频转码播放失败')
+      }
+
       videoEl.addEventListener('webkitendfullscreen', releaseOrientationLock)
       document.addEventListener('fullscreenchange', handleFullscreenChange)
       videoEl.addEventListener('play', scheduleInitialStallRecovery)
       videoEl.addEventListener('timeupdate', handleTimeUpdate)
       videoEl.addEventListener('pause', handlePause)
+      videoEl.addEventListener('error', handleVideoError)
+      art.on('error', handleVideoError)
+      art.on('video:error', handleVideoError)
 
       art.on('destroy', () => {
+        destroyHlsInstances()
         videoEl.removeEventListener('webkitendfullscreen', releaseOrientationLock)
         document.removeEventListener('fullscreenchange', handleFullscreenChange)
         videoEl.removeEventListener('play', scheduleInitialStallRecovery)
         videoEl.removeEventListener('timeupdate', handleTimeUpdate)
         videoEl.removeEventListener('pause', handlePause)
+        videoEl.removeEventListener('error', handleVideoError)
         clearStallCheck()
         releaseOrientationLock()
       })
@@ -203,7 +263,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
         artRef.current = null
       }
     }
-  }, [url])
+  }, [currentUrl])
 
   useEffect(() => {
     const { style } = document.body
@@ -262,6 +322,12 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       <div className="flex-1 flex items-center justify-center px-4 pb-4" onClick={(e) => e.stopPropagation()}>
         <div className="w-full max-w-6xl h-[60vh] sm:h-[75vh] touch-manipulation">
           <div ref={containerRef} className="w-full h-full" />
+          {error && (
+            <div className="mt-3 flex items-center justify-center gap-2 text-sm text-red-300">
+              <AlertCircle className="w-4 h-4" />
+              <span>{error}</span>
+            </div>
+          )}
         </div>
       </div>
     </div>

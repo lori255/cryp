@@ -406,6 +406,7 @@ function DuplicateFileCard({
   onPreviewVideo: (url: string, title: string) => void
 }) {
   const contentUrl = api.getContentUrl(vaultId, file.path)
+  const videoUrl = api.getVideoUrl(vaultId, file.path)
   const { src: previewSrc, status: previewStatus, onPreviewError } = useImagePreviewSrc(
     file.name,
     contentUrl,
@@ -419,7 +420,6 @@ function DuplicateFileCard({
           <FilePreview
             vaultId={vaultId}
             file={file}
-            contentUrl={contentUrl}
             previewSrc={previewSrc}
             previewStatus={previewStatus}
             onPreviewError={onPreviewError}
@@ -456,7 +456,7 @@ function DuplicateFileCard({
             )}
             {isVideo(file.name) && (
               <button
-                onClick={() => onPreviewVideo(contentUrl, file.name)}
+                onClick={() => onPreviewVideo(videoUrl, file.name)}
                 className="px-2.5 py-1.5 rounded-lg border border-gray-800 text-xs text-gray-200 hover:border-gray-700"
               >
                 预览视频
@@ -480,7 +480,6 @@ function DuplicateFileCard({
 function FilePreview({
   vaultId,
   file,
-  contentUrl,
   previewSrc,
   previewStatus,
   onPreviewError,
@@ -488,7 +487,6 @@ function FilePreview({
 }: {
   vaultId: string
   file: DuplicateFileItem
-  contentUrl: string
   previewSrc: string
   previewStatus: 'loading' | 'ready' | 'unavailable'
   onPreviewError: () => void
@@ -508,7 +506,7 @@ function FilePreview({
   if (isVideo(file.name)) {
     if (file.hasThumb) {
       return (
-        <button className="w-full h-full" onClick={() => onPreviewVideo(contentUrl, file.name)}>
+        <button className="w-full h-full" onClick={() => onPreviewVideo(api.getVideoUrl(vaultId, file.path), file.name)}>
           <img src={api.getThumbnailUrl(vaultId, file.path)} alt={file.name} className="w-full h-full object-cover" />
         </button>
       )

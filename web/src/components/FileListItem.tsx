@@ -20,7 +20,7 @@ export default function FileListItem({ file, vaultId, currentPath, onOpenDir, on
     if (file.isDir) {
       onOpenDir(file.name)
     } else if (isVideo(file.name)) {
-      onPlayVideo(contentUrl, file.name)
+      onPlayVideo(api.getVideoUrl(vaultId, filePath), file.name)
     }
   }
 

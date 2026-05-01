@@ -21,6 +21,7 @@ export default function FileGridItem({ file, vaultId, currentPath, onOpenDir, on
 }) {
   const filePath = joinPath(currentPath, file.name)
   const contentUrl = api.getContentUrl(vaultId, filePath)
+  const videoUrl = api.getVideoUrl(vaultId, filePath)
   const thumbnailUrl = api.getThumbnailUrl(vaultId, filePath)
   const { src: previewUrl, status: previewStatus, onPreviewError } = useImagePreviewSrc(file.name, contentUrl, thumbnailUrl)
 
@@ -110,7 +111,7 @@ export default function FileGridItem({ file, vaultId, currentPath, onOpenDir, on
     const thumbUrl = file.hasThumb ? thumbnailUrl : ''
     return (
       <div className="relative group">
-        <div onClick={() => onPlayVideo(contentUrl, file.name)}
+        <div onClick={() => onPlayVideo(videoUrl, file.name)}
           className="w-full bg-gray-900 border border-gray-800 hover:border-gray-700 rounded-xl overflow-hidden transition-all text-center cursor-pointer">
           <div className="aspect-video bg-gray-800 flex items-center justify-center">
             {thumbUrl ? <VideoThumb src={thumbUrl} alt={file.name} /> : <Film className="w-10 h-10 text-purple-500" />}

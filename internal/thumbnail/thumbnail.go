@@ -387,6 +387,17 @@ func (g *Generator) worker() {
 // the moov atom (even at end of file) and extract a frame — all without any
 // plaintext ever touching disk.
 func (g *Generator) generate(job thumbJob) error {
+	vault := &crypto.Vault{
+		ID:   job.VaultID,
+		Path: job.VaultPath,
+		Keys: job.Keys,
+	}
+	if encPath, err := vault.ResolveExistingFilePath(job.FilePath); err == nil {
+		if info, statErr := os.Stat(encPath); statErr == nil && crypto.CipherSize2PlaintextSize(info.Size()) == 0 {
+			return nil
+		}
+	}
+
 	if IsHEIF(job.FilePath) {
 		return g.generateHEIF(job)
 	}
@@ -401,7 +412,7 @@ func (g *Generator) generate(job thumbJob) error {
 	defer g.sessions.Delete(sessionID)
 
 	// Build the internal URL for the content endpoint
-	contentURL := fmt.Sprintf("http://127.0.0.1:%s/api/vaults/%s/files/content?path=%s",
+	contentURL := fmt.Sprintf("http://127.0.0.1:%s/api/vaults/%s/files/content?probe=1&path=%s",
 		g.port, job.VaultID, url.QueryEscape(job.FilePath))
 
 	// Ensure thumbnail directory exists
@@ -419,6 +430,8 @@ func (g *Generator) generate(job thumbJob) error {
 		ffmpegArgs = appendAttemptHwArgs(ffmpegArgs, attempt)
 
 		ffmpegArgs = append(ffmpegArgs,
+			"-probesize", "100M",
+			"-analyzeduration", "100M",
 			// Pass session cookie via HTTP headers for authentication
 			"-headers", fmt.Sprintf("Cookie: session_id=%s\r\n", sessionID),
 			// Input from local HTTP server (supports Range for seeking)
@@ -601,7 +614,7 @@ func (g *Generator) scanDir(vault *crypto.Vault, dirPath string) {
 
 		if f.IsDir {
 			g.scanDir(vault, fullPath)
-		} else if (IsVideo(f.Name) || IsHEIF(f.Name)) && !g.HasThumbnail(vault.ID, fullPath) {
+		} else if f.Size > 0 && (IsVideo(f.Name) || IsHEIF(f.Name)) && !g.HasThumbnail(vault.ID, fullPath) {
 			g.Enqueue(vault.ID, vault.Path, vault.Keys, fullPath)
 		}
 	}

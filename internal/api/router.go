@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"cryp/internal/session"
 	"cryp/internal/storage"
@@ -24,6 +25,8 @@ type Server struct {
 	staticFS  fs.FS
 	scryptSem chan struct{} // limits concurrent scrypt derivations to prevent OOM
 	corsAllow map[string]struct{}
+	hlsMu     sync.Mutex
+	hls       map[string]*hlsStream
 }
 
 func NewServer(db *storage.DB, sessions *session.Store, tasks *task.Manager, thumbs *thumbnail.Generator, vaultDir string, staticFS fs.FS) *Server {
@@ -36,6 +39,7 @@ func NewServer(db *storage.DB, sessions *session.Store, tasks *task.Manager, thu
 		staticFS:  staticFS,
 		scryptSem: make(chan struct{}, 2), // max 2 concurrent scrypt ops (~64MB peak)
 		corsAllow: parseAllowedOrigins(os.Getenv("CRYP_ALLOWED_ORIGINS")),
+		hls:       make(map[string]*hlsStream),
 	}
 }
 
@@ -107,6 +111,8 @@ func (s *Server) SetupRouter() *gin.Engine {
 			vaultOps.GET("/files", s.handleListFiles)
 			vaultOps.GET("/files/content", s.handleFileContent)
 			vaultOps.GET("/files/download", s.handleDownloadFile)
+			vaultOps.GET("/files/hls", s.handleHLSStart)
+			vaultOps.GET("/files/hls/:stream/*name", s.handleHLSAsset)
 			vaultOps.POST("/files/upload", s.handleUploadFile)
 			vaultOps.POST("/files/mkdir", s.handleMkdir)
 			vaultOps.DELETE("/files", s.handleDeleteFile)

@@ -2,21 +2,27 @@ package api
 
 import (
 	"archive/zip"
+	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"cryp/internal/crypto"
 	"cryp/internal/session"
@@ -184,6 +190,17 @@ func (s *Server) handleFileContent(c *gin.Context) {
 	// Determine content type from decrypted filename
 	ext := strings.ToLower(filepath.Ext(path))
 	contentType := getContentType(ext)
+	if c.Query("probe") == "1" {
+		contentType = "application/octet-stream"
+	}
+
+	if plaintextSize == 0 {
+		c.Header("Content-Type", contentType)
+		c.Header("Content-Length", "0")
+		c.Header("Accept-Ranges", "bytes")
+		c.Status(http.StatusOK)
+		return
+	}
 
 	// Handle Range requests for video/audio seeking
 	rangeHeader := c.GetHeader("Range")
@@ -284,6 +301,363 @@ func (s *Server) handleDownloadFile(c *gin.Context) {
 	if err := s.writeDirectoryZip(zw, vault, path, zipName); err != nil {
 		return
 	}
+}
+
+type transcodeProfile struct {
+	name            string
+	beforeInputArgs []string
+	videoArgs       []string
+}
+
+type hlsStream struct {
+	dir       string
+	cmd       *exec.Cmd
+	cancel    context.CancelFunc
+	sessionID string
+	lastSeen  time.Time
+}
+
+var (
+	ffmpegEncodersOnce  sync.Once
+	ffmpegEncodersCache map[string]bool
+)
+
+func (s *Server) handleHLSStart(c *gin.Context) {
+	sess := getSession(c)
+	rawPath := c.Query("path")
+	if rawPath == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path required"})
+		return
+	}
+	path := crypto.NormalizeVirtualPath(rawPath)
+
+	keysCopy := sess.Keys.Clone()
+	sessionID, err := s.sessions.Create(sess.VaultID, sess.VaultPath, keysCopy)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create hls session"})
+		return
+	}
+
+	contentURL := fmt.Sprintf("http://127.0.0.1:%s/api/vaults/%s/files/content?probe=1&path=%s",
+		os.Getenv("PORT"), sess.VaultID, url.QueryEscape(path))
+	if os.Getenv("PORT") == "" {
+		contentURL = fmt.Sprintf("http://127.0.0.1:9527/api/vaults/%s/files/content?probe=1&path=%s",
+			sess.VaultID, url.QueryEscape(path))
+	}
+
+	streamID, err := randomHex(16)
+	if err != nil {
+		s.sessions.Delete(sessionID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create stream id"})
+		return
+	}
+	dir := filepath.Join(os.TempDir(), "cryp-hls-"+streamID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		s.sessions.Delete(sessionID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create hls temp dir"})
+		return
+	}
+
+	stream, err := s.startHLSStream(context.Background(), dir, contentURL, sessionID)
+	if err != nil {
+		s.sessions.Delete(sessionID)
+		os.RemoveAll(dir)
+		log.Printf("hls: failed for %s: %v", path, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start hls transcode"})
+		return
+	}
+
+	s.hlsMu.Lock()
+	s.hls[streamID] = stream
+	s.hlsMu.Unlock()
+
+	go s.cleanupHLSStream(streamID, stream)
+
+	c.Redirect(http.StatusFound, fmt.Sprintf("/api/vaults/%s/files/hls/%s/index.m3u8", sess.VaultID, streamID))
+}
+
+func (s *Server) startHLSStream(ctx context.Context, dir, contentURL, sessionID string) (*hlsStream, error) {
+	profiles := buildHLSProfiles()
+	var lastErr error
+	for _, profile := range profiles {
+		started := time.Now()
+		cmd, cancel, stderr, err := startHLSCommand(ctx, profile, dir, contentURL, sessionID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := waitForHLSReady(ctx, cmd, dir, 5*time.Second); err != nil {
+			cancel()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			lastErr = fmt.Errorf("hls %s failed: %w stderr=%s", profile.name, err, trimLog(stderr.String()))
+			continue
+		}
+		log.Printf("hls: started profile=%s in %s", profile.name, time.Since(started).Round(time.Millisecond))
+		return &hlsStream{dir: dir, cmd: cmd, cancel: cancel, sessionID: sessionID, lastSeen: time.Now()}, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no hls profile available")
+}
+
+func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, contentURL, sessionID string) (*exec.Cmd, context.CancelFunc, *bytes.Buffer, error) {
+	segmentPattern := filepath.Join(dir, "segment_%05d.ts")
+	playlistPath := filepath.Join(dir, "index.m3u8")
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-probesize", "10M",
+		"-analyzeduration", "10M",
+	}
+	args = append(args, profile.beforeInputArgs...)
+	args = append(args,
+		"-headers", fmt.Sprintf("Cookie: session_id=%s\r\n", sessionID),
+		"-i", contentURL,
+		"-map", "0:v:0",
+		"-map", "0:a:0?",
+	)
+	args = append(args, profile.videoArgs...)
+	args = append(args,
+		"-c:a", "aac",
+		"-b:a", "128k",
+		"-force_key_frames", "expr:gte(t,n_forced*2)",
+		"-f", "hls",
+		"-hls_time", "2",
+		"-hls_list_size", "15",
+		"-hls_delete_threshold", "2",
+		"-hls_flags", "independent_segments+temp_file+delete_segments",
+		"-hls_segment_filename", segmentPattern,
+		playlistPath,
+	)
+
+	streamCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(streamCtx, "ffmpeg", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, nil, nil, err
+	}
+	cmd.Cancel = func() error {
+		cancel()
+		if cmd.Process != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	return cmd, cancel, &stderr, nil
+}
+
+func waitForHLSReady(ctx context.Context, cmd *exec.Cmd, dir string, timeout time.Duration) error {
+	playlistPath := filepath.Join(dir, "index.m3u8")
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("playlist timeout")
+		case <-ticker.C:
+			data, err := os.ReadFile(playlistPath)
+			if err == nil {
+				for _, line := range strings.Split(string(data), "\n") {
+					line = strings.TrimSpace(line)
+					if strings.HasSuffix(line, ".ts") {
+						if _, statErr := os.Stat(filepath.Join(dir, filepath.Base(line))); statErr == nil {
+							return nil
+						}
+					}
+				}
+			}
+			if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+				return fmt.Errorf("ffmpeg exited")
+			}
+		}
+	}
+}
+
+func (s *Server) cleanupHLSStream(streamID string, stream *hlsStream) {
+	done := make(chan error, 1)
+	go func() {
+		done <- stream.cmd.Wait()
+	}()
+
+	var err error
+	stoppedForIdle := false
+	idleTicker := time.NewTicker(30 * time.Second)
+	defer idleTicker.Stop()
+	for {
+		select {
+		case err = <-done:
+			goto finished
+		case <-idleTicker.C:
+			s.hlsMu.Lock()
+			idleFor := time.Since(stream.lastSeen)
+			s.hlsMu.Unlock()
+			if idleFor > 5*time.Minute {
+				stoppedForIdle = true
+				stream.cancel()
+			}
+		}
+	}
+
+finished:
+	if err != nil && !stoppedForIdle {
+		log.Printf("hls: stream %s ended: %v", streamID, err)
+	}
+	s.sessions.Delete(stream.sessionID)
+
+	if !stoppedForIdle {
+		time.Sleep(15 * time.Minute)
+	}
+	s.hlsMu.Lock()
+	delete(s.hls, streamID)
+	s.hlsMu.Unlock()
+	os.RemoveAll(stream.dir)
+}
+
+func (s *Server) handleHLSAsset(c *gin.Context) {
+	streamID := c.Param("stream")
+	name := filepath.Base(c.Param("name"))
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hls asset"})
+		return
+	}
+
+	s.hlsMu.Lock()
+	stream := s.hls[streamID]
+	if stream != nil {
+		stream.lastSeen = time.Now()
+	}
+	s.hlsMu.Unlock()
+	if stream == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "hls stream not found"})
+		return
+	}
+
+	path := filepath.Join(stream.dir, name)
+	if name == "index.m3u8" {
+		c.Header("Content-Type", "application/vnd.apple.mpegurl")
+		c.Header("Cache-Control", "no-cache, max-age=1")
+		c.File(path)
+		return
+	}
+	if strings.HasSuffix(name, ".ts") {
+		c.Header("Content-Type", "video/mp2t")
+		c.Header("Cache-Control", "public, max-age=300")
+		c.File(path)
+		return
+	}
+	c.JSON(http.StatusNotFound, gin.H{"error": "hls asset not found"})
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func buildHLSProfiles() []transcodeProfile {
+	requested := strings.ToLower(strings.TrimSpace(os.Getenv("CRYP_FFMPEG_HWACCEL")))
+	if requested == "none" || requested == "off" || requested == "cpu" {
+		return []transcodeProfile{cpuTranscodeProfile()}
+	}
+
+	encoders := detectFFmpegEncoders()
+	profiles := make([]transcodeProfile, 0, 3)
+	if requested == "vaapi-hwdec" {
+		if profile, ok := gpuTranscodeProfile("vaapi", encoders); ok {
+			profiles = append(profiles, profile)
+		}
+	}
+	if requested == "" || requested == "auto" || requested == "vaapi" || requested == "vaapi-hwdec" {
+		if profile, ok := gpuFallbackTranscodeProfile("vaapi", encoders); ok {
+			profiles = append(profiles, profile)
+		}
+	}
+	profiles = append(profiles, cpuTranscodeProfile())
+	return profiles
+}
+
+func gpuTranscodeProfile(name string, encoders map[string]bool) (transcodeProfile, bool) {
+	switch name {
+	case "vaapi":
+		if !encoders["h264_vaapi"] {
+			return transcodeProfile{}, false
+		}
+		if _, err := os.Stat("/dev/dri/renderD128"); err != nil {
+			return transcodeProfile{}, false
+		}
+		return transcodeProfile{
+			name: "vaapi-hwdec",
+			beforeInputArgs: []string{
+				"-hwaccel", "vaapi",
+				"-hwaccel_device", "/dev/dri/renderD128",
+				"-hwaccel_output_format", "vaapi",
+			},
+			videoArgs: []string{"-vf", "scale_vaapi=format=nv12", "-c:v", "h264_vaapi", "-qp", "24"},
+		}, true
+	default:
+		return transcodeProfile{}, false
+	}
+}
+
+func gpuFallbackTranscodeProfile(name string, encoders map[string]bool) (transcodeProfile, bool) {
+	switch name {
+	case "vaapi":
+		if !encoders["h264_vaapi"] {
+			return transcodeProfile{}, false
+		}
+		if _, err := os.Stat("/dev/dri/renderD128"); err != nil {
+			return transcodeProfile{}, false
+		}
+		return transcodeProfile{
+			name:            "vaapi",
+			beforeInputArgs: []string{"-vaapi_device", "/dev/dri/renderD128"},
+			videoArgs:       []string{"-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "24"},
+		}, true
+	default:
+		return transcodeProfile{}, false
+	}
+}
+
+func cpuTranscodeProfile() transcodeProfile {
+	return transcodeProfile{
+		name:      "cpu",
+		videoArgs: []string{"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"},
+	}
+}
+
+func detectFFmpegEncoders() map[string]bool {
+	ffmpegEncodersOnce.Do(func() {
+		ffmpegEncodersCache = make(map[string]bool)
+		out, err := exec.Command("ffmpeg", "-hide_banner", "-encoders").CombinedOutput()
+		if err != nil {
+			return
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				ffmpegEncodersCache[fields[1]] = true
+			}
+		}
+	})
+	return ffmpegEncodersCache
+}
+
+func trimLog(s string) string {
+	if len(s) > 500 {
+		return s[len(s)-500:]
+	}
+	return s
 }
 
 func (s *Server) downloadSingleFile(c *gin.Context, vault *crypto.Vault, virtualPath string) error {
@@ -391,11 +765,26 @@ func openDecryptedVirtualFile(vault *crypto.Vault, virtualPath string) (*os.File
 }
 
 func (s *Server) handleRangeRequest(c *gin.Context, file *os.File, header *crypto.FileHeader, totalSize int64, contentType string, rangeHeader string) {
-	// Parse Range header: "bytes=start-end"
-	rangeHeader = strings.TrimPrefix(rangeHeader, "bytes=")
+	rangeNotSatisfiable := func() {
+		c.Header("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+		c.Header("Accept-Ranges", "bytes")
+		c.JSON(http.StatusRequestedRangeNotSatisfiable, gin.H{"error": "invalid range"})
+	}
+
+	if totalSize <= 0 {
+		rangeNotSatisfiable()
+		return
+	}
+
+	// Parse Range header: "bytes=start-end". FFmpeg may send multi-range probes;
+	// this endpoint streams one range, so serve the first satisfiable segment.
+	rangeHeader = strings.TrimSpace(strings.TrimPrefix(rangeHeader, "bytes="))
+	if comma := strings.Index(rangeHeader, ","); comma >= 0 {
+		rangeHeader = strings.TrimSpace(rangeHeader[:comma])
+	}
 	parts := strings.SplitN(rangeHeader, "-", 2)
 	if len(parts) != 2 {
-		c.JSON(http.StatusRequestedRangeNotSatisfiable, gin.H{"error": "invalid range"})
+		rangeNotSatisfiable()
 		return
 	}
 
@@ -404,28 +793,42 @@ func (s *Server) handleRangeRequest(c *gin.Context, file *os.File, header *crypt
 
 	if parts[0] == "" {
 		// Suffix range: -500 (last 500 bytes)
-		suffix, _ := strconv.ParseInt(parts[1], 10, 64)
+		suffix, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || suffix <= 0 {
+			rangeNotSatisfiable()
+			return
+		}
+		if suffix > totalSize {
+			suffix = totalSize
+		}
 		start = totalSize - suffix
 		end = totalSize - 1
 	} else {
 		start, err = strconv.ParseInt(parts[0], 10, 64)
 		if err != nil {
-			c.JSON(http.StatusRequestedRangeNotSatisfiable, gin.H{"error": "invalid range"})
+			rangeNotSatisfiable()
 			return
 		}
 		if parts[1] != "" {
 			end, err = strconv.ParseInt(parts[1], 10, 64)
 			if err != nil {
-				c.JSON(http.StatusRequestedRangeNotSatisfiable, gin.H{"error": "invalid range"})
+				rangeNotSatisfiable()
 				return
+			}
+			if end >= totalSize {
+				end = totalSize - 1
 			}
 		} else {
 			end = totalSize - 1
 		}
 	}
 
-	if start < 0 || start >= totalSize || end >= totalSize || start > end {
-		c.JSON(http.StatusRequestedRangeNotSatisfiable, gin.H{"error": "invalid range"})
+	if start == totalSize && totalSize > 0 {
+		start = totalSize - 1
+		end = totalSize - 1
+	}
+	if start < 0 || start >= totalSize || start > end {
+		rangeNotSatisfiable()
 		return
 	}
 
@@ -607,7 +1010,7 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 	}
 
 	// Enqueue video thumbnail generation
-	if s.thumbs != nil && (thumbnail.IsVideo(fileName) || thumbnail.IsHEIF(fileName)) {
+	if s.thumbs != nil && written > 0 && (thumbnail.IsVideo(fileName) || thumbnail.IsHEIF(fileName)) {
 		s.thumbs.Enqueue(sess.VaultID, sess.VaultPath, sess.Keys, virtualPath)
 	}
 	c.JSON(http.StatusOK, gin.H{
