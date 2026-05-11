@@ -466,7 +466,6 @@ func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, content
 	}
 	args = append(args, profile.beforeInputArgs...)
 	args = append(args,
-		"-re",
 		"-headers", fmt.Sprintf("Cookie: session_id=%s\r\n", sessionID),
 		"-i", contentURL,
 		"-map", "0:v:0",
