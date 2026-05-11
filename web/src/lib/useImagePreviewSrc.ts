@@ -69,21 +69,31 @@ function isApplePlatform(): boolean {
   return isIOS || isMac
 }
 
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms))
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'))
+      return
+    }
+    const timer = window.setTimeout(resolve, ms)
+    signal?.addEventListener('abort', () => {
+      window.clearTimeout(timer)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }, { once: true })
+  })
 }
 
-async function fetchThumbnailBlob(thumbnailUrl: string, shouldCancel: () => boolean): Promise<Blob> {
+async function fetchThumbnailBlob(thumbnailUrl: string, shouldCancel: () => boolean, signal?: AbortSignal): Promise<Blob> {
   const attempts = 12
   for (let i = 0; i < attempts; i++) {
-    const res = await fetch(thumbnailUrl, { credentials: 'include' })
+    const res = await fetch(thumbnailUrl, { credentials: 'include', signal })
     if (res.ok) {
       return res.blob()
     }
     if (res.status !== 404 || i === attempts - 1 || shouldCancel()) {
       throw new Error(`failed to fetch thumbnail: ${res.status}`)
     }
-    await wait(800)
+    await wait(800, signal)
   }
   throw new Error('thumbnail unavailable')
 }
@@ -129,11 +139,12 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
     }
 
     if (thumbnailUrl) {
+      const controller = new AbortController()
       const run = async () => {
         try {
           setStatus('loading')
           setSrc('')
-          const outputBlob = await fetchThumbnailBlob(thumbnailUrl, () => cancelled)
+          const outputBlob = await fetchThumbnailBlob(thumbnailUrl, () => cancelled, controller.signal)
           const objectUrl = URL.createObjectURL(outputBlob)
 
           if (cancelled) {
@@ -160,6 +171,7 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
 
       return () => {
         cancelled = true
+        controller.abort()
         if (objectUrlRef.current) {
           URL.revokeObjectURL(objectUrlRef.current)
           objectUrlRef.current = null
@@ -187,16 +199,21 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
       }
     }
 
+    const controller = new AbortController()
     const run = async () => {
+      const signal = controller.signal
       try {
         setStatus('loading')
-        const res = await fetch(contentUrl, { credentials: 'include' })
+        const res = await fetch(contentUrl, { credentials: 'include', signal })
         if (!res.ok) {
           throw new Error(`failed to fetch image: ${res.status}`)
         }
+        if (cancelled) return
 
         const inputBlob = await res.blob()
+        if (cancelled) return
         const outputBlob = await decodeHeifToJpegBlob(inputBlob)
+        if (cancelled) return
         const objectUrl = URL.createObjectURL(outputBlob)
 
         if (cancelled) {
@@ -211,9 +228,11 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
         setSrc(objectUrl)
         setStatus('ready')
       } catch (err) {
-        console.warn('HEIF conversion failed', err)
-        setSrc('')
-        setStatus('unavailable')
+        if (!cancelled) {
+          console.warn('HEIF conversion failed', err)
+          setSrc('')
+          setStatus('unavailable')
+        }
       }
     }
 
@@ -221,6 +240,9 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
 
     return () => {
       cancelled = true
+      controller.abort()
+      // The WASM decode itself cannot be interrupted, but aborting fetch keeps
+      // navigation away from starting or continuing large downloads.
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current)
         objectUrlRef.current = null

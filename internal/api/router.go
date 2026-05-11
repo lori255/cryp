@@ -27,6 +27,7 @@ type Server struct {
 	corsAllow map[string]struct{}
 	hlsMu     sync.Mutex
 	hls       map[string]*hlsStream
+	hlsStarts int
 }
 
 func NewServer(db *storage.DB, sessions *session.Store, tasks *task.Manager, thumbs *thumbnail.Generator, vaultDir string, staticFS fs.FS) *Server {
@@ -112,6 +113,8 @@ func (s *Server) SetupRouter() *gin.Engine {
 			vaultOps.GET("/files/content", s.handleFileContent)
 			vaultOps.GET("/files/download", s.handleDownloadFile)
 			vaultOps.GET("/files/hls", s.handleHLSStart)
+			vaultOps.POST("/files/hls/stop", s.handleHLSStop)
+			vaultOps.POST("/files/hls/:stream/stop", s.handleHLSStop)
 			vaultOps.GET("/files/hls/:stream/*name", s.handleHLSAsset)
 			vaultOps.POST("/files/upload", s.handleUploadFile)
 			vaultOps.POST("/files/mkdir", s.handleMkdir)

@@ -21,10 +21,12 @@ type ThumbEnqueuer interface {
 
 // Manager handles background task execution
 type Manager struct {
-	db      *storage.DB
-	mu      sync.RWMutex
-	running map[string]chan struct{} // taskID -> cancel channel
-	thumbs  ThumbEnqueuer
+	db                 *storage.DB
+	mu                 sync.RWMutex
+	running            map[string]chan struct{} // taskID -> cancel channel
+	runningByVaultType map[string]string        // vaultID:type -> taskID
+	taskRunKeys        map[string]string        // taskID -> vaultID:type
+	thumbs             ThumbEnqueuer
 }
 
 const errTaskCancelled = "task cancelled"
@@ -32,8 +34,10 @@ const errTaskCancelled = "task cancelled"
 // NewManager creates a new task manager and recovers interrupted tasks
 func NewManager(db *storage.DB) *Manager {
 	m := &Manager{
-		db:      db,
-		running: make(map[string]chan struct{}),
+		db:                 db,
+		running:            make(map[string]chan struct{}),
+		runningByVaultType: make(map[string]string),
+		taskRunKeys:        make(map[string]string),
 	}
 	// Mark previously running tasks as interrupted
 	m.recoverTasks()
@@ -61,6 +65,16 @@ func (m *Manager) recoverTasks() {
 
 // StartImport starts a background directory import+encrypt task
 func (m *Manager) StartImport(taskID, vaultID, vaultPath string, keys *crypto.VaultKeys, sourcePath, destPath string, deleteSource bool) error {
+	if err := m.reserveExclusiveTask(taskID, vaultID, "import"); err != nil {
+		return err
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			m.releaseExclusiveTask(taskID)
+		}
+	}()
+
 	// Count files first
 	totalFiles, totalBytes, err := countFiles(sourcePath)
 	if err != nil {
@@ -89,12 +103,23 @@ func (m *Manager) StartImport(taskID, vaultID, vaultPath string, keys *crypto.Va
 	m.running[taskID] = cancel
 	m.mu.Unlock()
 
+	reserved = false
 	go m.runImport(t, vaultPath, keys, cancel)
 	return nil
 }
 
 // StartRebuildIndex starts a background task that rebuilds the vault file index.
 func (m *Manager) StartRebuildIndex(taskID, vaultID, vaultPath string, keys *crypto.VaultKeys) error {
+	if err := m.reserveExclusiveTask(taskID, vaultID, "index"); err != nil {
+		return err
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			m.releaseExclusiveTask(taskID)
+		}
+	}()
+
 	vault := &crypto.Vault{
 		ID:   vaultID,
 		Path: vaultPath,
@@ -118,8 +143,34 @@ func (m *Manager) StartRebuildIndex(taskID, vaultID, vaultPath string, keys *cry
 	m.running[taskID] = cancel
 	m.mu.Unlock()
 
+	reserved = false
 	go m.runRebuildIndex(t, vault, cancel)
 	return nil
+}
+
+func (m *Manager) reserveExclusiveTask(taskID, vaultID, taskType string) error {
+	key := vaultID + ":" + taskType
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if runningID, ok := m.runningByVaultType[key]; ok {
+		return fmt.Errorf("%s task already running: %s", taskType, runningID)
+	}
+	m.runningByVaultType[key] = taskID
+	m.taskRunKeys[taskID] = key
+	return nil
+}
+
+func (m *Manager) releaseExclusiveTask(taskID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseExclusiveTaskLocked(taskID)
+}
+
+func (m *Manager) releaseExclusiveTaskLocked(taskID string) {
+	if key, ok := m.taskRunKeys[taskID]; ok {
+		delete(m.runningByVaultType, key)
+		delete(m.taskRunKeys, taskID)
+	}
 }
 
 // CreateUploadTask creates a task record for tracking uploads
@@ -181,6 +232,7 @@ func (m *Manager) CancelTask(taskID string) bool {
 	if ok {
 		close(cancel)
 		delete(m.running, taskID)
+		m.releaseExclusiveTaskLocked(taskID)
 	}
 	m.mu.Unlock()
 
@@ -198,6 +250,7 @@ func (m *Manager) runImport(t *storage.TaskRecord, vaultPath string, keys *crypt
 	defer func() {
 		m.mu.Lock()
 		delete(m.running, t.ID)
+		m.releaseExclusiveTaskLocked(t.ID)
 		m.mu.Unlock()
 	}()
 
@@ -234,6 +287,7 @@ func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, ca
 	defer func() {
 		m.mu.Lock()
 		delete(m.running, t.ID)
+		m.releaseExclusiveTaskLocked(t.ID)
 		m.mu.Unlock()
 	}()
 

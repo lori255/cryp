@@ -27,6 +27,7 @@ const (
 	queueSize     = 1000
 	maxRetries    = 1
 	failCooldown  = 5 * time.Minute
+	maxFailedJobs = 5000
 )
 
 // videoExtensions lists supported video file extensions
@@ -78,9 +79,12 @@ type Generator struct {
 	jobs     chan thumbJob
 	ffmpeg   ffmpegConfig
 	wg       sync.WaitGroup
+	scanWg   sync.WaitGroup
 	mu       sync.Mutex
 	queued   map[string]struct{}
 	failed   map[string]time.Time
+	scanning map[string]struct{}
+	stopped  bool
 }
 
 type ffmpegConfig struct {
@@ -122,6 +126,7 @@ func NewGenerator(vaultDir string, sessions *session.Store, port string) *Genera
 		ffmpeg:   cfg,
 		queued:   make(map[string]struct{}),
 		failed:   make(map[string]time.Time),
+		scanning: make(map[string]struct{}),
 	}
 	g.wg.Add(1)
 	go g.worker()
@@ -211,6 +216,7 @@ func probeFFmpegAttempts(bin string, attempts []ffmpegAttempt) []ffmpegAttempt {
 
 func canUseFFmpegAttempt(bin string, attempt ffmpegAttempt) bool {
 	probePath := "/tmp/cryp-ffmpeg-probe.mp4"
+	defer os.Remove(probePath)
 	createCmd := exec.Command(
 		bin,
 		"-hide_banner",
@@ -273,6 +279,10 @@ func formatFFmpegAttempts(attempts []ffmpegAttempt) string {
 
 // Stop gracefully shuts down the generator
 func (g *Generator) Stop() {
+	g.mu.Lock()
+	g.stopped = true
+	g.mu.Unlock()
+	g.scanWg.Wait()
 	close(g.jobs)
 	g.wg.Wait()
 }
@@ -287,6 +297,11 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 	key := thumbJobKey(vaultID, virtualPath)
 	now := time.Now()
 	g.mu.Lock()
+	if g.stopped {
+		g.mu.Unlock()
+		return
+	}
+	g.pruneFailedLocked(now)
 	if _, ok := g.queued[key]; ok {
 		g.mu.Unlock()
 		return
@@ -317,6 +332,20 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 	}
 }
 
+func (g *Generator) pruneFailedLocked(now time.Time) {
+	for key, until := range g.failed {
+		if !now.Before(until) {
+			delete(g.failed, key)
+		}
+	}
+	for len(g.failed) > maxFailedJobs {
+		for key := range g.failed {
+			delete(g.failed, key)
+			break
+		}
+	}
+}
+
 // GetPath returns the thumbnail file path if it exists, or empty string
 func (g *Generator) GetPath(vaultID, virtualPath string) string {
 	p := g.thumbPath(vaultID, virtualPath)
@@ -335,6 +364,11 @@ func (g *Generator) HasThumbnail(vaultID, virtualPath string) bool {
 func (g *Generator) DeleteThumbnail(vaultID, virtualPath string) {
 	p := g.thumbPath(vaultID, virtualPath)
 	os.Remove(p) // ignore error if not exists
+	key := thumbJobKey(vaultID, virtualPath)
+	g.mu.Lock()
+	delete(g.queued, key)
+	delete(g.failed, key)
+	g.mu.Unlock()
 }
 
 // thumbPath returns the on-disk path for a thumbnail
@@ -588,11 +622,31 @@ func (g *Generator) writeDecryptedFile(job thumbJob, outPath string) error {
 // ScanVault scans a vault for video files that are missing thumbnails and enqueues them.
 // Runs in a goroutine to avoid blocking startup.
 func (g *Generator) ScanVault(vaultID, vaultPath string, keys *crypto.VaultKeys) {
+	g.mu.Lock()
+	if g.stopped {
+		g.mu.Unlock()
+		return
+	}
+	if _, ok := g.scanning[vaultID]; ok {
+		g.mu.Unlock()
+		return
+	}
+	g.scanning[vaultID] = struct{}{}
+	g.scanWg.Add(1)
+	g.mu.Unlock()
+
+	keysCopy := keys.Clone()
 	go func() {
+		defer func() {
+			g.mu.Lock()
+			delete(g.scanning, vaultID)
+			g.mu.Unlock()
+			g.scanWg.Done()
+		}()
 		vault := &crypto.Vault{
 			ID:   vaultID,
 			Path: vaultPath,
-			Keys: keys,
+			Keys: keysCopy,
 		}
 		g.scanDir(vault, "/")
 	}()

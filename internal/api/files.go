@@ -2,7 +2,6 @@ package api
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -314,12 +313,23 @@ type hlsStream struct {
 	dir             string
 	cmd             *exec.Cmd
 	cancel          context.CancelFunc
+	vaultID         string
+	virtualPath     string
 	sessionID       string
 	durationSeconds float64
 	segmentSeconds  float64
 	playlist        string
 	lastSeen        time.Time
+	stopRequested   bool
 }
+
+const (
+	hlsIdleCheckInterval = 10 * time.Second
+	hlsIdleTimeout       = 120 * time.Second
+	hlsFinishedRetention = 15 * time.Minute
+	hlsMaxStreams        = 3
+	hlsMaxStderrBytes    = 64 * 1024
+)
 
 var (
 	ffmpegEncodersOnce  sync.Once
@@ -334,6 +344,28 @@ func (s *Server) handleHLSStart(c *gin.Context) {
 		return
 	}
 	path := crypto.NormalizeVirtualPath(rawPath)
+
+	s.hlsMu.Lock()
+	for existingID, existing := range s.hls {
+		if existing.vaultID == sess.VaultID && existing.virtualPath == path && !existing.stopRequested {
+			existing.lastSeen = time.Now()
+			s.hlsMu.Unlock()
+			c.Redirect(http.StatusFound, fmt.Sprintf("/api/vaults/%s/files/hls/%s/index.m3u8", sess.VaultID, existingID))
+			return
+		}
+	}
+	if len(s.hls)+s.hlsStarts >= hlsMaxStreams {
+		s.hlsMu.Unlock()
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many active video streams"})
+		return
+	}
+	s.hlsStarts++
+	s.hlsMu.Unlock()
+	defer func() {
+		s.hlsMu.Lock()
+		s.hlsStarts--
+		s.hlsMu.Unlock()
+	}()
 
 	keysCopy := sess.Keys.Clone()
 	sessionID, err := s.sessions.Create(sess.VaultID, sess.VaultPath, keysCopy)
@@ -362,7 +394,7 @@ func (s *Server) handleHLSStart(c *gin.Context) {
 		return
 	}
 
-	stream, err := s.startHLSStream(context.Background(), dir, contentURL, sessionID)
+	stream, err := s.startHLSStream(context.Background(), sess.VaultID, path, dir, contentURL, sessionID)
 	if err != nil {
 		s.sessions.Delete(sessionID)
 		os.RemoveAll(dir)
@@ -380,7 +412,7 @@ func (s *Server) handleHLSStart(c *gin.Context) {
 	c.Redirect(http.StatusFound, fmt.Sprintf("/api/vaults/%s/files/hls/%s/index.m3u8", sess.VaultID, streamID))
 }
 
-func (s *Server) startHLSStream(ctx context.Context, dir, contentURL, sessionID string) (*hlsStream, error) {
+func (s *Server) startHLSStream(ctx context.Context, vaultID, virtualPath, dir, contentURL, sessionID string) (*hlsStream, error) {
 	durationSeconds := probeMediaDuration(ctx, contentURL, sessionID)
 	segmentSeconds := 2.0
 	playlist := ""
@@ -408,6 +440,8 @@ func (s *Server) startHLSStream(ctx context.Context, dir, contentURL, sessionID 
 			dir:             dir,
 			cmd:             cmd,
 			cancel:          cancel,
+			vaultID:         vaultID,
+			virtualPath:     virtualPath,
 			sessionID:       sessionID,
 			durationSeconds: durationSeconds,
 			segmentSeconds:  segmentSeconds,
@@ -421,7 +455,7 @@ func (s *Server) startHLSStream(ctx context.Context, dir, contentURL, sessionID 
 	return nil, fmt.Errorf("no hls profile available")
 }
 
-func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, contentURL, sessionID string) (*exec.Cmd, context.CancelFunc, *bytes.Buffer, error) {
+func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, contentURL, sessionID string) (*exec.Cmd, context.CancelFunc, *tailBuffer, error) {
 	segmentPattern := filepath.Join(dir, "segment_%05d.ts")
 	playlistPath := filepath.Join(dir, "index.m3u8")
 	args := []string{
@@ -453,8 +487,8 @@ func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, content
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(streamCtx, "ffmpeg", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	stderr := newTailBuffer(hlsMaxStderrBytes)
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return nil, nil, nil, err
@@ -466,7 +500,34 @@ func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, content
 		}
 		return nil
 	}
-	return cmd, cancel, &stderr, nil
+	return cmd, cancel, stderr, nil
+}
+
+type tailBuffer struct {
+	mu    sync.Mutex
+	limit int
+	buf   []byte
+}
+
+func newTailBuffer(limit int) *tailBuffer {
+	return &tailBuffer{limit: limit}
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > b.limit {
+		copy(b.buf, b.buf[len(b.buf)-b.limit:])
+		b.buf = b.buf[:b.limit]
+	}
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
 }
 
 func waitForHLSReady(ctx context.Context, cmd *exec.Cmd, dir string, timeout time.Duration) error {
@@ -501,6 +562,50 @@ func waitForHLSReady(ctx context.Context, cmd *exec.Cmd, dir string, timeout tim
 	}
 }
 
+func (s *Server) handleHLSStop(c *gin.Context) {
+	sess := getSession(c)
+	streamID := c.Param("stream")
+	rawPath := c.Query("path")
+	virtualPath := ""
+	if rawPath != "" {
+		virtualPath = crypto.NormalizeVirtualPath(rawPath)
+	}
+
+	streams := s.stopHLSStreams(sess.VaultID, streamID, virtualPath)
+	if len(streams) == 0 {
+		c.JSON(http.StatusOK, gin.H{"stopped": 0})
+		return
+	}
+	for _, stream := range streams {
+		stream.cancel()
+	}
+	c.JSON(http.StatusOK, gin.H{"stopped": len(streams)})
+}
+
+func (s *Server) stopHLSStreams(vaultID, streamID, virtualPath string) []*hlsStream {
+	s.hlsMu.Lock()
+	defer s.hlsMu.Unlock()
+
+	streams := make([]*hlsStream, 0, 1)
+	if streamID != "" {
+		if stream := s.hls[streamID]; stream != nil && stream.vaultID == vaultID {
+			stream.stopRequested = true
+			streams = append(streams, stream)
+		}
+		return streams
+	}
+	if virtualPath == "" {
+		return streams
+	}
+	for _, stream := range s.hls {
+		if stream.vaultID == vaultID && stream.virtualPath == virtualPath {
+			stream.stopRequested = true
+			streams = append(streams, stream)
+		}
+	}
+	return streams
+}
+
 func (s *Server) cleanupHLSStream(streamID string, stream *hlsStream) {
 	done := make(chan error, 1)
 	go func() {
@@ -509,7 +614,7 @@ func (s *Server) cleanupHLSStream(streamID string, stream *hlsStream) {
 
 	var err error
 	stoppedForIdle := false
-	idleTicker := time.NewTicker(30 * time.Second)
+	idleTicker := time.NewTicker(hlsIdleCheckInterval)
 	defer idleTicker.Stop()
 	for {
 		select {
@@ -518,22 +623,32 @@ func (s *Server) cleanupHLSStream(streamID string, stream *hlsStream) {
 		case <-idleTicker.C:
 			s.hlsMu.Lock()
 			idleFor := time.Since(stream.lastSeen)
+			alreadyStopped := stream.stopRequested
 			s.hlsMu.Unlock()
-			if idleFor > 5*time.Minute {
+			if alreadyStopped {
+				continue
+			}
+			if idleFor > hlsIdleTimeout {
 				stoppedForIdle = true
+				s.hlsMu.Lock()
+				stream.stopRequested = true
+				s.hlsMu.Unlock()
 				stream.cancel()
 			}
 		}
 	}
 
 finished:
-	if err != nil && !stoppedForIdle {
+	s.hlsMu.Lock()
+	stoppedByRequest := stream.stopRequested
+	s.hlsMu.Unlock()
+	if err != nil && !stoppedForIdle && !stoppedByRequest {
 		log.Printf("hls: stream %s ended: %v", streamID, err)
 	}
 	s.sessions.Delete(stream.sessionID)
 
-	if !stoppedForIdle {
-		time.Sleep(15 * time.Minute)
+	if !stoppedForIdle && !stoppedByRequest {
+		time.Sleep(hlsFinishedRetention)
 	}
 	s.hlsMu.Lock()
 	delete(s.hls, streamID)

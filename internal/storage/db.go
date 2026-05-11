@@ -11,6 +11,8 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+const taskRetentionSeconds = 30 * 24 * 60 * 60
+
 // DB wraps the SQLite database
 type DB struct {
 	*sql.DB
@@ -38,11 +40,13 @@ func NewDB(dataDir string) (*DB, error) {
 	}
 
 	if err := db.Ping(); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
 	d := &DB{db}
 	if err := d.migrate(); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("migrate database: %w", err)
 	}
 
@@ -295,9 +299,12 @@ func (d *DB) CreateTask(t *TaskRecord) error {
 	}
 	_, err := d.Exec(
 		`INSERT INTO tasks (id, vault_id, type, status, total_files, processed_files, total_bytes, processed_bytes, current_file, error_msg, source_path, dest_path, delete_source, started_at, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.VaultID, t.Type, t.Status, t.TotalFiles, t.ProcessedFiles, t.TotalBytes, t.ProcessedBytes, "", taskErrorForStorage(t), "", "", delSrc, t.StartedAt, t.CreatedAt, t.UpdatedAt,
 	)
+	if err == nil {
+		_, _ = d.Exec("DELETE FROM tasks WHERE vault_id=? AND status IN ('done', 'error', 'cancelled') AND updated_at < ?", t.VaultID, now-taskRetentionSeconds)
+	}
 	return err
 }
 
@@ -336,10 +343,10 @@ func (d *DB) GetTask(id string) (*TaskRecord, error) {
 	return &t, nil
 }
 
-// ListTasks returns all tasks for a vault, newest first
+// ListTasks returns recent tasks for a vault, newest first.
 func (d *DB) ListTasks(vaultID string) ([]TaskRecord, error) {
 	rows, err := d.Query(
-		`SELECT id, vault_id, type, status, total_files, processed_files, total_bytes, processed_bytes, current_file, error_msg, source_path, dest_path, delete_source, started_at, created_at, updated_at FROM tasks WHERE vault_id=? ORDER BY created_at DESC`, vaultID,
+		`SELECT id, vault_id, type, status, total_files, processed_files, total_bytes, processed_bytes, current_file, error_msg, source_path, dest_path, delete_source, started_at, created_at, updated_at FROM tasks WHERE vault_id=? ORDER BY created_at DESC LIMIT 200`, vaultID,
 	)
 	if err != nil {
 		return nil, err

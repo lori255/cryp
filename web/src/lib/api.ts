@@ -149,6 +149,41 @@ class ApiClient {
     return this.getHlsUrl(vaultId, path);
   }
 
+  stopHls(url: string): void {
+    const endpoint = this.getHlsStopUrl(url);
+    if (!endpoint) return;
+
+    if (navigator.sendBeacon?.(endpoint)) {
+      return;
+    }
+
+    const headers: Record<string, string> = {};
+    if (this.sessionId) {
+      headers['X-Session-ID'] = this.sessionId;
+    }
+    void fetch(endpoint, {
+      method: 'POST',
+      credentials: 'include',
+      keepalive: true,
+      headers,
+    }).catch(() => {});
+  }
+
+  private getHlsStopUrl(url: string): string | null {
+    const parsed = new URL(url, window.location.origin);
+    const path = parsed.pathname;
+    if (path.includes('/files/hls/') && path.endsWith('/index.m3u8')) {
+      parsed.pathname = path.replace(/\/index\.m3u8$/, '/stop');
+      parsed.search = '';
+      return parsed.toString();
+    }
+    if (path.endsWith('/files/hls')) {
+      parsed.pathname = `${path}/stop`;
+      return parsed.toString();
+    }
+    return null;
+  }
+
   getDownloadUrl(vaultId: string, path: string): string {
     return `${API_BASE}/vaults/${vaultId}/files/download?path=${encodeURIComponent(path)}`;
   }

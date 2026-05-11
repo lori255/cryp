@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import Artplayer from 'artplayer'
 import Hls from 'hls.js'
 import { AlertCircle, Maximize, X } from 'lucide-react'
+import { api } from '../lib/api'
 
 interface VideoPlayerProps {
   url: string
@@ -16,11 +17,17 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
   const artRef = useRef<Artplayer | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const unlockOrientationRef = useRef<(() => void) | null>(null)
+  const hlsUrlRef = useRef(url)
 
   useEffect(() => {
     setCurrentUrl(url)
+    hlsUrlRef.current = url
     setError('')
   }, [url])
+
+  useEffect(() => {
+    hlsUrlRef.current = currentUrl
+  }, [currentUrl])
 
   async function lockLandscapeOrientation() {
     const orientationApi = screen.orientation as ScreenOrientation & {
@@ -47,7 +54,12 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     }
 
     unlockOrientationRef.current?.()
-    unlockOrientationRef.current = await lockLandscapeOrientation()
+    const unlockOrientation = await lockLandscapeOrientation()
+    if (videoRef.current !== video) {
+      unlockOrientation?.()
+      return
+    }
+    unlockOrientationRef.current = unlockOrientation
 
     if (nativeVideo.webkitSupportsFullscreen && nativeVideo.webkitEnterFullscreen) {
       nativeVideo.webkitEnterFullscreen()
@@ -142,6 +154,9 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
             hls.loadSource(sourceUrl)
             hls.attachMedia(video)
             hlsInstances.push(hls)
+            hls.on(Hls.Events.MANIFEST_LOADED, (_, data) => {
+              hlsUrlRef.current = data.networkDetails?.responseURL || data.url || sourceUrl
+            })
             hls.on(Hls.Events.ERROR, (_, data) => {
               if (data.fatal) {
                 destroyHlsInstances()
@@ -255,6 +270,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     artRef.current = art
 
     return () => {
+      api.stopHls(hlsUrlRef.current)
       videoRef.current = null
       unlockOrientationRef.current?.()
       unlockOrientationRef.current = null
@@ -264,6 +280,16 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       }
     }
   }, [currentUrl])
+
+  useEffect(() => {
+    const stopHls = () => api.stopHls(hlsUrlRef.current)
+    const handlePageHide = () => stopHls()
+    window.addEventListener('pagehide', handlePageHide)
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide)
+      stopHls()
+    }
+  }, [])
 
   useEffect(() => {
     const { style } = document.body
