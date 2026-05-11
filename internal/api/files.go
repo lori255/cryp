@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -310,11 +311,14 @@ type transcodeProfile struct {
 }
 
 type hlsStream struct {
-	dir       string
-	cmd       *exec.Cmd
-	cancel    context.CancelFunc
-	sessionID string
-	lastSeen  time.Time
+	dir             string
+	cmd             *exec.Cmd
+	cancel          context.CancelFunc
+	sessionID       string
+	durationSeconds float64
+	segmentSeconds  float64
+	playlist        string
+	lastSeen        time.Time
 }
 
 var (
@@ -377,6 +381,12 @@ func (s *Server) handleHLSStart(c *gin.Context) {
 }
 
 func (s *Server) startHLSStream(ctx context.Context, dir, contentURL, sessionID string) (*hlsStream, error) {
+	durationSeconds := probeMediaDuration(ctx, contentURL, sessionID)
+	segmentSeconds := 2.0
+	playlist := ""
+	if durationSeconds > 0 {
+		playlist = buildVODPlaylist(durationSeconds, segmentSeconds)
+	}
 	profiles := buildHLSProfiles()
 	var lastErr error
 	for _, profile := range profiles {
@@ -394,7 +404,16 @@ func (s *Server) startHLSStream(ctx context.Context, dir, contentURL, sessionID 
 			continue
 		}
 		log.Printf("hls: started profile=%s in %s", profile.name, time.Since(started).Round(time.Millisecond))
-		return &hlsStream{dir: dir, cmd: cmd, cancel: cancel, sessionID: sessionID, lastSeen: time.Now()}, nil
+		return &hlsStream{
+			dir:             dir,
+			cmd:             cmd,
+			cancel:          cancel,
+			sessionID:       sessionID,
+			durationSeconds: durationSeconds,
+			segmentSeconds:  segmentSeconds,
+			playlist:        playlist,
+			lastSeen:        time.Now(),
+		}, nil
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -413,6 +432,7 @@ func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, content
 	}
 	args = append(args, profile.beforeInputArgs...)
 	args = append(args,
+		"-re",
 		"-headers", fmt.Sprintf("Cookie: session_id=%s\r\n", sessionID),
 		"-i", contentURL,
 		"-map", "0:v:0",
@@ -425,9 +445,8 @@ func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, content
 		"-force_key_frames", "expr:gte(t,n_forced*2)",
 		"-f", "hls",
 		"-hls_time", "2",
-		"-hls_list_size", "15",
-		"-hls_delete_threshold", "2",
-		"-hls_flags", "independent_segments+temp_file+delete_segments",
+		"-hls_list_size", "0",
+		"-hls_flags", "independent_segments+temp_file",
 		"-hls_segment_filename", segmentPattern,
 		playlistPath,
 	)
@@ -545,10 +564,18 @@ func (s *Server) handleHLSAsset(c *gin.Context) {
 	if name == "index.m3u8" {
 		c.Header("Content-Type", "application/vnd.apple.mpegurl")
 		c.Header("Cache-Control", "no-cache, max-age=1")
+		if stream.playlist != "" {
+			c.String(http.StatusOK, stream.playlist)
+			return
+		}
 		c.File(path)
 		return
 	}
 	if strings.HasSuffix(name, ".ts") {
+		if err := waitForFile(c.Request.Context(), path, 30*time.Second); err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "hls segment not ready"})
+			return
+		}
 		c.Header("Content-Type", "video/mp2t")
 		c.Header("Cache-Control", "public, max-age=300")
 		c.File(path)
@@ -563,6 +590,78 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func probeMediaDuration(ctx context.Context, contentURL, sessionID string) float64 {
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, "ffprobe",
+		"-v", "error",
+		"-probesize", "10M",
+		"-analyzeduration", "10M",
+		"-headers", fmt.Sprintf("Cookie: session_id=%s\r\n", sessionID),
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		contentURL,
+	).Output()
+	if err != nil {
+		log.Printf("hls: duration probe failed: %v", err)
+		return 0
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil || duration <= 0 || math.IsNaN(duration) || math.IsInf(duration, 0) {
+		return 0
+	}
+	return duration
+}
+
+func buildVODPlaylist(durationSeconds, segmentSeconds float64) string {
+	segmentCount := int(math.Ceil(durationSeconds / segmentSeconds))
+	if segmentCount < 1 {
+		segmentCount = 1
+	}
+	targetDuration := int(math.Ceil(segmentSeconds))
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:3\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDuration))
+	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+	for i := 0; i < segmentCount; i++ {
+		segmentDuration := segmentSeconds
+		remaining := durationSeconds - float64(i)*segmentSeconds
+		if remaining < segmentDuration {
+			segmentDuration = remaining
+		}
+		if segmentDuration <= 0 {
+			segmentDuration = segmentSeconds
+		}
+		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", segmentDuration))
+		b.WriteString(fmt.Sprintf("segment_%05d.ts\n", i))
+	}
+	b.WriteString("#EXT-X-ENDLIST\n")
+	return b.String()
+}
+
+func waitForFile(ctx context.Context, path string, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("segment timeout")
+		case <-ticker.C:
+		}
+	}
 }
 
 func buildHLSProfiles() []transcodeProfile {
