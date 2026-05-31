@@ -341,7 +341,7 @@ func (g *Generator) DeleteThumbnail(vaultID, virtualPath string) {
 func (g *Generator) thumbPath(vaultID, virtualPath string) string {
 	cacheKey := virtualPath
 	if IsHEIF(virtualPath) {
-		cacheKey += "\x00heif-v2"
+		cacheKey += "\x00heif-v3"
 	}
 	hash := sha256.Sum256([]byte(cacheKey))
 	name := fmt.Sprintf("%x.c9r", hash)
@@ -479,7 +479,7 @@ func (g *Generator) generateHEIF(job thumbJob) error {
 	defer os.RemoveAll(tmpDir)
 
 	heifPath := filepath.Join(tmpDir, "input"+strings.ToLower(filepath.Ext(job.FilePath)))
-	fullJPEGPath := filepath.Join(tmpDir, "full.jpg")
+	fullPNGPath := filepath.Join(tmpDir, "full.png")
 	thumbTmp := outPath + ".tmp"
 	defer os.Remove(thumbTmp)
 
@@ -488,7 +488,7 @@ func (g *Generator) generateHEIF(job thumbJob) error {
 	}
 
 	var heifErr bytes.Buffer
-	convertCmd := exec.Command("heif-convert", heifPath, fullJPEGPath)
+	convertCmd := exec.Command("heif-convert", heifPath, fullPNGPath)
 	convertCmd.Stderr = &heifErr
 	if err := convertCmd.Run(); err != nil {
 		errOut := heifErr.String()
@@ -499,11 +499,11 @@ func (g *Generator) generateHEIF(job thumbJob) error {
 	}
 
 	ffmpegArgs := []string{
-		"-i", fullJPEGPath,
+		"-i", fullPNGPath,
 		"-frames:v", "1",
-		"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease",
+		"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos",
 			imageThumbMax, imageThumbMax),
-		"-q:v", "3",
+		"-q:v", "2",
 		"-f", "image2",
 		"-y", thumbTmp,
 	}
