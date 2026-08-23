@@ -282,3 +282,11 @@
 | R-10 | 网格、列表和重复文件面板改用托管图片节点；切换文件时隐藏尚未确认属于当前 key 的旧 URL，避免错图和错误 PhotoView。 |
 
 验证：`cd web && npm run lint`、`cd web && npm run build` 通过；仍需在真实桌面/iOS 浏览器用大目录、快速返回、快速滚动和 HEIF/WASM 样本检查 Network、CPU、对象 URL 回收。真实 WASM 解码一旦开始无法被 JavaScript 强制中断，服务端缩略图生成也不受本次前端取消控制。
+
+## 16. 预览错误回退复核（2026-08-23）
+
+对本轮 `onPreviewError` 的异常路径做逐分支核验，补充一项在修复前记录的问题：
+
+| 编号 | 级别 | 问题与影响 | 关键位置 | 计划 |
+| --- | --- | --- | --- | --- |
+| R-11 | P2 | 普通图片加载失败时也会设置 HEIF `conversionKey`；普通图片 effect 随后把状态重新写成 `ready`，错误占位无法稳定显示。Apple 平台 HEIF 加载失败则被静默忽略并长期保持 `ready`，用户无法判断资源不可用。 | `web/src/lib/useImagePreviewSrc.ts:251-263,360-364` | 按格式区分回退：仅非 Apple HEIF 允许进入转换；其它失败清空源并标记 `unavailable`，避免错误状态抖动或假成功。 |
