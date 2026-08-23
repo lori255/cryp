@@ -83,6 +83,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     let disposed = false
     let streamStopped = false
     let activeHlsUrl = activeUrl
+    const probeController = new AbortController()
     const stopStream = () => {
       if (streamStopped) return
       streamStopped = true
@@ -297,6 +298,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
           void fetch(activeUrl, {
             credentials: 'include',
             headers: probeHeaders,
+            signal: probeController.signal,
           }).then(async (response) => {
             await response.body?.cancel()
             if (disposed) return
@@ -312,14 +314,18 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
               setErrorState({ baseUrl: activeBaseUrl, message: '文件服务暂时不可用，请重试' })
               return
             }
+            if (!response.ok) {
+              setErrorState({ baseUrl: activeBaseUrl, message: '无法读取视频文件（HTTP ' + response.status + '）' })
+              return
+            }
             stopStream()
             setErrorState(null)
             setSourceState({
               baseUrl: activeBaseUrl,
               url: activeUrl.replace('/files/content', '/files/hls'),
             })
-          }).catch(() => {
-            if (disposed) return
+          }).catch((err: unknown) => {
+            if (disposed || (err instanceof DOMException && err.name === 'AbortError')) return
             stopStream()
             setErrorState(null)
             setSourceState({
@@ -360,6 +366,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
 
     return () => {
       disposed = true
+      probeController.abort()
       stopStream()
       if (stopHlsRef.current === stopStream) {
         stopHlsRef.current = () => {}

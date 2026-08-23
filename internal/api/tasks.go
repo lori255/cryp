@@ -1,12 +1,13 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
+	"cryp/internal/pathguard"
 	"cryp/internal/storage"
 	"cryp/internal/task"
 
@@ -15,12 +16,18 @@ import (
 
 // handleBrowseDir lists directories on the host filesystem (within allowed paths)
 func (s *Server) handleBrowseDir(c *gin.Context) {
-	dirPath := c.DefaultQuery("path", "/data")
-
-	// Security: only allow browsing under /data
-	absPath, err := filepath.Abs(dirPath)
-	if err != nil || (absPath != "/data" && !strings.HasPrefix(absPath, "/data/")) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied: can only browse /data"})
+	dirPath := c.DefaultQuery("path", s.sourceRoot)
+	if s.sourceGuard == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "source directory is not configured"})
+		return
+	}
+	absPath, err := s.sourceGuard.ResolveDir(dirPath)
+	if err != nil {
+		if errors.Is(err, pathguard.ErrOutsideRoot) || errors.Is(err, pathguard.ErrProtectedPath) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "access denied: path is outside the source root"})
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "directory not found"})
 		return
 	}
 
@@ -48,6 +55,15 @@ func (s *Server) handleBrowseDir(c *gin.Context) {
 
 	var items []DirEntry
 	for _, e := range entries {
+		// Do not expose symlinks as selectable import sources. ResolveDir still
+		// protects direct requests, while skipping them here avoids encouraging
+		// a UI flow that can never be safely imported/deleted.
+		if e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		if s.sourceGuard.IsReserved(filepath.Join(absPath, e.Name())) {
+			continue
+		}
 		entry := DirEntry{
 			Name:  e.Name(),
 			IsDir: e.IsDir(),
@@ -77,6 +93,10 @@ func (s *Server) handleBrowseDir(c *gin.Context) {
 // handleCreateImportTask starts a background import+encrypt task
 func (s *Server) handleCreateImportTask(c *gin.Context) {
 	sess := getSession(c)
+	if s.tasks == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "task manager unavailable", "code": "task_manager_unavailable"})
+		return
+	}
 
 	var req struct {
 		SourcePath   string `json:"sourcePath" binding:"required"`
@@ -92,10 +112,18 @@ func (s *Server) handleCreateImportTask(c *gin.Context) {
 		req.DestPath = "/"
 	}
 
-	// Verify source exists
-	info, err := os.Stat(req.SourcePath)
-	if err != nil || !info.IsDir() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "source directory not found"})
+	if s.sourceGuard == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "source directory is not configured"})
+		return
+	}
+	validatedSource, err := s.sourceGuard.ValidateImport(req.SourcePath, req.DeleteSource)
+	if err != nil {
+		switch {
+		case errors.Is(err, pathguard.ErrOutsideRoot), errors.Is(err, pathguard.ErrSymlinkNotAllowed), errors.Is(err, pathguard.ErrRootDelete), errors.Is(err, pathguard.ErrProtectedPath):
+			c.JSON(http.StatusForbidden, gin.H{"error": "source path is not allowed"})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "source directory not found"})
+		}
 		return
 	}
 
@@ -104,9 +132,24 @@ func (s *Server) handleCreateImportTask(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate task id"})
 		return
 	}
-	err = s.tasks.StartImport(taskID, sess.VaultID, sess.VaultPath, sess.Keys, req.SourcePath, req.DestPath, req.DeleteSource)
+	err = s.tasks.StartImport(taskID, sess.VaultID, sess.VaultPath, sess.Keys, validatedSource, req.DestPath, req.DeleteSource)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start import: " + err.Error()})
+		status := http.StatusInternalServerError
+		code := "task_start_failed"
+		if errors.Is(err, task.ErrVaultQuiescing) {
+			status = http.StatusConflict
+			code = "vault_removing"
+		} else if errors.Is(err, task.ErrTaskManagerClosed) {
+			status = http.StatusServiceUnavailable
+			code = "task_manager_unavailable"
+		}
+		if status >= http.StatusInternalServerError {
+			// Keep implementation details in server logs; clients only need a
+			// stable code to decide whether to retry or show a conflict.
+			c.JSON(status, gin.H{"error": "failed to start import", "code": code})
+		} else {
+			c.JSON(status, gin.H{"error": "vault is being removed", "code": code})
+		}
 		return
 	}
 
@@ -137,14 +180,8 @@ func (s *Server) handleListTasks(c *gin.Context) {
 func (s *Server) handleGetTask(c *gin.Context) {
 	sess := getSession(c)
 	taskID := c.Param("taskId")
-
-	t, err := s.db.GetTask(taskID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
-		return
-	}
-	if t.VaultID != sess.VaultID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "task not for this vault"})
+	t, ok := s.taskForVault(c, sess.VaultID, taskID)
+	if !ok {
 		return
 	}
 
@@ -155,26 +192,31 @@ func (s *Server) handleGetTask(c *gin.Context) {
 func (s *Server) handleCancelTask(c *gin.Context) {
 	sess := getSession(c)
 	taskID := c.Param("taskId")
-	t, err := s.db.GetTask(taskID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+	if s.tasks == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "task manager unavailable", "code": "task_manager_unavailable"})
 		return
 	}
-	if t.VaultID != sess.VaultID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "task not for this vault"})
+	_, ok := s.taskForVault(c, sess.VaultID, taskID)
+	if !ok {
 		return
 	}
 
 	if s.tasks.CancelTask(taskID) {
 		c.JSON(http.StatusOK, gin.H{"message": "task cancelled"})
 	} else {
-		// Task might not be running, try to update status anyway
-		if t.Status == "running" || t.Status == "pending" {
-			t.Status = "cancelled"
-			_ = s.db.UpdateTask(t)
-			c.JSON(http.StatusOK, gin.H{"message": "task cancelled"})
-		} else {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "task not running"})
+		// Re-read after the failed cancellation. The worker may have finished
+		// between the ownership lookup and CancelTask; never overwrite a newer
+		// done/error state using the stale record.
+		latest, readErr := s.db.GetTask(taskID)
+		if readErr != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+			return
+		}
+		switch latest.Status {
+		case "running", "pending":
+			c.JSON(http.StatusConflict, gin.H{"error": "task is finishing; retry cancellation", "code": "task_not_cancellable"})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "task is not running", "code": "task_not_running"})
 		}
 	}
 }
@@ -183,20 +225,16 @@ func (s *Server) handleCancelTask(c *gin.Context) {
 func (s *Server) handleDeleteTask(c *gin.Context) {
 	sess := getSession(c)
 	taskID := c.Param("taskId")
-
-	t, err := s.db.GetTask(taskID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
-		return
-	}
-	if t.VaultID != sess.VaultID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "task not for this vault"})
+	t, ok := s.taskForVault(c, sess.VaultID, taskID)
+	if !ok {
 		return
 	}
 
-	// Don't allow deleting running tasks
-	if t.Status == "running" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete running task, cancel it first"})
+	// Pending tasks are also owned by a future worker in older deployments;
+	// deleting their row would let the worker recreate/update it after this
+	// handler returns. Require cancellation/settling first.
+	if t.Status == "running" || t.Status == "pending" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete active task, cancel it first", "code": "task_active"})
 		return
 	}
 
@@ -210,6 +248,10 @@ func (s *Server) handleDeleteTask(c *gin.Context) {
 
 func (s *Server) handleCreateUploadTask(c *gin.Context) {
 	sess := getSession(c)
+	if s.tasks == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "task manager unavailable", "code": "task_manager_unavailable"})
+		return
+	}
 
 	var req struct {
 		TotalFiles int   `json:"totalFiles" binding:"required"`
@@ -226,7 +268,19 @@ func (s *Server) handleCreateUploadTask(c *gin.Context) {
 		return
 	}
 	if err := s.tasks.CreateUploadTask(taskID, sess.VaultID, req.TotalFiles, req.TotalBytes); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create upload task"})
+		status := http.StatusInternalServerError
+		code := "task_start_failed"
+		message := "failed to create upload task"
+		if errors.Is(err, task.ErrVaultQuiescing) {
+			status = http.StatusConflict
+			code = "vault_removing"
+			message = "vault is being removed"
+		} else if errors.Is(err, task.ErrTaskManagerClosed) {
+			status = http.StatusServiceUnavailable
+			code = "task_manager_unavailable"
+			message = "task manager unavailable"
+		}
+		c.JSON(status, gin.H{"error": message, "code": code})
 		return
 	}
 
@@ -234,6 +288,19 @@ func (s *Server) handleCreateUploadTask(c *gin.Context) {
 		"taskId":  taskID,
 		"message": "upload task created",
 	})
+}
+
+func (s *Server) taskForVault(c *gin.Context, vaultID, taskID string) (*storage.TaskRecord, bool) {
+	t, err := s.db.GetTask(taskID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		return nil, false
+	}
+	if t.VaultID != vaultID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "task not for this vault"})
+		return nil, false
+	}
+	return t, true
 }
 
 // handleDeleteCompletedTasks deletes all completed/failed/cancelled tasks for a vault

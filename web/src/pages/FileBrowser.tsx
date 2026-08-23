@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { PhotoProvider } from 'react-photo-view'
-import { api, type FileItem, joinPath } from '../lib/api'
+import { api, ApiError, type FileItem, joinPath } from '../lib/api'
 import { Folder, ArrowLeft, Grid3x3, List, Upload, FolderPlus, Lock, ListTodo, FolderInput, ArrowUpDown, CopyMinus } from 'lucide-react'
 import VideoPlayer from '../components/VideoPlayer'
 import UploadDialog from '../components/UploadDialog'
@@ -95,12 +95,20 @@ export default function FileBrowser() {
       if (requestId !== listRequestIdRef.current) return
       const nextFiles = data.files || []
       setIndexRequired(Boolean(data.indexRequired))
-      setFiles((prev) => append ? [...prev, ...nextFiles] : nextFiles)
+      setFiles((prev) => {
+        if (!append) return nextFiles
+        const seen = new Set(prev.map((file) => file.name))
+        return [...prev, ...nextFiles.filter((file) => {
+          if (seen.has(file.name)) return false
+          seen.add(file.name)
+          return true
+        })]
+      })
       setHasMore(Boolean(data.hasMore))
       setNextOffset(data.nextOffset ?? (offset + nextFiles.length))
     } catch (err) {
       if (controller.signal.aborted || requestId !== listRequestIdRef.current) return
-      if (err instanceof Error && err.message.includes('session')) {
+      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
         navigate('/')
         return
       }
@@ -176,7 +184,7 @@ export default function FileBrowser() {
     setError('')
     try {
       await api.deleteFile(vaultId, getFilePath(file.name))
-      loadFiles()
+      void loadFiles()
     } catch (err) {
       setError(err instanceof Error ? err.message : '删除失败')
     }

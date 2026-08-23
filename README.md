@@ -66,13 +66,17 @@ services:
       - PORT=9527
       - DATA_DIR=/data/config
       - VAULT_DIR=/data/vaults
+      # 可选：导入/目录浏览根目录（默认 /data；config 和 vaults 自动受保护）
+      # - SOURCE_DIR=/data/media
       - GOMEMLIMIT=256MiB
       # Optional: thumbnail hardware acceleration strategy (auto/vaapi/qsv/cuda/cpu)
       # - CRYP_FFMPEG_HWACCEL=auto
+      # Optional: override the FFmpeg executable (useful for a pinned build or integration tests)
+      # - CRYP_FFMPEG_BIN=/usr/local/bin/ffmpeg
     restart: unless-stopped
 ```
 
-将 `/your/data/path` 替换为实际存储路径，保险库配置和加密文件都存储在此目录中。
+将 `/your/data/path` 替换为实际存储路径，保险库配置和加密文件都存储在此目录中。导入/浏览路径受 `SOURCE_DIR` 限制；建议把它设为挂载目录下的专用媒体子目录，应用的 `DATA_DIR` 与 `VAULT_DIR` 即使位于 `/data` 下也不会被导入或删除。
 
 ### 首次使用
 
@@ -99,9 +103,11 @@ cryp/
 ├── internal/
 │   ├── api/             # HTTP 路由和处理器
 │   ├── crypto/          # 加解密核心（内容、文件名、密钥、IO）
+│   ├── pathguard/       # 导入源和 vault 存储路径策略
 │   ├── session/         # 会话管理
 │   ├── storage/         # SQLite 数据库
-│   └── task/            # 后台任务管理
+│   ├── task/            # 后台任务管理
+│   └── thumbnail/       # 缩略图队列与 FFmpeg 生命周期
 ├── web/                 # React 前端
 │   └── src/
 │       ├── components/  # UI 组件
@@ -131,6 +137,7 @@ cryp/
 可用环境变量：
 
 - `CRYP_FFMPEG_HWACCEL`：硬件加速策略（默认 `auto`；可设 `none`/`cpu` 强制 CPU，或指定 `vaapi`/`qsv`/`cuda`）
+- `CRYP_FFMPEG_BIN`：可选的 FFmpeg 可执行文件路径；HLS 和缩略图共用该设置，便于固定版本或做 fake-FFmpeg 集成测试。
 
 示例（自动探测 + 自动降级）：
 

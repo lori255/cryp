@@ -10,7 +10,8 @@ interface ImportDialogProps {
 }
 
 export default function ImportDialog({ vaultId, onClose, onStarted }: ImportDialogProps) {
-  const [currentPath, setCurrentPath] = useState('/data')
+  const [currentPath, setCurrentPath] = useState('')
+  const [rootPath, setRootPath] = useState('')
   const [items, setItems] = useState<DirEntry[]>([])
   const [loading, setLoading] = useState(true)
   const [destPath, setDestPath] = useState('/')
@@ -28,6 +29,7 @@ export default function ImportDialog({ vaultId, onClose, onStarted }: ImportDial
     try {
       const data = await api.browseDir(path)
       setItems(data.items || [])
+      setRootPath(previous => previous || data.path)
       setCurrentPath(data.path)
     } catch (err) {
       setError(err instanceof Error ? err.message : '无法读取目录')
@@ -43,9 +45,10 @@ export default function ImportDialog({ vaultId, onClose, onStarted }: ImportDial
 
   function goUp() {
     const parts = currentPath.split('/').filter(Boolean)
-    if (parts.length <= 1) return
+    if (!rootPath || currentPath === rootPath) return
     parts.pop()
-    navigateTo('/' + parts.join('/'))
+    const parent = '/' + parts.join('/')
+    navigateTo(parent.length < rootPath.length ? rootPath : parent)
   }
 
   function enterDir(name: string) {
@@ -86,7 +89,7 @@ export default function ImportDialog({ vaultId, onClose, onStarted }: ImportDial
 
         {/* Breadcrumb */}
         <div className="px-4 py-2 border-b border-gray-800/50 flex-shrink-0">
-          <Breadcrumbs path={currentPath} onNavigate={navigateTo} rootPath="/data" />
+          <Breadcrumbs path={currentPath} onNavigate={navigateTo} rootPath={rootPath} />
         </div>
 
         {/* Directory listing */}
@@ -97,7 +100,7 @@ export default function ImportDialog({ vaultId, onClose, onStarted }: ImportDial
             </div>
           ) : (
             <div className="p-2">
-              {currentPath !== '/data' && (
+              {currentPath && currentPath !== rootPath && (
                 <button
                   onClick={goUp}
                   className="w-full flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-800 transition-colors text-left"

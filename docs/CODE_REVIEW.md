@@ -140,3 +140,56 @@
 | T-32 | P2 | 启动取消路径的 `stopAndWaitHLS` 与 cleanup goroutine 可能同时调用同一 `exec.Cmd.Wait`；重复 Wait 会丢失真实退出错误并导致不稳定的测试/回收行为。 | 已修复：`hlsStream` 使用 `sync.Once` 统一等待并复用退出错误。 |
 
 以上追加项与第 3 节原始编号互补；真实 FFmpeg、VAAPI 驱动和浏览器集成回归仍受当前环境缺少 `ffmpeg`/`ffprobe` 及 render node 的限制。
+
+## 7. 结构与质量优化（2026-08-23）
+
+在完成上述 HLS 生命周期修复后，又按“避免继续堆补丁、收敛边界”的原则落地了一轮低风险优化：
+
+| 编号 | 优化 | 落地点与收益 |
+| --- | --- | --- |
+| O-01 | 导入源沙箱 | 新增 `internal/pathguard`，浏览和导入共用同一个真实路径校验；解析 symlink、拒绝越界和导入树中的 symlink，并禁止 `deleteSource` 指向根目录或应用保留目录（`DATA_DIR`/`VAULT_DIR`）。`SOURCE_DIR`/`BROWSE_ROOT` 可配置。 |
+| O-02 | 后台任务所有权 | `task.Manager` 使用 `context.Context`、任务完成信号和 `WaitGroup`；取消不再提前释放独占名额，新增 vault 级 quiesce 和服务 shutdown 等待，避免任务访问已关闭 DB 或已删除 vault。 |
+| O-03 | 密钥生命周期 | 请求、导入、索引、登录和缩略图使用明确的 clone/owner，并统一通过 `VaultKeys.Zero` 清理副本。 |
+| O-04 | 加密读取健壮性 | `DecryptingReader` 对截断/异常 chunk 返回 `ErrCorruptContent`，不再在短密文上 slice panic；异常密文尺寸也会被钳制。导入加密支持 context 取消。 |
+| O-05 | 前端错误与轮询边界 | API 客户端引入 `ApiError(status/code/details)`，正确处理 204/空响应和任意 `Headers`；任务轮询改为请求完成后排程并区分轮询错误；播放器 probe 请求随组件销毁取消。 |
+| O-06 | 小步结构化 | 将纯 HLS HTTP 错误映射抽到 `hls_errors.go` 并补单元测试，作为后续拆分 HLS Manager 的安全切入点。 |
+
+本轮验证：`go test ./...`、`go test -race ./...`、`go vet ./...`、`git diff --check`、`cd web && npm run lint`、`cd web && npm run build` 均通过。
+
+仍需后续处理的架构项：`internal/api/files.go` 仍是大型单体（HTTP、HLS、传输和索引职责混合），尚未建立真实 FFmpeg fake/API 集成测试与活动流/队列/GPU metrics；跨 DB 与磁盘的 vault 删除也仍属于补偿式语义，生产部署应配合 orphan sweeper 和失败重试告警。当前环境仍没有可执行的 FFmpeg/VAAPI render node，因此不能把这些验证缺口误判为已解决。
+
+## 8. 继续优化复核（2026-08-23）
+
+对上一轮改动做生命周期和可维护性复核后，新增问题与处理状态如下：
+
+| 编号 | 级别 | 问题与影响 | 处理状态 |
+| --- | --- | --- | --- |
+| M-09 | P1 | vault 删除只等待导入/索引和 HLS；缩略图 FFmpeg 或扫描仍可能在 `RemoveAll` 后读 vault、重建 `thumbnails` 目录，且队列密钥继续驻留内存。 | 已修复：Generator 增加按 vault 的 quiesce/cancel/wait；队列在 claim 阶段再次闸门校验，删除成功后以 tombstone/`ForgetVault` 收敛。 |
+| S-08 | P1 | 删除接口直接信任数据库中的 `vault.Path`；数据库异常或配置漂移可能使 `deleteFiles=true` 删除 vault 根目录或任意路径。 | 已修复：`pathguard.ValidateVaultPath` 要求路径是配置 vault 根下、basename 与 ID 一致、非 symlink 且真实路径不越界；失败则 fail-closed。 |
+| S-09 | P2 | 导入源经过路径树校验后，打开阶段仍有 Lstat/真实文件被替换的 TOCTOU 窗口，可能把校验对象与实际读取对象分离。 | 已缓解：加密入口打开后再次 `Lstat`，用 `os.SameFile` 和 regular-file 检查校验 FD 身份；完整 `openat2`/目录 FD 沙箱仍是 Linux 专项后续项。 |
+| Q-02 | P2 | 任务 API 在 manager 为空、取消竞态、pending 删除和内部错误回传时行为不一致，可能 panic、覆盖已完成状态或泄露实现细节。 | 已修复：统一 503/code；取消失败后重新读取状态且不覆写；pending 与 running 均禁止删除；提取 vault ownership helper；客户端只收到稳定错误码。 |
+| Q-03 | P2 | HLS/缩略图硬编码 `ffmpeg`，难以固定版本、隔离测试和做真实进程回收回归。 | 已改善：支持 `CRYP_FFMPEG_BIN`；补充 fake-FFmpeg 启动、playlist ready、单一 `Wait` 和进程组停止测试。 |
+
+本轮新增验证：`go test ./...`、`go test -race ./...`、`go vet ./...`、前端 lint/build 已重新执行并通过。真实硬件驱动、跨浏览器和跨 DB/磁盘补偿仍不应以单元测试通过替代生产观测；建议后续继续拆出 HLS Manager，并增加活动流、FFmpeg profile/退出码、缩略图队列及 GPU/磁盘 metrics。
+
+## 9. 架构与边界复核（2026-08-23）
+
+本轮在提交前又做了一次“是否继续堆补丁”的复核，落地项和明确保留的架构债务如下：
+
+| 编号 | 级别 | 结论与处理状态 |
+| --- | --- | --- |
+| S-10 | P1 | vault 删除从“校验后直接 `RemoveAll`”改为 `QuarantineVaultPath` 原子移到 vault 根下的唯一 sibling，再删除隔离路径；临时 reservation 在失败时自动清理。该方案收窄了检查-删除窗口，但对能写入整个 vault 根的高权限外部进程仍不能替代 Linux `openat2`/目录 FD 沙箱。 |
+| T-33 | P2 | HLS 并发上限响应补充稳定 `code=hls_capacity_exceeded`，与启动超时/取消/失败契约一致；前端可将 429 区分为资源繁忙而不是泛化为转码失败。 |
+| Q-04 | P1 | `Server.Shutdown` 现在先取得 context-aware 的 HLS 生命周期写屏障，等待上传/导入替换/删除操作退出；task manager 增加 `Wait`，有界 shutdown 超时后仍等待 worker 完成，再关闭 DB/session，避免 use-after-close 和 orphan FFmpeg。 |
+| M-10 | P2 | 缩略图 vault tombstone 完成回收时同步清理 `queued`/`failed`/`generations` 的 per-file bookkeeping，避免删除大量 vault 后内存只增不减。 |
+| Q-05 | P2 | 上传任务进度更新统一经过 manager 读锁生命周期屏障，并在上传入口校验 task 所属 vault；无 task manager 时返回 503，不再因带 taskId 的请求 panic。 |
+| A-01 | P2 | `internal/api/files.go` 仍是约 2600 行的多职责单体（文件传输、HLS、上传、索引、缩略图 HTTP）。本轮只抽离纯错误映射，暂不做机械拆文件，避免在无真实 FFmpeg/浏览器回归时扩大行为变更；后续应按职责拆成 `files_hls`/`files_content`/`files_mutation` 等模块。 |
+| A-02 | P2 | HLS 与 thumbnail 各自维护 FFmpeg binary、硬件探测和 profile 模型。本轮统一 `CRYP_FFMPEG_BIN`、修正 HLS encoder cache 按 binary 隔离，并为失败的 HLS 硬件 profile 增加短 TTL 冷却；共享 `internal/ffmpeg` 能力层仍属于下一阶段跨硬件矩阵重构。 |
+| A-03 | P2 | vault 删除仍是 DB 与磁盘的补偿式事务：文件已隔离/删除后 DB 操作可能失败。当前保持 tombstone/quiesce 以便重试；生产部署应增加 orphan quarantine sweeper、失败告警和可观测指标。 |
+| Q-06 | P1 | 任务启动在预约独占名额后、写入 durable task/加入 `running` 与 `WaitGroup` 前存在 admission 窗口；vault 删除或服务关停可能误判“没有运行任务”，并发删除任务行或关闭 DB。 | 已修复：`task.Manager` 增加 admission 读写屏障，将任务行创建、`running` 注册和 `WaitGroup.Add` 放入同一不可被 quiesce/shutdown 穿透的临界区；耗时源校验/文件计数若在屏障外完成，进入 admission 时会再次检查 closed/quiescing 并 fail-closed。 |
+| Q-07 | P1 | `StartImport`/`StartRebuildIndex` 在源校验、文件计数和 durable admission 之间仍可能长时间悬挂；若只等待 `running` worker，vault 删除或 shutdown 会提前返回并与启动者交叉。 | 已修复：用 `pendingStarts` + `startWg` 覆盖整个 public `Start*` 调用；`QuiesceVault`、`ForgetVault`、`ResumeVault` 和 `Shutdown` 均等待或保留 tombstone，直到最后一个启动者退出。`Wait` 只允许在 `Shutdown` 已建立 admission 边界后调用。 |
+| M-11 | P2 | 缩略图硬件探测把“生成测试文件”和“解码测试文件”共用一个 10 秒 context；冷启动驱动耗尽前半段预算后，第二次探测会被误判为不可用，导致无谓 CPU 回退。 | 已修复：两个探测命令使用独立超时预算，并补充探测生命周期回归覆盖。 |
+| T-34 | P2 | 已知不可用的 VAAPI profile 每次播放都会重新启动并等待 readiness 后才回退 CPU，连续播放时会制造短时 GPU 峰值和启动延迟。 | 已缓解：硬件 profile 启动失败进入按 binary/profile/设备参数隔离的 30 秒冷却；CPU fallback 不受冷却影响，成功后立即清除记录。真实驱动恢复仍需硬件集成测试。 |
+| T-35 | P2 | 前端 stop 请求忽略 202/网络失败，页面切换后无法再次确认进程组是否已完成退出；虽然后端会继续清理，但 UI 与回收状态脱节。 | 已缓解：`stopHls` 对 202 或一次网络失败按 `Retry-After` 最多重试一次，仍保持卸载场景的 best-effort 语义。 |
+
+本轮新增验证目标：除 Go 全量与 race/vet、前端 lint/build 外，还应在具备真实 FFmpeg、VAAPI render node 和带音视频样本的环境回归连续播放/停止/切换、GPU 进程退出、磁盘清理及 vault 删除失败重试。单元 fake-FFmpeg 测试只覆盖基础 ready/stop/Wait 契约，不能代替上述硬件和浏览器验证。

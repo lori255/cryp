@@ -1,11 +1,17 @@
 package api
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"time"
 
 	"cryp/internal/crypto"
+	"cryp/internal/pathguard"
 	"cryp/internal/storage"
 	"cryp/internal/task"
 
@@ -27,7 +33,17 @@ func (s *Server) handleLogin(c *gin.Context) {
 	// Get vault record by name
 	vault, err := s.db.GetVaultByName(req.Name)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "vault not found"})
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "vault not found"})
+		} else {
+			log.Printf("auth: lookup vault %q: %v", req.Name, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up vault"})
+		}
+		return
+	}
+	if _, pathErr := pathguard.ValidateVaultPath(s.vaultDir, vault.ID, vault.Path); pathErr != nil {
+		log.Printf("auth: refusing unsafe vault path for %s (%q): %v", vault.ID, vault.Path, pathErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "vault storage path is invalid"})
 		return
 	}
 
@@ -53,6 +69,9 @@ func (s *Server) handleLogin(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "wrong password"})
 		return
 	}
+	// Session and thumbnail/task entrypoints clone the keys they retain. The
+	// request-owned unlock result must not remain live after this handler.
+	defer keys.Zero()
 
 	// Create session
 	sessionID, err := s.sessions.Create(vault.ID, vault.Path, keys)
@@ -87,6 +106,7 @@ func (s *Server) handleLogout(c *gin.Context) {
 
 	if sessionID != "" {
 		if sess, ok := s.sessions.Get(sessionID); ok {
+			defer sess.Keys.Zero()
 			// Serialize logout with HLS starts and destructive replacements. This
 			// closes the window where a new stream could be registered after the
 			// owner stop but before its internal auth session is deleted.
@@ -130,7 +150,12 @@ func (s *Server) handleAuthStatus(c *gin.Context) {
 
 	vault, err := s.db.GetVault(sess.VaultID)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"authenticated": false})
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusOK, gin.H{"authenticated": false})
+		} else {
+			log.Printf("auth status: lookup vault %s: %v", sess.VaultID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up vault"})
+		}
 		return
 	}
 
@@ -166,13 +191,14 @@ func (s *Server) handleCreateVault(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate vault id"})
 		return
 	}
-	vaultPath := s.vaultDir + "/" + id
+	vaultPath := filepath.Join(s.vaultDir, id)
 
 	config, keys, err := crypto.InitVault(vaultPath, []byte(req.Password))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create vault: " + err.Error()})
 		return
 	}
+	defer keys.Zero()
 
 	record := &storage.VaultRecord{
 		ID:   id,
@@ -232,34 +258,121 @@ func (s *Server) handleDeleteVault(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "vault not found"})
 		return
 	}
+	validatedVaultPath, pathErr := pathguard.ValidateVaultPath(s.vaultDir, id, vault.Path)
+	if pathErr != nil {
+		log.Printf("vault %s: refusing unsafe storage path %q: %v", id, vault.Path, pathErr)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "vault storage path is invalid; vault was not deleted",
+			"code":  "vault_path_invalid",
+		})
+		return
+	}
+
+	// Quiesce background import/index tasks first. This also blocks a new task
+	// from starting in the cancellation-to-delete window.
+	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer deleteCancel()
+	resumeWorkers := func() {
+		if s.thumbs != nil {
+			s.thumbs.ResumeVault(id)
+		}
+		if s.tasks != nil {
+			s.tasks.ResumeVault(id)
+		}
+	}
+	if s.tasks != nil {
+		if err := s.tasks.QuiesceVault(deleteCtx, id); err != nil {
+			s.tasks.ResumeVault(id)
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusGatewayTimeout, gin.H{"error": "background vault tasks are still stopping; retry vault deletion"})
+			return
+		}
+	}
+	if s.thumbs != nil {
+		if err := s.thumbs.QuiesceVault(deleteCtx, id); err != nil {
+			resumeWorkers()
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusGatewayTimeout, gin.H{"error": "thumbnail tasks are still stopping; retry vault deletion"})
+			return
+		}
+	}
 
 	// Prevent new HLS starts while streams are stopped and the vault is
 	// removed. Otherwise a start racing this handler could recreate a reader
 	// between cleanup and deletion.
 	s.hlsLifeMu.Lock()
-	defer s.hlsLifeMu.Unlock()
 
 	// Stop any HLS/FFmpeg work before deleting the vault or its keys. Otherwise
 	// a background transcode can keep reading a vault that is being removed and
 	// hold GPU/file resources until an eventual authentication failure.
 	if !s.stopHLSForVault(id) {
+		s.hlsLifeMu.Unlock()
+		resumeWorkers()
 		c.Header("Retry-After", "1")
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "active video streams are still stopping; retry vault deletion"})
 		return
 	}
 
-	// Delete sessions for this vault
-	s.sessions.DeleteByVault(id)
+	// Optionally remove encrypted files from disk
+	if req.DeleteFiles {
+		// Move the validated directory to an application-generated sibling
+		// before recursively deleting it. This closes the most dangerous
+		// check-then-RemoveAll window: a replacement at the database-controlled
+		// name can no longer redirect the recursive walk outside the vault root.
+		quarantinePath, err := pathguard.QuarantineVaultPath(s.vaultDir, id, validatedVaultPath)
+		if err != nil {
+			log.Printf("vault %s: quarantine files %s: %v", id, validatedVaultPath, err)
+			// Keep workers quiesced on any isolation failure. The path may have
+			// changed after the initial validation; reopening it here would restore
+			// background readers before a retry can re-establish the boundary.
+			s.hlsLifeMu.Unlock()
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "encrypted files could not be isolated; vault was not deleted",
+				"code":  "vault_quarantine_failed",
+			})
+			return
+		}
+		if quarantinePath != "" {
+			if err := os.RemoveAll(quarantinePath); err != nil {
+				log.Printf("vault %s: remove quarantined files %s: %v", id, quarantinePath, err)
+				// RemoveAll may have completed only part of the tree. Keep all
+				// background owners quiesced so a retry cannot read or recreate a
+				// partially deleted vault.
+				s.hlsLifeMu.Unlock()
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": "encrypted files could not be removed; vault was not deleted",
+					"code":  "vault_files_remove_failed",
+				})
+				return
+			}
+		}
+	}
 
 	if err := s.db.DeleteVault(id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete vault"})
+		// The record remains as a retryable tombstone when the DB operation
+		// fails. If files were already removed, keep all workers quiesced: a
+		// resumed thumbnail/import job could recreate directories or write to a
+		// path whose encrypted contents no longer exist. A subsequent delete
+		// request will wait on the same tombstone and retry the DB operation.
+		log.Printf("vault %s: delete database record after file cleanup: %v", id, err)
+		s.hlsLifeMu.Unlock()
+		if !req.DeleteFiles {
+			resumeWorkers()
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete vault record"})
 		return
 	}
 
-	// Optionally remove encrypted files from disk
-	if req.DeleteFiles {
-		_ = os.RemoveAll(vault.Path)
+	// Delete sessions only after all work and persistent deletion succeeded;
+	// failed attempts can therefore be retried with the existing credentials.
+	s.sessions.DeleteByVault(id)
+	if s.tasks != nil {
+		s.tasks.ForgetVault(id)
 	}
+	if s.thumbs != nil {
+		s.thumbs.ForgetVault(id)
+	}
+	s.hlsLifeMu.Unlock()
 
 	c.JSON(http.StatusOK, gin.H{"message": "vault deleted"})
 }

@@ -16,7 +16,11 @@ services:
       - PORT=9527
       - DATA_DIR=/data/config
       - VAULT_DIR=/data/vaults
+      # Optional: restrict import and directory browsing to a media subtree.
+      # - SOURCE_DIR=/data/media
       - GOMEMLIMIT=256MiB
       # Optional: thumbnail hardware acceleration strategy (auto/vaapi/qsv/cuda/cpu)
       # - CRYP_FFMPEG_HWACCEL=auto
+      # Optional: override the FFmpeg executable used by HLS and thumbnails.
+      # - CRYP_FFMPEG_BIN=/usr/local/bin/ffmpeg
     restart: unless-stopped

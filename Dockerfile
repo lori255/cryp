@@ -37,5 +37,8 @@ VOLUME ["/data"]
 ENV PORT=9527
 ENV DATA_DIR=/data/config
 ENV VAULT_DIR=/data/vaults
+# SOURCE_DIR defaults to /data; set it to a dedicated media subtree in
+# deployments that share the mount with other application data.
+ENV SOURCE_DIR=/data
 
 CMD ["/app/cryp"]

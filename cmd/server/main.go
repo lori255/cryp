@@ -25,6 +25,7 @@ func main() {
 	port := flag.String("port", "8080", "server port")
 	dataDir := flag.String("data", "/data/config", "data directory for config/DB")
 	vaultDir := flag.String("vaults", "/data/vaults", "directory for encrypted vaults")
+	sourceDir := flag.String("source", "/data", "root directory allowed for browsing/import")
 	flag.Parse()
 
 	// Override with env vars
@@ -36,6 +37,11 @@ func main() {
 	}
 	if v := os.Getenv("VAULT_DIR"); v != "" {
 		*vaultDir = v
+	}
+	if source := os.Getenv("SOURCE_DIR"); source != "" {
+		*sourceDir = source
+	} else if browseRoot := os.Getenv("BROWSE_ROOT"); browseRoot != "" {
+		*sourceDir = browseRoot
 	}
 
 	// Initialize database
@@ -63,6 +69,9 @@ func main() {
 	if err := os.MkdirAll(*vaultDir, 0700); err != nil {
 		log.Fatalf("Failed to create vault directory: %v", err)
 	}
+	if err := os.MkdirAll(*sourceDir, 0700); err != nil {
+		log.Fatalf("Failed to create source directory: %v", err)
+	}
 
 	// Get embedded static files (nil in dev mode)
 	var staticFS fs.FS
@@ -72,7 +81,7 @@ func main() {
 
 	// Setup API server
 	gin.SetMode(gin.ReleaseMode)
-	server := api.NewServerWithPort(db, sessions, tasks, thumbs, *vaultDir, *port, staticFS)
+	server := api.NewServerWithPortAndSourceRoot(db, sessions, tasks, thumbs, *vaultDir, *port, *sourceDir, staticFS, *dataDir, *vaultDir)
 	router := server.SetupRouter()
 
 	log.Printf("Cryp server starting on :%s", *port)
@@ -93,19 +102,36 @@ func main() {
 	// groups, so merely returning from main would otherwise orphan them and
 	// leave GPU work and temporary files behind.
 	shutdown := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		hlsDone := make(chan error, 1)
-		go func() { hlsDone <- server.Shutdown(ctx) }()
-		if err := httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		httpCtx, httpCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer httpCancel()
+		if err := httpServer.Shutdown(httpCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("HTTP graceful shutdown failed: %v", err)
 			// Force-close connections that ignored the bounded graceful window;
 			// otherwise an upload/long response could keep the process alive
 			// while dependent resources are being torn down.
 			_ = httpServer.Close()
 		}
-		if err := <-hlsDone; err != nil {
+		if err := server.Shutdown(httpCtx); err != nil {
 			log.Printf("HLS graceful shutdown incomplete: %v", err)
+			// Do not close the session store while a late FFmpeg cleanup still
+			// owns an internal session. The second call is idempotent and waits
+			// without the HTTP grace-period budget.
+			if waitErr := server.Shutdown(context.Background()); waitErr != nil {
+				log.Printf("HLS shutdown wait failed: %v", waitErr)
+			}
+		}
+		// Use a fresh budget: a slow HLS cleanup must not make task shutdown
+		// return immediately and allow the DB to close under a worker goroutine.
+		taskCtx, taskCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer taskCancel()
+		if err := tasks.Shutdown(taskCtx); err != nil {
+			log.Printf("background task shutdown incomplete: %v", err)
+			// Workers may still persist their terminal state or index entries.
+			// Wait for that barrier before deferred DB/session closes; otherwise a
+			// timeout would turn a clean shutdown into a use-after-close race.
+			if waitErr := tasks.Wait(context.Background()); waitErr != nil {
+				log.Printf("background task shutdown wait failed: %v", waitErr)
+			}
 		}
 	}
 

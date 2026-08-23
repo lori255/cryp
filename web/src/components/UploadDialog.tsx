@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { api, formatSize } from '../lib/api'
 import { Upload, X, FileUp, CheckCircle2, AlertCircle } from 'lucide-react'
 
@@ -22,6 +22,16 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
   const [uploading, setUploading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const uploadAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => () => {
+    uploadAbortRef.current?.abort()
+  }, [])
+
+  function handleClose() {
+    uploadAbortRef.current?.abort()
+    onClose()
+  }
 
   function addFiles(fileList: FileList | null) {
     if (!fileList) return
@@ -41,6 +51,8 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
 
   async function uploadAll() {
     setUploading(true)
+    const controller = new AbortController()
+    uploadAbortRef.current = controller
 
     const pendingItems = items.filter(i => i.status === 'pending')
     const totalBytes = pendingItems.reduce((sum, i) => sum + i.file.size, 0)
@@ -55,6 +67,7 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
     }
 
     let fileIndex = 0
+    let aborted = false
     for (let i = 0; i < items.length; i++) {
       if (items[i].status !== 'pending') continue
 
@@ -75,20 +88,26 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
           taskId,
           fileIndex,
           pendingItems.length,
+          controller.signal,
         )
         setItems((prev) => prev.map((item, idx) =>
           idx === i ? { ...item, status: 'done' as const, progress: 100 } : item
         ))
         onUploaded()
       } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          aborted = true
+          break
+        }
         setItems((prev) => prev.map((item, idx) =>
           idx === i ? { ...item, status: 'error' as const, error: err instanceof Error ? err.message : '上传失败' } : item
         ))
       }
       fileIndex++
     }
+    uploadAbortRef.current = null
     setUploading(false)
-    onUploaded()
+    if (!aborted) onUploaded()
   }
 
   const pendingCount = items.filter((i) => i.status === 'pending').length
@@ -96,11 +115,11 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
   const allDone = items.length > 0 && doneCount === items.length
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-2 sm:p-4" onClick={onClose}>
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-2 sm:p-4" onClick={handleClose}>
       <div className="bg-gray-900 border border-gray-800 rounded-2xl p-6 w-full max-w-lg max-h-[calc(100vh-2rem)] sm:max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-white">上传文件</h2>
-          <button onClick={onClose} className="p-1 text-gray-400 hover:text-white"><X className="w-5 h-5" /></button>
+          <button onClick={handleClose} className="p-1 text-gray-400 hover:text-white"><X className="w-5 h-5" /></button>
         </div>
 
         <div
@@ -143,7 +162,7 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
         )}
 
         <div className="flex gap-3">
-          <button onClick={onClose}
+          <button onClick={handleClose}
             className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 py-2.5 rounded-xl font-medium transition-colors">
             {allDone ? '关闭' : '取消'}
           </button>

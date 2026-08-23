@@ -17,8 +17,10 @@ interface TaskActionError {
 export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPanelProps) {
   const [tasks, setTasks] = useState<TaskRecord[]>([])
   const [loading, setLoading] = useState(true)
+  const [pollError, setPollError] = useState('')
   const [actionError, setActionError] = useState<TaskActionError | null>(null)
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const openRef = useRef(open)
   const prevTasksRef = useRef<TaskRecord[]>([])
   const pollAbortRef = useRef<AbortController | null>(null)
   const pollRequestIdRef = useRef(0)
@@ -26,10 +28,22 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
     pollRequestIdRef.current += 1
     pollAbortRef.current?.abort()
     pollAbortRef.current = null
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
   }, [])
+
+  useEffect(() => {
+    openRef.current = open
+  }, [open])
 
   const loadTasks = useCallback(async () => {
     if (pollAbortRef.current) return
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
     const requestId = ++pollRequestIdRef.current
     const controller = new AbortController()
     pollAbortRef.current = controller
@@ -50,27 +64,36 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
       if (hasCompletedTask) {
         onRefresh?.()
       }
-      
+
       prevTasksRef.current = newTasks
+      setPollError('')
       setTasks(newTasks)
     } catch {
       if (controller.signal.aborted || requestId !== pollRequestIdRef.current) return
-      setActionError({ message: '任务列表加载失败' })
+      setPollError('任务列表加载失败')
     } finally {
       if (requestId === pollRequestIdRef.current) {
         pollAbortRef.current = null
         setLoading(false)
+        if (openRef.current && !controller.signal.aborted) {
+          const delay = document.visibilityState === 'hidden' ? 5000 : 2000
+          pollTimerRef.current = setTimeout(() => void loadTasks(), delay)
+        }
       }
     }
   }, [vaultId, onRefresh])
 
   useEffect(() => {
+    openRef.current = open
+    cancelPolling()
+    prevTasksRef.current = []
     if (!open) return
+    setLoading(true)
+    setPollError('')
+    setActionError(null)
     void loadTasks()
-    intervalRef.current = setInterval(() => void loadTasks(), 2000)
     return () => {
       cancelPolling()
-      if (intervalRef.current) clearInterval(intervalRef.current)
     }
   }, [open, loadTasks, cancelPolling])
 
@@ -78,7 +101,7 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
     setActionError(null)
     try {
       await api.cancelTask(vaultId, taskId)
-      loadTasks()
+      void loadTasks()
     } catch (err) {
       setActionError({ taskId, message: err instanceof Error ? err.message : '取消任务失败' })
     }
@@ -88,7 +111,7 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
     setActionError(null)
     try {
       await api.deleteTask(vaultId, taskId)
-      loadTasks()
+      void loadTasks()
     } catch (err) {
       setActionError({ taskId, message: err instanceof Error ? err.message : '删除任务失败' })
     }
@@ -115,7 +138,7 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
                   setActionError(null)
                   try {
                     await api.deleteCompletedTasks(vaultId)
-                    loadTasks()
+                    void loadTasks()
                   } catch (err) {
                     setActionError({ message: err instanceof Error ? err.message : '清除已完成任务失败' })
                   }
@@ -135,6 +158,11 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
           {actionError && (
             <p className="text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2">
               {actionError.message}
+            </p>
+          )}
+          {pollError && !actionError && (
+            <p className="text-xs text-amber-400 bg-amber-500/10 rounded-lg px-3 py-2">
+              {pollError}
             </p>
           )}
           {loading ? (
@@ -160,11 +188,13 @@ function TaskItem({ task: t, onCancel, onDelete }: {
   onCancel: (id: string) => void
   onDelete: (id: string) => void
 }) {
-  const pct = t.totalFiles > 0 ? Math.round((t.processedFiles / t.totalFiles) * 100) : 0
+  const pct = t.totalFiles > 0
+    ? Math.min(100, Math.max(0, Math.round((t.processedFiles / t.totalFiles) * 100)))
+    : 0
   const isActive = t.status === 'running'
   const hasKnownTotal = t.totalFiles > 0
 
-  const statusConfig: Record<string, { label: string; color: string }> = {
+  const statusConfig: Record<TaskRecord['status'], { label: string; color: string }> = {
     pending: { label: '等待中', color: 'bg-yellow-500/20 text-yellow-400' },
     running: { label: '运行中', color: 'bg-blue-500/20 text-blue-400' },
     done: { label: '已完成', color: 'bg-green-500/20 text-green-400' },
@@ -172,7 +202,7 @@ function TaskItem({ task: t, onCancel, onDelete }: {
     cancelled: { label: '已取消', color: 'bg-gray-500/20 text-gray-400' },
   }
 
-  const status = statusConfig[t.status] || statusConfig.pending
+  const status = statusConfig[t.status]
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">

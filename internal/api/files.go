@@ -378,14 +378,26 @@ const (
 var (
 	// Kept for source compatibility with older in-package tests. Detection no
 	// longer uses sync.Once because failed probes must be retriable.
-	ffmpegEncodersOnce       sync.Once
 	ffmpegEncodersMu         sync.Mutex
 	ffmpegEncodersCache      map[string]bool
 	ffmpegEncodersCachedAt   time.Time
 	ffmpegEncodersCacheValid bool
+	ffmpegEncodersCacheBin   string
+	hlsProfileFailuresMu     sync.Mutex
+	hlsProfileFailures       map[string]time.Time
 )
 
-const ffmpegEncodersCacheTTL = time.Minute
+const (
+	ffmpegEncodersCacheTTL = time.Minute
+	hlsProfileFailureTTL   = 30 * time.Second
+)
+
+func ffmpegBinary() string {
+	if bin := strings.TrimSpace(os.Getenv("CRYP_FFMPEG_BIN")); bin != "" {
+		return bin
+	}
+	return "ffmpeg"
+}
 
 func (s *Server) handleHLSStart(c *gin.Context) {
 	sess := getSession(c)
@@ -409,6 +421,11 @@ func (s *Server) handleHLSStart(c *gin.Context) {
 	// and start a fresh attempt for the new owner.
 	for {
 		s.hlsLifeMu.RLock()
+		if !s.requestSessionActive(c) {
+			s.hlsLifeMu.RUnlock()
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+			return
+		}
 		s.hlsMu.Lock()
 		if s.hls == nil {
 			s.hls = make(map[string]*hlsStream)
@@ -462,7 +479,10 @@ func (s *Server) handleHLSStart(c *gin.Context) {
 			s.hlsMu.Unlock()
 			s.hlsLifeMu.RUnlock()
 			c.Header("Retry-After", "2")
-			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many active video streams"})
+			c.JSON(hlsStartHTTPStatus(errHLSCapacity), gin.H{
+				"error": "too many active video streams",
+				"code":  hlsStartErrorCode(errHLSCapacity),
+			})
 			return
 		}
 		streamID, err := randomHex(16)
@@ -567,14 +587,8 @@ func hlsPendingReusable(pending *hlsPending) bool {
 }
 
 func zeroHLSKeys(keys *crypto.VaultKeys) {
-	if keys == nil {
-		return
-	}
-	for i := range keys.MasterKey {
-		keys.MasterKey[i] = 0
-	}
-	for i := range keys.MACKey {
-		keys.MACKey[i] = 0
+	if keys != nil {
+		keys.Zero()
 	}
 }
 
@@ -608,7 +622,10 @@ func (s *Server) waitForHLSStartOwner(c *gin.Context, vaultID, ownerID string, p
 		}
 		result := pending.result
 		if result.err != nil {
-			c.JSON(hlsStartHTTPStatus(result.err), gin.H{"error": "failed to start hls transcode"})
+			c.JSON(hlsStartHTTPStatus(result.err), gin.H{
+				"error": "failed to start hls transcode",
+				"code":  hlsStartErrorCode(result.err),
+			})
 			return
 		}
 		// The request can be cancelled in the tiny interval between the select
@@ -631,17 +648,6 @@ func (s *Server) releaseHLSStartOwner(vaultID, ownerID, streamID string) {
 	}
 	targets := s.collectHLSStopTargetsForOwner(vaultID, ownerID, streamID, "")
 	cancelHLSStopTargets(targets)
-}
-
-func hlsStartHTTPStatus(err error) int {
-	switch {
-	case errors.Is(err, context.Canceled):
-		return http.StatusConflict
-	case errors.Is(err, context.DeadlineExceeded):
-		return http.StatusGatewayTimeout
-	default:
-		return http.StatusInternalServerError
-	}
 }
 
 // completeHLSStart atomically publishes a ready stream or releases a pending
@@ -712,6 +718,10 @@ func (s *Server) startHLSStream(ctx context.Context, vaultID, virtualPath, dir, 
 	profiles := buildHLSProfiles()
 	var lastErr error
 	for profileIndex, profile := range profiles {
+		if hlsProfileCoolingDown(profile) {
+			log.Printf("hls: skipping profile=%s during backend failure cooldown", profile.name)
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -729,6 +739,7 @@ func (s *Server) startHLSStream(ctx context.Context, vaultID, virtualPath, dir, 
 		// controls probing/readiness; once ready, stream.cancel owns the process.
 		cmd, cancel, stderr, err := startHLSCommand(context.Background(), profile, dir, contentURL, sessionID)
 		if err != nil {
+			markHLSProfileFailure(profile)
 			lastErr = err
 			continue
 		}
@@ -742,8 +753,10 @@ func (s *Server) startHLSStream(ctx context.Context, vaultID, virtualPath, dir, 
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			markHLSProfileFailure(profile)
 			continue
 		}
+		clearHLSProfileFailure(profile)
 		log.Printf("hls: started profile=%s in %s", profile.name, time.Since(started).Round(time.Millisecond))
 		return &hlsStream{
 			dir:         dir,
@@ -760,6 +773,62 @@ func (s *Server) startHLSStream(ctx context.Context, vaultID, virtualPath, dir, 
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("no hls profile available")
+}
+
+func hlsProfileKey(profile transcodeProfile) string {
+	// CPU is the stable fallback and should never be cooled down. Include the
+	// complete argument shape so a device/profile change is allowed to recover
+	// immediately instead of inheriting a stale failure for the old setup.
+	if profile.name == "" || profile.name == "cpu" {
+		return ""
+	}
+	return ffmpegBinary() + "\x00" + profile.name + "\x00" +
+		strings.Join(profile.beforeInputArgs, "\x00") + "\x00" +
+		strings.Join(profile.videoArgs, "\x00")
+}
+
+func hlsProfileCoolingDown(profile transcodeProfile) bool {
+	key := hlsProfileKey(profile)
+	if key == "" {
+		return false
+	}
+	hlsProfileFailuresMu.Lock()
+	defer hlsProfileFailuresMu.Unlock()
+	if hlsProfileFailures == nil {
+		return false
+	}
+	until, ok := hlsProfileFailures[key]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(hlsProfileFailures, key)
+	return false
+}
+
+func markHLSProfileFailure(profile transcodeProfile) {
+	key := hlsProfileKey(profile)
+	if key == "" {
+		return
+	}
+	hlsProfileFailuresMu.Lock()
+	if hlsProfileFailures == nil {
+		hlsProfileFailures = make(map[string]time.Time)
+	}
+	hlsProfileFailures[key] = time.Now().Add(hlsProfileFailureTTL)
+	hlsProfileFailuresMu.Unlock()
+}
+
+func clearHLSProfileFailure(profile transcodeProfile) {
+	key := hlsProfileKey(profile)
+	if key == "" {
+		return
+	}
+	hlsProfileFailuresMu.Lock()
+	delete(hlsProfileFailures, key)
+	hlsProfileFailuresMu.Unlock()
 }
 
 func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, contentURL, sessionID string) (*exec.Cmd, context.CancelFunc, *tailBuffer, error) {
@@ -792,7 +861,7 @@ func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, content
 	)
 
 	streamCtx, cancel := context.WithCancel(ctx)
-	cmd := exec.CommandContext(streamCtx, "ffmpeg", args...)
+	cmd := exec.CommandContext(streamCtx, ffmpegBinary(), args...)
 	cmd.WaitDelay = 2 * time.Second
 	procgroup.Configure(cmd)
 	stderr := newTailBuffer(hlsMaxStderrBytes)
@@ -1123,13 +1192,22 @@ func (s *Server) collectAllHLSStopTargets(vaultID string) hlsStopTargets {
 }
 
 // Shutdown stops every pending and active HLS stream and waits for its
-// cleanup goroutine. It is intended to run before the HTTP server and session
-// store are closed, so FFmpeg cannot outlive the main process during a
-// graceful shutdown. The caller controls the upper bound through ctx.
+// cleanup goroutine. It first takes the lifecycle write barrier so an upload,
+// import replacement, or destructive file operation cannot continue while
+// sessions and the vault filesystem are being torn down. It is intended to
+// run before the HTTP server and session store are closed; the caller controls
+// the upper bound through ctx for process-level graceful shutdown.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// HTTP shutdown stops admission before this method is called in production.
+	// Holding the barrier here also drains any already-running mutation before
+	// we close its dependent session/DB resources.
+	if err := s.acquireHLSLifecycle(ctx); err != nil {
+		return err
+	}
+	defer s.hlsLifeMu.Unlock()
 	s.hlsMu.Lock()
 	s.hlsClosing = true
 	s.hlsMu.Unlock()
@@ -1142,6 +1220,29 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return err
 	}
 	return context.DeadlineExceeded
+}
+
+// acquireHLSLifecycle is a context-aware write-lock acquisition used only by
+// shutdown. The ordinary request paths use the mutex directly because they
+// must hold the barrier across a filesystem operation; shutdown additionally
+// needs to honor its grace-period budget while waiting for one such operation
+// to finish.
+func (s *Server) acquireHLSLifecycle(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.hlsLifeMu.TryLock() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Server) collectHLSOwnerTargets(vaultID, ownerID string) hlsStopTargets {
@@ -1632,13 +1733,14 @@ func detectFFmpegEncoders() map[string]bool {
 	ffmpegEncodersMu.Lock()
 	defer ffmpegEncodersMu.Unlock()
 	now := time.Now()
-	if ffmpegEncodersCacheValid && now.Sub(ffmpegEncodersCachedAt) < ffmpegEncodersCacheTTL {
+	bin := ffmpegBinary()
+	if ffmpegEncodersCacheValid && ffmpegEncodersCacheBin == bin && now.Sub(ffmpegEncodersCachedAt) < ffmpegEncodersCacheTTL {
 		return cloneFFmpegEncoders(ffmpegEncodersCache)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), ffmpegDetectTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-encoders")
+	cmd := exec.CommandContext(ctx, bin, "-hide_banner", "-encoders")
 	cmd.WaitDelay = 2 * time.Second
 	procgroup.Configure(cmd)
 	out, err := cmd.CombinedOutput()
@@ -1646,6 +1748,7 @@ func detectFFmpegEncoders() map[string]bool {
 		ffmpegEncodersCache = nil
 		ffmpegEncodersCacheValid = false
 		ffmpegEncodersCachedAt = time.Time{}
+		ffmpegEncodersCacheBin = bin
 		return map[string]bool{}
 	}
 
@@ -1659,6 +1762,7 @@ func detectFFmpegEncoders() map[string]bool {
 	ffmpegEncodersCache = encoders
 	ffmpegEncodersCachedAt = now
 	ffmpegEncodersCacheValid = true
+	ffmpegEncodersCacheBin = bin
 	return cloneFFmpegEncoders(encoders)
 }
 
@@ -1907,6 +2011,23 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 	taskID := c.Query("taskId")
 	fileIndex, _ := strconv.Atoi(c.DefaultQuery("fileIndex", "0"))
 	totalFiles, _ := strconv.Atoi(c.DefaultQuery("totalFiles", "1"))
+	// Take the lifecycle barrier before any task lookup or request-body work.
+	// Shutdown must be able to observe an in-flight upload even when the HTTP
+	// connection is closed while ownership is being checked.
+	s.hlsLifeMu.Lock()
+	defer s.hlsLifeMu.Unlock()
+	if taskID != "" {
+		if s.tasks == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "task manager unavailable", "code": "task_manager_unavailable"})
+			return
+		}
+		// A client may only report progress for a task belonging to its own
+		// vault. Check ownership before consuming the multipart body; otherwise
+		// an arbitrary task ID could be used to overwrite another vault's status.
+		if _, ok := s.taskForVault(c, sess.VaultID, taskID); !ok {
+			return
+		}
+	}
 
 	vault := &crypto.Vault{
 		ID:   sess.VaultID,
@@ -1956,8 +2077,10 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 	// Keep new HLS starts out of the stop-and-replace window. The write lock is
 	// held through encryption and indexing, so a concurrent player cannot
 	// start reading the destination again before it is complete.
-	s.hlsLifeMu.Lock()
-	defer s.hlsLifeMu.Unlock()
+	if !s.requestSessionActive(c) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		return
+	}
 	// Replacing a file invalidates any in-flight transcode for the old bytes.
 	// Stop it before opening the destination so a subsequent playback cannot
 	// race the upload and inherit stale segments.
@@ -2090,6 +2213,12 @@ func (s *Server) handleMkdir(c *gin.Context) {
 		Path: sess.VaultPath,
 		Keys: sess.Keys,
 	}
+	s.hlsLifeMu.Lock()
+	defer s.hlsLifeMu.Unlock()
+	if !s.requestSessionActive(c) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		return
+	}
 
 	if err := vault.CreateEncryptedDirectory(req.Path); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create directory: " + err.Error()})
@@ -2112,6 +2241,10 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 	}
 	s.hlsLifeMu.Lock()
 	defer s.hlsLifeMu.Unlock()
+	if !s.requestSessionActive(c) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		return
+	}
 
 	vault := &crypto.Vault{
 		ID:   sess.VaultID,
@@ -2154,6 +2287,10 @@ func (s *Server) handleDeleteFilesBatch(c *gin.Context) {
 	}
 	s.hlsLifeMu.Lock()
 	defer s.hlsLifeMu.Unlock()
+	if !s.requestSessionActive(c) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		return
+	}
 
 	deleted := make([]string, 0, len(req.Paths))
 	failed := make(map[string]string)
@@ -2285,6 +2422,10 @@ func (s *Server) handleListDuplicates(c *gin.Context) {
 
 func (s *Server) handleRebuildFileIndex(c *gin.Context) {
 	sess := getSession(c)
+	if s.tasks == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "task manager unavailable", "code": "task_manager_unavailable"})
+		return
+	}
 
 	taskID, err := task.GenerateID()
 	if err != nil {
@@ -2292,7 +2433,22 @@ func (s *Server) handleRebuildFileIndex(c *gin.Context) {
 		return
 	}
 	if err := s.tasks.StartRebuildIndex(taskID, sess.VaultID, sess.VaultPath, sess.Keys); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start rebuild task: " + err.Error()})
+		status := http.StatusInternalServerError
+		code := "task_start_failed"
+		if errors.Is(err, task.ErrTaskManagerClosed) {
+			status = http.StatusServiceUnavailable
+			code = "task_manager_unavailable"
+		} else if errors.Is(err, task.ErrVaultQuiescing) {
+			status = http.StatusConflict
+			code = "vault_removing"
+		}
+		message := "failed to start rebuild task"
+		if errors.Is(err, task.ErrVaultQuiescing) {
+			message = "vault is being removed"
+		} else if errors.Is(err, task.ErrTaskManagerClosed) {
+			message = "task manager unavailable"
+		}
+		c.JSON(status, gin.H{"error": message, "code": code})
 		return
 	}
 
@@ -2476,7 +2632,11 @@ func (s *Server) handleThumbnail(c *gin.Context) {
 
 	c.Header("Content-Type", "image/jpeg")
 	c.Status(http.StatusOK)
-	io.Copy(c.Writer, reader)
+	if _, copyErr := io.Copy(c.Writer, reader); copyErr != nil {
+		// The status line is already committed, but logging the short-read keeps
+		// corrupted cache files observable instead of silently returning a 200.
+		log.Printf("thumbnail: stream %s: %v", path, copyErr)
+	}
 }
 
 func getContentType(ext string) string {

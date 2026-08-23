@@ -55,36 +55,61 @@ export interface DirEntry {
   size: number;
 }
 
+export interface ApiErrorDetails {
+  [key: string]: unknown;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly details?: ApiErrorDetails;
+
+  constructor(status: number, message: string, code?: string, details?: ApiErrorDetails) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
+
 class ApiClient {
   private sessionId: string | null = null;
 
   constructor() {
-    this.sessionId = localStorage.getItem('sessionId');
+    this.sessionId = typeof localStorage === 'undefined' ? null : localStorage.getItem('sessionId');
   }
 
   private async request<T = Record<string, unknown>>(path: string, options?: RequestInit): Promise<T> {
-    const headers: Record<string, string> = {};
+    const headers = new Headers(options?.headers);
 
     if (this.sessionId) {
-      headers['X-Session-ID'] = this.sessionId;
+      headers.set('X-Session-ID', this.sessionId);
     }
 
     if (options?.body && !(options.body instanceof FormData)) {
-      headers['Content-Type'] = 'application/json';
+      headers.set('Content-Type', 'application/json');
     }
 
     const res = await fetch(`${API_BASE}${path}`, {
       ...options,
       credentials: 'include',
-      headers: { ...headers, ...(options?.headers as Record<string, string>) },
+      headers,
     });
 
     if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new Error((data as Record<string, string>).error || `Request failed: ${res.status}`);
+      const data = await readResponseBody(res);
+      const payload = isRecord(data) ? data : {};
+      const message = typeof payload.error === 'string'
+        ? payload.error
+        : typeof payload.message === 'string'
+          ? payload.message
+          : `Request failed: ${res.status}`;
+      const code = typeof payload.code === 'string' ? payload.code : undefined;
+      throw new ApiError(res.status, message, code, payload);
     }
 
-    return res.json() as Promise<T>;
+    return await readResponseBody(res) as T;
   }
 
   async login(name: string, password: string) {
@@ -92,15 +117,13 @@ class ApiClient {
       '/auth/login',
       { method: 'POST', body: JSON.stringify({ name, password }) },
     );
-    this.sessionId = data.sessionId;
-    localStorage.setItem('sessionId', data.sessionId);
+    this.setSessionId(data.sessionId);
     return data;
   }
 
   async logout() {
     await this.request('/auth/logout', { method: 'POST' }).catch(() => {});
-    this.sessionId = null;
-    localStorage.removeItem('sessionId');
+    this.setSessionId(null);
   }
 
   async checkAuth() {
@@ -114,8 +137,7 @@ class ApiClient {
       '/vaults',
       { method: 'POST', body: JSON.stringify({ name, password }) },
     );
-    this.sessionId = data.sessionId;
-    localStorage.setItem('sessionId', data.sessionId);
+    this.setSessionId(data.sessionId);
     return data;
   }
 
@@ -171,21 +193,44 @@ class ApiClient {
     // Beacon cannot carry X-Session-ID. Prefer keepalive fetch whenever the
     // client relies on localStorage auth; otherwise use Beacon for its unload
     // reliability and let the HttpOnly cookie authenticate it.
-    if (!this.sessionId && navigator.sendBeacon?.(endpoint)) {
+    if (!this.sessionId && typeof navigator !== 'undefined' && navigator.sendBeacon?.(endpoint)) {
       return;
     }
-    void fetch(endpoint, {
-      method: 'POST',
-      credentials: 'include',
-      keepalive: true,
-      headers,
-    }).catch(() => {});
+
+    // A stop may legitimately return 202 while FFmpeg is still unwinding.
+    // Retry once so a transient process-group delay is observed by the
+    // client, while keeping this best-effort and unload-safe (callers do not
+    // need to await the promise from a pagehide/unmount handler).
+    void (async () => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let response: Response;
+        try {
+          response = await fetch(endpoint, {
+            method: 'POST',
+            credentials: 'include',
+            keepalive: true,
+            headers,
+          });
+        } catch {
+          if (attempt === 1) return;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          continue;
+        }
+        if (response.status !== 202 || attempt === 1) return;
+        const retryAfter = Number(response.headers.get('Retry-After'));
+        const delay = Number.isFinite(retryAfter)
+          ? Math.max(100, Math.min(2000, retryAfter * 1000))
+          : 250;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    })();
   }
 
   private getHlsStopUrl(url: string): string | null {
     let parsed: URL;
     try {
-      parsed = new URL(url, window.location.origin);
+      const origin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin;
+      parsed = new URL(url, origin);
     } catch {
       return null;
     }
@@ -218,9 +263,12 @@ class ApiClient {
     taskId?: string,
     fileIndex?: number,
     totalFiles?: number,
+    signal?: AbortSignal,
   ): Promise<void> {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
+      const abortRequest = () => xhr.abort();
+      const cleanup = () => signal?.removeEventListener('abort', abortRequest);
       const formData = new FormData();
       formData.append('file', file);
 
@@ -231,14 +279,22 @@ class ApiClient {
       });
 
       xhr.addEventListener('load', () => {
+        cleanup();
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve();
         } else {
-          reject(new Error(`Upload failed: ${xhr.status}`));
+          reject(new ApiError(xhr.status, `Upload failed: ${xhr.status}`));
         }
       });
 
-      xhr.addEventListener('error', () => reject(new Error('Upload failed')));
+      xhr.addEventListener('error', () => {
+        cleanup();
+        reject(new Error('Upload failed'));
+      });
+      xhr.addEventListener('abort', () => {
+        cleanup();
+        reject(new DOMException('Upload aborted', 'AbortError'));
+      });
 
       let url = `${API_BASE}/vaults/${vaultId}/files/upload?path=${encodeURIComponent(currentPath)}`;
       if (taskId) {
@@ -248,6 +304,13 @@ class ApiClient {
       xhr.withCredentials = true;
       if (this.sessionId) {
         xhr.setRequestHeader('X-Session-ID', this.sessionId);
+      }
+      if (signal) {
+        if (signal.aborted) {
+          xhr.abort();
+          return;
+        }
+        signal.addEventListener('abort', abortRequest, { once: true });
       }
       xhr.send(formData);
     });
@@ -286,9 +349,10 @@ class ApiClient {
   }
 
   // Directory browsing
-  async browseDir(path: string) {
+  async browseDir(path?: string) {
+    const query = path ? `?path=${encodeURIComponent(path)}` : '';
     return this.request<{ path: string; items: DirEntry[] }>(
-      `/browse-dir?path=${encodeURIComponent(path)}`,
+      `/browse-dir${query}`,
     );
   }
 
@@ -334,6 +398,16 @@ class ApiClient {
   isLoggedIn(): boolean {
     return this.sessionId !== null;
   }
+
+  private setSessionId(sessionId: string | null): void {
+    this.sessionId = sessionId;
+    if (typeof localStorage === 'undefined') return;
+    if (sessionId) {
+      localStorage.setItem('sessionId', sessionId);
+    } else {
+      localStorage.removeItem('sessionId');
+    }
+  }
 }
 
 export const api = new ApiClient();
@@ -353,10 +427,10 @@ export function joinPath(parent: string, name: string): string {
 }
 
 export function formatSize(bytes: number): string {
-  if (bytes === 0) return '0 B';
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const i = Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k)));
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
@@ -372,9 +446,10 @@ export function formatDate(timestamp: number): string {
 }
 
 export function formatETA(startedAt: number, processedBytes: number, totalBytes: number): string {
-  if (processedBytes <= 0 || totalBytes <= 0) return '';
-  const elapsed = Date.now() / 1000 - startedAt;
-  const remaining = (elapsed / processedBytes) * (totalBytes - processedBytes);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(processedBytes) || !Number.isFinite(totalBytes)
+    || processedBytes <= 0 || totalBytes <= 0) return '';
+  const elapsed = Math.max(0, Date.now() / 1000 - startedAt);
+  const remaining = Math.max(0, (elapsed / processedBytes) * (totalBytes - processedBytes));
   if (remaining < 60) return `预计剩余 ${Math.round(remaining)}s`;
   if (remaining < 3600) {
     const mins = Math.floor(remaining / 60);
@@ -384,4 +459,29 @@ export function formatETA(startedAt: number, processedBytes: number, totalBytes:
   const hours = Math.floor(remaining / 3600);
   const mins = Math.floor((remaining % 3600) / 60);
   return `预计剩余 ${hours}h ${mins}m`;
+}
+
+async function readResponseBody(response: Response): Promise<unknown> {
+  if (response.status === 204 || response.headers.get('content-length') === '0') {
+    return undefined;
+  }
+  const text = await response.text();
+  if (!text.trim()) return undefined;
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.includes('application/json')) {
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      return { error: text };
+    }
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

@@ -33,6 +33,12 @@ const (
 	HeaderReservedValue = 0xFFFFFFFFFFFFFFFF
 )
 
+// ErrCorruptContent is returned when an encrypted file contains a truncated
+// or otherwise structurally invalid chunk. It is intentionally distinguishable
+// from an authentication failure so HTTP callers can report a damaged file
+// instead of a transient server/transcode error.
+var ErrCorruptContent = errors.New("corrupt encrypted content")
+
 // FileHeader represents the decrypted file header
 type FileHeader struct {
 	Nonce      []byte // 12 bytes - also used as AAD for chunks
@@ -141,14 +147,18 @@ func EncryptChunk(gcm cipher.AEAD, plaintext []byte, chunkNumber uint64, headerN
 // DecryptChunk decrypts a single ciphertext chunk
 func DecryptChunk(gcm cipher.AEAD, chunkData []byte, chunkNumber uint64, headerNonce []byte) ([]byte, error) {
 	if len(chunkData) < ChunkNonceSize+ChunkTagSize {
-		return nil, errors.New("chunk data too short")
+		return nil, fmt.Errorf("%w: chunk data too short", ErrCorruptContent)
 	}
 
 	nonce := chunkData[:ChunkNonceSize]
 	ciphertext := chunkData[ChunkNonceSize:]
 	aad := chunkAAD(chunkNumber, headerNonce)
 
-	return gcm.Open(nil, nonce, ciphertext, aad)
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, aad)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decrypt chunk %d: %w", ErrCorruptContent, chunkNumber, err)
+	}
+	return plaintext, nil
 }
 
 // EncryptingWriter encrypts data in chunks and writes to the underlying writer
@@ -321,6 +331,9 @@ func NewDecryptingReaderFromChunk(r io.Reader, contentKey []byte, headerNonce []
 }
 
 func (dr *DecryptingReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if dr.offset < len(dr.buf) {
 		n := copy(p, dr.buf[dr.offset:])
 		dr.offset += n
@@ -340,6 +353,13 @@ func (dr *DecryptingReader) Read(p []byte) (int, error) {
 		}
 		return 0, err
 	}
+	if n < ChunkNonceSize+ChunkTagSize {
+		dr.done = true
+		return 0, fmt.Errorf("%w: chunk %d is truncated (got %d bytes)", ErrCorruptContent, dr.chunkNum, n)
+	}
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return 0, err
+	}
 
 	chunkData := dr.chunkBuf[:n]
 
@@ -348,7 +368,7 @@ func (dr *DecryptingReader) Read(p []byte) (int, error) {
 	fillAAD(dr.aadBuf, dr.chunkNum, dr.headerNonce)
 	plaintext, decErr := dr.gcm.Open(dr.ptBuf[:0], nonce, ciphertext, dr.aadBuf)
 	if decErr != nil {
-		return 0, fmt.Errorf("decrypt chunk %d: %w", dr.chunkNum, decErr)
+		return 0, fmt.Errorf("%w: decrypt chunk %d: %w", ErrCorruptContent, dr.chunkNum, decErr)
 	}
 
 	dr.chunkNum++
@@ -400,7 +420,11 @@ func CipherSize2PlaintextSize(cipherSize int64) int64 {
 
 	plaintextSize := fullChunks * ChunkPayloadSize
 	if remainder > 0 {
-		plaintextSize += remainder - int64(ChunkNonceSize) - int64(ChunkTagSize)
+		minimum := int64(ChunkNonceSize + ChunkTagSize)
+		if remainder < minimum {
+			return plaintextSize
+		}
+		plaintextSize += remainder - minimum
 	}
 	return plaintextSize
 }

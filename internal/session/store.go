@@ -68,6 +68,12 @@ func (s *Store) Close() {
 
 // Create creates a new session for an unlocked vault
 func (s *Store) Create(vaultID, vaultPath string, keys *crypto.VaultKeys) (string, error) {
+	if s == nil {
+		return "", errors.New("session store is nil")
+	}
+	if keys == nil {
+		return "", errors.New("session keys are missing")
+	}
 	id, err := generateSessionID()
 	if err != nil {
 		return "", err
@@ -99,6 +105,9 @@ func (s *Store) Create(vaultID, vaultPath string, keys *crypto.VaultKeys) (strin
 
 // Get retrieves a session by ID
 func (s *Store) Get(id string) (*Session, bool) {
+	if s == nil {
+		return nil, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -119,8 +128,25 @@ func (s *Store) Get(id string) (*Session, bool) {
 	return &snapshot, true
 }
 
+// Has reports whether an unexpired session is still present without cloning
+// its key material. It is useful for re-checking authorization after a
+// lifecycle barrier (for example, a write that waited while a vault was being
+// deleted).
+func (s *Store) Has(id string) bool {
+	if s == nil || id == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sess, ok := s.sessions[id]
+	return ok && time.Now().Before(sess.ExpiresAt)
+}
+
 // Delete removes a session
 func (s *Store) Delete(id string) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -133,6 +159,9 @@ func (s *Store) Delete(id string) {
 
 // DeleteByVault removes all sessions for a specific vault
 func (s *Store) DeleteByVault(vaultID string) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -146,6 +175,9 @@ func (s *Store) DeleteByVault(vaultID string) {
 
 // Refresh extends a session's expiry
 func (s *Store) Refresh(id string) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -184,16 +216,8 @@ func generateSessionID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func zeroBytes(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}
-
 func zeroVaultKeys(keys *crypto.VaultKeys) {
-	if keys == nil {
-		return
+	if keys != nil {
+		keys.Zero()
 	}
-	zeroBytes(keys.MasterKey)
-	zeroBytes(keys.MACKey)
 }

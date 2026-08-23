@@ -3,6 +3,7 @@ package crypto
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"io"
 	"testing"
 )
@@ -74,6 +75,43 @@ func TestEncryptDecryptRoundtrip(t *testing.T) {
 				t.Fatalf("roundtrip failed for size %d: plaintext len=%d, decrypted len=%d", size, len(plaintext), len(decrypted))
 			}
 		})
+	}
+}
+
+func TestDecryptingReaderRejectsTruncatedChunk(t *testing.T) {
+	masterKey := make([]byte, MasterKeySize)
+	contentKey := make([]byte, MasterKeySize)
+	if _, err := rand.Read(masterKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(contentKey); err != nil {
+		t.Fatal(err)
+	}
+
+	var encrypted bytes.Buffer
+	header, err := WriteFileHeader(&encrypted, masterKey, contentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A chunk containing only a nonce cannot contain an authenticated payload.
+	encrypted.Write(make([]byte, ChunkNonceSize-1))
+
+	reader, err := NewDecryptingReader(bytes.NewReader(encrypted.Bytes()[HeaderSize:]), contentKey, header.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Release()
+	_, err = io.ReadAll(reader)
+	if !errors.Is(err, ErrCorruptContent) {
+		t.Fatalf("expected ErrCorruptContent, got %v", err)
+	}
+}
+
+func TestCipherSize2PlaintextSizeClampsMalformedChunk(t *testing.T) {
+	for _, size := range []int64{HeaderSize + ChunkNonceSize + ChunkTagSize - 1, HeaderSize + 1} {
+		if got := CipherSize2PlaintextSize(size); got != 0 {
+			t.Fatalf("CipherSize2PlaintextSize(%d) = %d, want 0", size, got)
+		}
 	}
 }
 

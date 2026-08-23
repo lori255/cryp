@@ -1,9 +1,11 @@
 package crypto
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +19,12 @@ const (
 	copyBufSize       = 32 * 1024       // 32KB
 )
 
+// ErrUnsafeSource is returned when the path opened for import is no longer the
+// same regular file that was validated by the caller.  Re-checking the opened
+// descriptor's identity closes the most useful part of the Lstat/EvalSymlinks
+// TOCTOU window without tying the crypto package to a particular path policy.
+var ErrUnsafeSource = errors.New("source path changed or is not a regular file")
+
 // EncryptResult describes an encrypted file written into the vault.
 type EncryptResult struct {
 	PlaintextSize int64
@@ -27,6 +35,16 @@ type EncryptResult struct {
 // CopyWithCacheDrop copies src to dst through encWriter, periodically
 // dropping page cache on both files to limit memory usage during large file encryption.
 func CopyWithCacheDrop(encWriter io.Writer, src *os.File, dst *os.File) (int64, error) {
+	return CopyWithCacheDropContext(context.Background(), encWriter, src, dst)
+}
+
+// CopyWithCacheDropContext is the cancellable form used by background tasks.
+// Cancellation is checked between bounded (32 KiB) reads, so a large import
+// can be stopped without waiting for the entire file to be encrypted.
+func CopyWithCacheDropContext(ctx context.Context, encWriter io.Writer, src *os.File, dst *os.File) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	buf := make([]byte, copyBufSize)
 	var total int64
 	var sinceLastDrop int64
@@ -34,6 +52,11 @@ func CopyWithCacheDrop(encWriter io.Writer, src *os.File, dst *os.File) (int64, 
 	var dstDropped int64
 
 	for {
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		default:
+		}
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			nw, writeErr := encWriter.Write(buf[:n])
@@ -116,16 +139,39 @@ func DropFileCache(f *os.File) {
 // EncryptSingleFile encrypts a file from srcPath into the vault at virtualPath,
 // computing the plaintext SHA-256 hash while streaming.
 func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath string) (EncryptResult, error) {
+	return EncryptSingleFileContext(context.Background(), vault, keys, srcPath, virtualPath)
+}
+
+// EncryptSingleFileContext encrypts one file while honoring cancellation.
+// The destination remains an atomic replacement: cancellation or any other
+// error removes only the private temporary file.
+func EncryptSingleFileContext(ctx context.Context, vault *Vault, keys *VaultKeys, srcPath, virtualPath string) (EncryptResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return EncryptResult{}, err
+	}
 	var result EncryptResult
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
 		return result, err
 	}
 	defer srcFile.Close()
-
-	if info, err := srcFile.Stat(); err == nil {
-		result.ModTime = info.ModTime().Unix()
+	pathInfo, err := os.Lstat(srcPath)
+	if err != nil {
+		return result, fmt.Errorf("stat source after open: %w", err)
 	}
+	fileInfo, err := srcFile.Stat()
+	if err != nil {
+		return result, fmt.Errorf("stat opened source: %w", err)
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() ||
+		!fileInfo.Mode().IsRegular() || !os.SameFile(pathInfo, fileInfo) {
+		return result, fmt.Errorf("%w: %s", ErrUnsafeSource, srcPath)
+	}
+
+	result.ModTime = fileInfo.ModTime().Unix()
 
 	encPath, err := vault.GetEncryptedFilePath(virtualPath)
 	if err != nil {
@@ -167,8 +213,12 @@ func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath strin
 	}
 
 	hasher := sha256.New()
-	written, err := CopyWithCacheDrop(io.MultiWriter(writer, hasher), srcFile, outFile)
+	written, err := CopyWithCacheDropContext(ctx, io.MultiWriter(writer, hasher), srcFile, outFile)
 	if err != nil {
+		os.Remove(tmpPath)
+		return result, err
+	}
+	if err := ctx.Err(); err != nil {
 		os.Remove(tmpPath)
 		return result, err
 	}
@@ -192,6 +242,10 @@ func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath strin
 	if err := outFile.Close(); err != nil {
 		os.Remove(tmpPath)
 		return result, fmt.Errorf("close encrypted file: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		os.Remove(tmpPath)
+		return result, err
 	}
 	if err := os.Rename(tmpPath, encPath); err != nil {
 		os.Remove(tmpPath)

@@ -77,6 +77,31 @@ type thumbJob struct {
 	Keys       *crypto.VaultKeys
 	FilePath   string // virtual path within vault
 	generation uint64
+	queueID    uint64
+	runID      uint64
+	ctx        context.Context
+}
+
+// thumbnailRun represents one piece of work that can touch a vault.  Keeping
+// cancellation and completion together lets destructive operations wait for a
+// concrete owner instead of guessing how long FFmpeg or a directory scan may
+// take to stop.
+type thumbnailRun struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// vaultLifecycle is intentionally small and local to the generator.  A vault
+// can be quiesced while the global worker continues serving other vaults.
+// Queued jobs are counted so a retired vault state can eventually be removed;
+// they are discarded by the worker after quiescing and never open the vault.
+type vaultLifecycle struct {
+	quiescing bool
+	retiring  bool
+	pending   int
+	nextID    uint64
+	active    map[uint64]*thumbnailRun
+	scans     map[uint64]*thumbnailRun
 }
 
 // Generator manages async thumbnail generation with a single-worker queue.
@@ -99,6 +124,7 @@ type Generator struct {
 	failed      map[string]time.Time
 	scanning    map[string]struct{}
 	generations map[string]uint64
+	vaults      map[string]*vaultLifecycle
 	stopped     bool
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -121,7 +147,7 @@ type ffmpegAttempt struct {
 // FFmpeg HTTP requests against the local server's content endpoint.
 func NewGenerator(vaultDir string, sessions *session.Store, port string) *Generator {
 	cfg := ffmpegConfig{
-		bin:     "ffmpeg",
+		bin:     thumbnailFFmpegBinary(),
 		hwaccel: strings.TrimSpace(os.Getenv("CRYP_FFMPEG_HWACCEL")),
 	}
 	if cfg.hwaccel == "" {
@@ -147,12 +173,20 @@ func NewGenerator(vaultDir string, sessions *session.Store, port string) *Genera
 		failed:      make(map[string]time.Time),
 		scanning:    make(map[string]struct{}),
 		generations: make(map[string]uint64),
+		vaults:      make(map[string]*vaultLifecycle),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
 	g.wg.Add(1)
 	go g.worker()
 	return g
+}
+
+func thumbnailFFmpegBinary() string {
+	if bin := strings.TrimSpace(os.Getenv("CRYP_FFMPEG_BIN")); bin != "" {
+		return bin
+	}
+	return "ffmpeg"
 }
 
 func buildFFmpegAttempts(cfg ffmpegConfig) []ffmpegAttempt {
@@ -241,6 +275,19 @@ func probeFFmpegAttempts(bin string, attempts []ffmpegAttempt) []ffmpegAttempt {
 }
 
 func canUseFFmpegAttempt(bin string, attempt ffmpegAttempt) bool {
+	return canUseFFmpegAttemptWithTimeout(bin, attempt, probeTimeout)
+}
+
+func canUseFFmpegAttemptWithTimeout(bin string, attempt ffmpegAttempt, timeout time.Duration) bool {
+	return canUseFFmpegAttemptWithRunner(bin, attempt, timeout, runFFmpegProbeCommand)
+}
+
+type ffmpegProbeRunner func(context.Context, string, []string) error
+
+func canUseFFmpegAttemptWithRunner(bin string, attempt ffmpegAttempt, timeout time.Duration, run ffmpegProbeRunner) bool {
+	if run == nil || timeout <= 0 {
+		return false
+	}
 	probeFile, err := os.CreateTemp("", "cryp-ffmpeg-probe-*.mp4")
 	if err != nil {
 		return false
@@ -249,11 +296,13 @@ func canUseFFmpegAttempt(bin string, attempt ffmpegAttempt) bool {
 	probeFile.Close()
 	defer os.Remove(probePath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-	defer cancel()
-	createCmd := exec.CommandContext(
-		ctx,
-		bin,
+	// Keep the encoder and decoder probes on independent deadlines.  The
+	// encoder probe can legitimately consume most of probeTimeout on a cold
+	// driver; sharing its context with the decoder would make the second probe
+	// inherit the already-expired budget and incorrectly disable a usable
+	// hardware backend.
+	createCtx, createCancel := context.WithTimeout(context.Background(), timeout)
+	createArgs := []string{
 		"-hide_banner",
 		"-loglevel", "error",
 		"-f", "lavfi",
@@ -261,26 +310,28 @@ func canUseFFmpegAttempt(bin string, attempt ffmpegAttempt) bool {
 		"-t", "1",
 		"-c:v", "h264",
 		"-y", probePath,
-	)
-	procgroup.Configure(createCmd)
-	if out, err := createCmd.CombinedOutput(); err != nil {
-		_ = out
+	}
+	if err := run(createCtx, bin, createArgs); err != nil {
+		createCancel()
 		return false
 	}
+	createCancel()
 
 	probeArgs := make([]string, 0, 16)
 	probeArgs = append(probeArgs, "-hide_banner", "-loglevel", "error")
 	probeArgs = appendAttemptHwArgs(probeArgs, attempt)
 	probeArgs = append(probeArgs, "-i", probePath, "-frames:v", "1", "-f", "null", "-")
 
-	runCmd := exec.CommandContext(ctx, bin, probeArgs...)
-	procgroup.Configure(runCmd)
-	out, err := runCmd.CombinedOutput()
-	if err != nil {
-		_ = out
-		return false
-	}
-	return true
+	decodeCtx, decodeCancel := context.WithTimeout(context.Background(), timeout)
+	defer decodeCancel()
+	return run(decodeCtx, bin, probeArgs) == nil
+}
+
+func runFFmpegProbeCommand(ctx context.Context, bin string, args []string) error {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	procgroup.Configure(cmd)
+	_, err := cmd.CombinedOutput()
+	return err
 }
 
 func appendAttemptHwArgs(args []string, attempt ffmpegAttempt) []string {
@@ -335,6 +386,233 @@ func formatFFmpegAttempts(attempts []ffmpegAttempt) string {
 	return strings.Join(parts, " -> ")
 }
 
+func (g *Generator) baseContext() context.Context {
+	if g != nil && g.ctx != nil {
+		return g.ctx
+	}
+	return context.Background()
+}
+
+// lifecycleLocked returns the state for a vault. Callers must hold g.mu.
+func (g *Generator) lifecycleLocked(vaultID string) *vaultLifecycle {
+	if g.vaults == nil {
+		g.vaults = make(map[string]*vaultLifecycle)
+	}
+	state := g.vaults[vaultID]
+	if state == nil {
+		state = &vaultLifecycle{
+			active: make(map[uint64]*thumbnailRun),
+			scans:  make(map[uint64]*thumbnailRun),
+		}
+		g.vaults[vaultID] = state
+	}
+	if state.active == nil {
+		state.active = make(map[uint64]*thumbnailRun)
+	}
+	if state.scans == nil {
+		state.scans = make(map[uint64]*thumbnailRun)
+	}
+	return state
+}
+
+// maybeRetireLocked removes a tombstone after all queued and active work has
+// gone away. A tombstone remains quiescing while queued jobs are still waiting
+// in the global channel, so a late worker cannot recreate a deleted vault.
+// Callers must hold g.mu.
+func (g *Generator) maybeRetireLocked(vaultID string) {
+	state := g.vaults[vaultID]
+	if state == nil || !state.retiring {
+		return
+	}
+	if state.pending == 0 && len(state.active) == 0 && len(state.scans) == 0 {
+		g.purgeVaultCachesLocked(vaultID)
+		delete(g.vaults, vaultID)
+	}
+}
+
+// purgeVaultCachesLocked releases per-file bookkeeping after a vault has no
+// queued or active owners left. Without this cleanup, generations and failure
+// cooldowns would retain every deleted vault's virtual paths for the lifetime
+// of the process even though the lifecycle tombstone was gone.
+func (g *Generator) purgeVaultCachesLocked(vaultID string) {
+	prefix := vaultID + "\x00"
+	for key := range g.queued {
+		if strings.HasPrefix(key, prefix) {
+			delete(g.queued, key)
+		}
+	}
+	for key := range g.failed {
+		if strings.HasPrefix(key, prefix) {
+			delete(g.failed, key)
+		}
+	}
+	for key := range g.generations {
+		if strings.HasPrefix(key, prefix) {
+			delete(g.generations, key)
+		}
+	}
+}
+
+// beginJob claims a queued job for execution. The claim is the last gate
+// before opening a vault file, so a quiesced/retired vault is safe even when a
+// job was already buffered in the worker channel.
+func (g *Generator) beginJob(job *thumbJob) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	state := g.lifecycleLocked(job.VaultID)
+	if job.queueID != 0 && state.pending > 0 {
+		state.pending--
+	}
+	if g.stopped || state.quiescing || state.retiring {
+		g.maybeRetireLocked(job.VaultID)
+		return false
+	}
+	state.nextID++
+	runID := state.nextID
+	ctx, cancel := context.WithCancel(g.baseContext())
+	state.active[runID] = &thumbnailRun{cancel: cancel, done: make(chan struct{})}
+	job.runID = runID
+	job.ctx = ctx
+	return true
+}
+
+func (g *Generator) endJob(job thumbJob) {
+	if job.runID == 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	state := g.vaults[job.VaultID]
+	if state == nil {
+		return
+	}
+	if run, ok := state.active[job.runID]; ok {
+		delete(state.active, job.runID)
+		run.cancel()
+		close(run.done)
+	}
+	g.maybeRetireLocked(job.VaultID)
+}
+
+func (g *Generator) beginScan(vaultID string) (context.Context, uint64, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return nil, 0, false
+	}
+	state := g.lifecycleLocked(vaultID)
+	if state.quiescing || state.retiring {
+		return nil, 0, false
+	}
+	if g.scanning == nil {
+		g.scanning = make(map[string]struct{})
+	}
+	if _, ok := g.scanning[vaultID]; ok {
+		return nil, 0, false
+	}
+	state.nextID++
+	runID := state.nextID
+	ctx, cancel := context.WithCancel(g.baseContext())
+	state.scans[runID] = &thumbnailRun{cancel: cancel, done: make(chan struct{})}
+	g.scanning[vaultID] = struct{}{}
+	// Stop waits for scanWg after taking the same mutex, so Add must happen
+	// before releasing g.mu to avoid an Add/Wait race during shutdown.
+	g.scanWg.Add(1)
+	return ctx, runID, true
+}
+
+func (g *Generator) endScan(vaultID string, runID uint64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.scanning, vaultID)
+	if state := g.vaults[vaultID]; state != nil {
+		if run, ok := state.scans[runID]; ok {
+			delete(state.scans, runID)
+			run.cancel()
+			close(run.done)
+		}
+	}
+	g.maybeRetireLocked(vaultID)
+}
+
+// QuiesceVault prevents new thumbnail work for a vault, cancels active
+// FFmpeg/scan work, and waits for the concrete owners to finish. Queued jobs
+// remain in the shared channel but are discarded by beginJob, so they never
+// touch a path after this method returns successfully.
+func (g *Generator) QuiesceVault(ctx context.Context, vaultID string) error {
+	if g == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	g.mu.Lock()
+	if g.stopped {
+		g.mu.Unlock()
+		return nil
+	}
+	state := g.lifecycleLocked(vaultID)
+	state.quiescing = true
+	runs := make([]*thumbnailRun, 0, len(state.active)+len(state.scans))
+	for _, run := range state.active {
+		runs = append(runs, run)
+	}
+	for _, run := range state.scans {
+		runs = append(runs, run)
+	}
+	g.mu.Unlock()
+
+	for _, run := range runs {
+		run.cancel()
+	}
+	for _, run := range runs {
+		select {
+		case <-run.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// ResumeVault reopens thumbnail work after a destructive operation was
+// deferred. If cancellation is still winding down, the tombstone stays in
+// place; a later quiesce retry will wait for the same owners instead of
+// allowing a new FFmpeg process to race them.
+func (g *Generator) ResumeVault(vaultID string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	state := g.vaults[vaultID]
+	if state == nil || state.retiring {
+		return
+	}
+	if len(state.active) == 0 && len(state.scans) == 0 {
+		state.quiescing = false
+	}
+}
+
+// ForgetVault leaves a short-lived tombstone when queued jobs are still in the
+// channel, then removes it automatically as the worker discards those jobs.
+// This avoids retaining one lifecycle object forever without reopening a
+// deleted vault to late work.
+func (g *Generator) ForgetVault(vaultID string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	state := g.vaults[vaultID]
+	if state == nil {
+		return
+	}
+	state.retiring = true
+	state.quiescing = true
+	g.maybeRetireLocked(vaultID)
+}
+
 // Stop gracefully shuts down the generator
 func (g *Generator) Stop() {
 	g.stopOnce.Do(func() {
@@ -357,6 +635,9 @@ func (g *Generator) Stop() {
 // Enqueue adds a thumbnail generation job to the queue.
 // Non-blocking: drops the job if queue is full.
 func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, virtualPath string) {
+	if g == nil || keys == nil || strings.TrimSpace(g.vaultDir) == "" || strings.TrimSpace(vaultID) == "" {
+		return
+	}
 	if g.HasThumbnail(vaultID, virtualPath) {
 		return
 	}
@@ -378,6 +659,11 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 		g.mu.Unlock()
 		return
 	}
+	state := g.lifecycleLocked(vaultID)
+	if state.quiescing || state.retiring {
+		g.mu.Unlock()
+		return
+	}
 	g.pruneFailedLocked(now)
 	if _, ok := g.queued[key]; ok {
 		g.mu.Unlock()
@@ -391,12 +677,16 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 		delete(g.failed, key)
 	}
 	g.queued[key] = struct{}{}
+	state.nextID++
+	queueID := state.nextID
+	state.pending++
 	job := thumbJob{
 		VaultID:    vaultID,
 		VaultPath:  vaultPath,
 		Keys:       keysCopy,
 		FilePath:   virtualPath,
 		generation: g.generations[key],
+		queueID:    queueID,
 	}
 	// Keep the non-blocking send under the same lock used by Stop. This closes
 	// the send/close race that otherwise could panic during server shutdown.
@@ -405,6 +695,8 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 		transferred = true
 	default:
 		delete(g.queued, key)
+		state.pending--
+		g.maybeRetireLocked(vaultID)
 		log.Printf("thumbnail: queue full, dropping %s", virtualPath)
 	}
 	g.mu.Unlock()
@@ -426,6 +718,9 @@ func (g *Generator) pruneFailedLocked(now time.Time) {
 
 // GetPath returns the thumbnail file path if it exists, or empty string
 func (g *Generator) GetPath(vaultID, virtualPath string) string {
+	if g == nil || strings.TrimSpace(g.vaultDir) == "" || strings.TrimSpace(vaultID) == "" || virtualPath == "" {
+		return ""
+	}
 	p := g.thumbPath(vaultID, virtualPath)
 	if _, err := os.Stat(p); err == nil {
 		return p
@@ -440,6 +735,9 @@ func (g *Generator) HasThumbnail(vaultID, virtualPath string) bool {
 
 // DeleteThumbnail removes a cached thumbnail for a file if it exists.
 func (g *Generator) DeleteThumbnail(vaultID, virtualPath string) {
+	if g == nil || strings.TrimSpace(g.vaultDir) == "" || strings.TrimSpace(vaultID) == "" || virtualPath == "" {
+		return
+	}
 	p := g.thumbPath(vaultID, virtualPath)
 	key := thumbJobKey(vaultID, virtualPath)
 	g.commitMu.Lock()
@@ -477,20 +775,37 @@ func thumbJobKey(vaultID, virtualPath string) string {
 func (g *Generator) worker() {
 	defer g.wg.Done()
 	for job := range g.jobs {
+		if !g.beginJob(&job) {
+			// A queued job may outlive a vault deletion or generator shutdown.
+			// Its key copy is still owned by the worker even though no I/O is
+			// performed, so release it here rather than waiting for GC.
+			g.discardJob(job)
+			continue
+		}
+		var generateErr error
 		// Skip if already exists
 		if g.HasThumbnail(job.VaultID, job.FilePath) {
-			g.finishJob(job, nil)
-			continue
+			generateErr = nil
+		} else {
+			generateErr = g.generate(job)
 		}
-		if err := g.generate(job); err != nil {
-			g.finishJob(job, err)
-			if !errors.Is(err, errThumbnailStale) && !errors.Is(err, errThumbnailSkipped) {
-				log.Printf("thumbnail: failed to generate for %s: %v", job.FilePath, err)
-			}
-			continue
+		g.endJob(job)
+		g.finishJob(job, generateErr)
+		if generateErr != nil && !errors.Is(generateErr, errThumbnailStale) && !errors.Is(generateErr, errThumbnailSkipped) {
+			log.Printf("thumbnail: failed to generate for %s: %v", job.FilePath, generateErr)
 		}
-		g.finishJob(job, nil)
 	}
+}
+
+func (g *Generator) discardJob(job thumbJob) {
+	defer zeroVaultKeys(job.Keys)
+	key := thumbJobKey(job.VaultID, job.FilePath)
+	g.mu.Lock()
+	if g.generations[key] == job.generation {
+		delete(g.queued, key)
+	}
+	g.maybeRetireLocked(job.VaultID)
+	g.mu.Unlock()
 }
 
 func (g *Generator) finishJob(job thumbJob, err error) {
@@ -533,9 +848,9 @@ func (g *Generator) finishJob(job thumbJob, err error) {
 // the moov atom (even at end of file) and extract a frame — all without any
 // plaintext ever touching disk.
 func (g *Generator) generate(job thumbJob) error {
-	baseCtx := g.ctx
+	baseCtx := job.ctx
 	if baseCtx == nil {
-		baseCtx = context.Background()
+		baseCtx = g.baseContext()
 	}
 	if err := baseCtx.Err(); err != nil {
 		return err
@@ -559,6 +874,9 @@ func (g *Generator) generate(job thumbJob) error {
 
 	if IsHEIF(job.FilePath) {
 		return g.generateHEIFWithContext(job, baseCtx)
+	}
+	if g.sessions == nil {
+		return errors.New("session store unavailable")
 	}
 
 	keysCopy := job.Keys.Clone()
@@ -675,9 +993,9 @@ func (g *Generator) generate(job thumbJob) error {
 }
 
 func (g *Generator) generateHEIF(job thumbJob) error {
-	baseCtx := g.ctx
+	baseCtx := job.ctx
 	if baseCtx == nil {
-		baseCtx = context.Background()
+		baseCtx = g.baseContext()
 	}
 	return g.generateHEIFWithContext(job, baseCtx)
 }
@@ -877,26 +1195,18 @@ func (g *Generator) writeDecryptedFileWithContext(job thumbJob, outPath string, 
 // ScanVault scans a vault for video files that are missing thumbnails and enqueues them.
 // Runs in a goroutine to avoid blocking startup.
 func (g *Generator) ScanVault(vaultID, vaultPath string, keys *crypto.VaultKeys) {
-	g.mu.Lock()
-	if g.stopped {
-		g.mu.Unlock()
+	if g == nil || keys == nil {
 		return
 	}
-	if _, ok := g.scanning[vaultID]; ok {
-		g.mu.Unlock()
+	ctx, runID, ok := g.beginScan(vaultID)
+	if !ok {
 		return
 	}
-	g.scanning[vaultID] = struct{}{}
-	g.scanWg.Add(1)
-	g.mu.Unlock()
-
 	keysCopy := keys.Clone()
 	go func() {
 		defer func() {
 			zeroVaultKeys(keysCopy)
-			g.mu.Lock()
-			delete(g.scanning, vaultID)
-			g.mu.Unlock()
+			g.endScan(vaultID, runID)
 			g.scanWg.Done()
 		}()
 		vault := &crypto.Vault{
@@ -904,12 +1214,15 @@ func (g *Generator) ScanVault(vaultID, vaultPath string, keys *crypto.VaultKeys)
 			Path: vaultPath,
 			Keys: keysCopy,
 		}
-		g.scanDir(vault, "/")
+		g.scanDir(ctx, vault, "/")
 	}()
 }
 
-func (g *Generator) scanDir(vault *crypto.Vault, dirPath string) {
-	if g.contextErr() != nil {
+func (g *Generator) scanDir(ctx context.Context, vault *crypto.Vault, dirPath string) {
+	if ctx == nil {
+		ctx = g.baseContext()
+	}
+	if err := ctx.Err(); err != nil {
 		return
 	}
 	files, err := vault.ListDirectory(dirPath)
@@ -918,7 +1231,7 @@ func (g *Generator) scanDir(vault *crypto.Vault, dirPath string) {
 	}
 
 	for _, f := range files {
-		if g.contextErr() != nil {
+		if err := ctx.Err(); err != nil {
 			return
 		}
 		fullPath := dirPath
@@ -929,29 +1242,16 @@ func (g *Generator) scanDir(vault *crypto.Vault, dirPath string) {
 		}
 
 		if f.IsDir {
-			g.scanDir(vault, fullPath)
+			g.scanDir(ctx, vault, fullPath)
 		} else if f.Size > 0 && (IsVideo(f.Name) || IsHEIF(f.Name)) && !g.HasThumbnail(vault.ID, fullPath) {
 			g.Enqueue(vault.ID, vault.Path, vault.Keys, fullPath)
 		}
 	}
 }
 
-func (g *Generator) contextErr() error {
-	if g.ctx == nil {
-		return nil
-	}
-	return g.ctx.Err()
-}
-
 func zeroVaultKeys(keys *crypto.VaultKeys) {
-	if keys == nil {
-		return
-	}
-	for i := range keys.MasterKey {
-		keys.MasterKey[i] = 0
-	}
-	for i := range keys.MACKey {
-		keys.MACKey[i] = 0
+	if keys != nil {
+		keys.Zero()
 	}
 }
 

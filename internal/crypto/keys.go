@@ -35,6 +35,22 @@ type VaultKeys struct {
 	MACKey    []byte // 32 bytes - used for filename encryption (AES-SIV)
 }
 
+// Zero overwrites the key material in place. Callers that own a clone of the
+// keys should invoke this when the work using that clone is complete. Keeping
+// the operation here avoids each package maintaining a subtly different
+// implementation.
+func (k *VaultKeys) Zero() {
+	if k == nil {
+		return
+	}
+	for i := range k.MasterKey {
+		k.MasterKey[i] = 0
+	}
+	for i := range k.MACKey {
+		k.MACKey[i] = 0
+	}
+}
+
 func (k *VaultKeys) Clone() *VaultKeys {
 	if k == nil {
 		return nil

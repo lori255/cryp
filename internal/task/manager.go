@@ -1,7 +1,9 @@
 package task
 
 import (
+	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"cryp/internal/crypto"
+	"cryp/internal/pathguard"
 	"cryp/internal/storage"
 	"cryp/internal/thumbnail"
 )
@@ -33,27 +36,70 @@ type ReplaceGuard func(vaultID, virtualPath string) error
 // written, preventing a new reader from starting in the stop/write window.
 type ReplaceLeaseGuard func(vaultID, virtualPath string) (release func(), err error)
 
+// ErrTaskManagerClosed is returned when a task is submitted during shutdown.
+var ErrTaskManagerClosed = errors.New("task manager is shutting down")
+
+// ErrTaskManagerNotClosed prevents callers from using Wait as a generic drain
+// operation while new starts are still allowed. WaitGroup permits Add/Wait
+// concurrency only while its counter is non-zero; requiring Shutdown first
+// gives Wait a stable admission boundary and avoids an Add-after-zero race.
+var ErrTaskManagerNotClosed = errors.New("task manager must be shut down before waiting")
+
+// ErrVaultQuiescing is returned while a vault is being deleted. Quiescing
+// prevents a new import/index task from starting between cancellation and the
+// destructive operation.
+var ErrVaultQuiescing = errors.New("vault is being removed")
+
+type runningTask struct {
+	cancel  context.CancelFunc
+	done    chan struct{}
+	vaultID string
+}
+
+type pendingStart struct {
+	vaultID string
+	done    chan struct{}
+}
+
 // Manager handles background task execution
 type Manager struct {
-	db                 *storage.DB
-	mu                 sync.RWMutex
-	running            map[string]chan struct{} // taskID -> cancel channel
-	runningByVaultType map[string]string        // vaultID:type -> taskID
-	taskRunKeys        map[string]string        // taskID -> vaultID:type
+	db *storage.DB
+	mu sync.RWMutex
+
+	// admissionMu closes the gap between a task start reserving its exclusive
+	// slot and registering its worker in running/wg.  Shutdown and vault
+	// quiesce take the write side before changing lifecycle state; a starter
+	// takes the read side only for the short durable-create/admission phase.
+	// Expensive source validation/counting remains outside this barrier, so a
+	// slow filesystem walk cannot indefinitely block unrelated shutdown work.
+	admissionMu        sync.RWMutex
+	running            map[string]*runningTask // taskID -> lifecycle handle
+	runningByVaultType map[string]string       // vaultID:type -> taskID
+	taskRunKeys        map[string]string       // taskID -> vaultID:type
 	thumbs             ThumbEnqueuer
 	replaceGuard       ReplaceGuard
 	replaceLeaseGuard  ReplaceLeaseGuard
+	importGuard        *pathguard.Guard
+	quiescingVaults    map[string]struct{}
+	pendingStarts      map[string]*pendingStart
+	resumeVaults       map[string]struct{}
+	startWg            sync.WaitGroup
+	wg                 sync.WaitGroup
+	closed             bool
 }
 
-const errTaskCancelled = "task cancelled"
+var errTaskCancelled = errors.New("task cancelled")
 
 // NewManager creates a new task manager and recovers interrupted tasks
 func NewManager(db *storage.DB) *Manager {
 	m := &Manager{
 		db:                 db,
-		running:            make(map[string]chan struct{}),
+		running:            make(map[string]*runningTask),
 		runningByVaultType: make(map[string]string),
 		taskRunKeys:        make(map[string]string),
+		quiescingVaults:    make(map[string]struct{}),
+		pendingStarts:      make(map[string]*pendingStart),
+		resumeVaults:       make(map[string]struct{}),
 	}
 	// Mark previously running tasks as interrupted
 	m.recoverTasks()
@@ -82,6 +128,22 @@ func (m *Manager) SetReplaceLeaseGuard(guard ReplaceLeaseGuard) {
 	m.mu.Unlock()
 }
 
+// SetImportSourceGuard installs the same host-path policy used by the HTTP
+// directory browser. The manager repeats validation defensively because task
+// creation may later gain non-HTTP callers.
+func (m *Manager) SetImportSourceGuard(guard *pathguard.Guard) {
+	m.mu.Lock()
+	m.importGuard = guard
+	m.mu.Unlock()
+}
+
+func (m *Manager) getImportSourceGuard() *pathguard.Guard {
+	m.mu.RLock()
+	guard := m.importGuard
+	m.mu.RUnlock()
+	return guard
+}
+
 func (m *Manager) getReplaceGuard() ReplaceGuard {
 	m.mu.RLock()
 	guard := m.replaceGuard
@@ -98,6 +160,9 @@ func (m *Manager) getReplaceLeaseGuard() ReplaceLeaseGuard {
 
 // recoverTasks marks any tasks that were "running" when server restarted as "error"
 func (m *Manager) recoverTasks() {
+	if m == nil || m.db == nil {
+		return
+	}
 	tasks, err := m.db.ListRunningTasks()
 	if err != nil {
 		log.Printf("Failed to recover tasks: %v", err)
@@ -106,12 +171,104 @@ func (m *Manager) recoverTasks() {
 	for _, t := range tasks {
 		t.Status = "error"
 		t.ErrorMsg = "server restarted, task interrupted"
-		_ = m.db.UpdateTask(&t)
+		m.updateTask(&t)
 	}
+}
+
+func (m *Manager) updateTask(t *storage.TaskRecord) {
+	if m == nil || m.db == nil || t == nil {
+		return
+	}
+	if err := m.db.UpdateTask(t); err != nil {
+		log.Printf("task %s: persist state: %v", t.ID, err)
+	}
+}
+
+// beginTaskStart registers the whole public Start* call, including source
+// validation and file counting.  These steps happen before a durable task row
+// exists, so tracking them separately is what lets vault deletion and
+// shutdown wait without guessing whether a starter is still in flight.
+func (m *Manager) beginTaskStart(taskID, vaultID string) error {
+	if m == nil {
+		return ErrTaskManagerClosed
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrTaskManagerClosed
+	}
+	if _, blocked := m.quiescingVaults[vaultID]; blocked {
+		return ErrVaultQuiescing
+	}
+	if taskID == "" {
+		return errors.New("task id is empty")
+	}
+	if m.pendingStarts == nil {
+		m.pendingStarts = make(map[string]*pendingStart)
+	}
+	if _, exists := m.pendingStarts[taskID]; exists {
+		return fmt.Errorf("task start already in progress: %s", taskID)
+	}
+	m.pendingStarts[taskID] = &pendingStart{vaultID: vaultID, done: make(chan struct{})}
+	m.startWg.Add(1)
+	return nil
+}
+
+func (m *Manager) finishTaskStart(taskID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	start := m.pendingStarts[taskID]
+	if start != nil {
+		delete(m.pendingStarts, taskID)
+		close(start.done)
+		m.startWg.Done()
+		m.maybeResumeVaultLocked(start.vaultID)
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) maybeResumeVaultLocked(vaultID string) {
+	if _, requested := m.resumeVaults[vaultID]; !requested || m.closed {
+		return
+	}
+	for _, run := range m.running {
+		if run != nil && run.vaultID == vaultID {
+			return
+		}
+	}
+	for _, start := range m.pendingStarts {
+		if start != nil && start.vaultID == vaultID {
+			return
+		}
+	}
+	delete(m.quiescingVaults, vaultID)
+	delete(m.resumeVaults, vaultID)
 }
 
 // StartImport starts a background directory import+encrypt task
 func (m *Manager) StartImport(taskID, vaultID, vaultPath string, keys *crypto.VaultKeys, sourcePath, destPath string, deleteSource bool) error {
+	if m == nil {
+		return ErrTaskManagerClosed
+	}
+	if keys == nil {
+		return errors.New("missing vault keys")
+	}
+	if err := m.beginTaskStart(taskID, vaultID); err != nil {
+		return err
+	}
+	defer m.finishTaskStart(taskID)
+	guard := m.getImportSourceGuard()
+	if guard == nil {
+		return errors.New("import source guard is not configured")
+	}
+	validatedPath, err := guard.ValidateImport(sourcePath, deleteSource)
+	if err != nil {
+		return fmt.Errorf("validate import source: %w", err)
+	}
+	sourcePath = validatedPath
+	destPath = crypto.NormalizeVirtualPath(destPath)
 	if err := m.reserveExclusiveTask(taskID, vaultID, "import"); err != nil {
 		return err
 	}
@@ -141,22 +298,31 @@ func (m *Manager) StartImport(taskID, vaultID, vaultPath string, keys *crypto.Va
 		StartedAt:    time.Now().Unix(),
 	}
 
-	if err := m.db.CreateTask(t); err != nil {
-		return fmt.Errorf("create task: %w", err)
+	ownedKeys := keys.Clone()
+	if ownedKeys == nil {
+		return errors.New("missing vault keys")
 	}
-
-	cancel := make(chan struct{})
-	m.mu.Lock()
-	m.running[taskID] = cancel
-	m.mu.Unlock()
-
+	if err := m.admitBackgroundTask(taskID, vaultID, t, ownedKeys, func(ctx context.Context) {
+		m.runImport(t, vaultPath, ownedKeys, ctx)
+	}); err != nil {
+		return err
+	}
 	reserved = false
-	go m.runImport(t, vaultPath, keys, cancel)
 	return nil
 }
 
 // StartRebuildIndex starts a background task that rebuilds the vault file index.
 func (m *Manager) StartRebuildIndex(taskID, vaultID, vaultPath string, keys *crypto.VaultKeys) error {
+	if m == nil {
+		return ErrTaskManagerClosed
+	}
+	if keys == nil {
+		return errors.New("missing vault keys")
+	}
+	if err := m.beginTaskStart(taskID, vaultID); err != nil {
+		return err
+	}
+	defer m.finishTaskStart(taskID)
 	if err := m.reserveExclusiveTask(taskID, vaultID, "index"); err != nil {
 		return err
 	}
@@ -181,17 +347,86 @@ func (m *Manager) StartRebuildIndex(taskID, vaultID, vaultPath string, keys *cry
 		StartedAt: time.Now().Unix(),
 	}
 
-	if err := m.db.CreateTask(t); err != nil {
-		return fmt.Errorf("create task: %w", err)
+	ownedKeys := keys.Clone()
+	if ownedKeys == nil {
+		return errors.New("missing vault keys")
+	}
+	vault.Keys = ownedKeys
+	if err := m.admitBackgroundTask(taskID, vaultID, t, ownedKeys, func(ctx context.Context) {
+		m.runRebuildIndex(t, vault, ctx)
+	}); err != nil {
+		return err
+	}
+	reserved = false
+	return nil
+}
+
+// admitBackgroundTask performs the short, irreversible part of task startup
+// under the admission read barrier: the durable task row is created and the
+// worker is registered in running/wg before a shutdown or vault quiesce can
+// proceed.  Callers may do expensive validation/counting before this helper;
+// those callers will simply observe closed/quiescing state and abort here.
+// Ownership of ownedKeys transfers to the worker on success and is wiped on
+// every failed admission path.
+func (m *Manager) admitBackgroundTask(taskID, vaultID string, t *storage.TaskRecord, ownedKeys *crypto.VaultKeys, runner func(context.Context)) error {
+	if m == nil {
+		if ownedKeys != nil {
+			ownedKeys.Zero()
+		}
+		return ErrTaskManagerClosed
+	}
+	if t == nil || ownedKeys == nil || runner == nil {
+		if ownedKeys != nil {
+			ownedKeys.Zero()
+		}
+		return errors.New("invalid task admission")
 	}
 
-	cancel := make(chan struct{})
+	m.admissionMu.RLock()
+	defer m.admissionMu.RUnlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &runningTask{cancel: cancel, done: make(chan struct{}), vaultID: vaultID}
 	m.mu.Lock()
-	m.running[taskID] = cancel
+	if m.closed {
+		m.mu.Unlock()
+		cancel()
+		ownedKeys.Zero()
+		return ErrTaskManagerClosed
+	}
+	if _, blocked := m.quiescingVaults[vaultID]; blocked {
+		m.mu.Unlock()
+		cancel()
+		ownedKeys.Zero()
+		return ErrVaultQuiescing
+	}
+	if m.db == nil {
+		m.mu.Unlock()
+		cancel()
+		ownedKeys.Zero()
+		return errors.New("task database is unavailable")
+	}
+	if err := m.db.CreateTask(t); err != nil {
+		m.mu.Unlock()
+		cancel()
+		ownedKeys.Zero()
+		return fmt.Errorf("create task: %w", err)
+	}
+	if m.running == nil {
+		m.running = make(map[string]*runningTask)
+	}
+	m.running[taskID] = run
+	// Add while admissionMu.RLock is held. Shutdown takes the write side before
+	// setting closed and waiting, so it cannot observe a zero counter and then
+	// race this Add/worker with DB.Close.
+	m.wg.Add(1)
 	m.mu.Unlock()
 
-	reserved = false
-	go m.runRebuildIndex(t, vault, cancel)
+	go func() {
+		defer m.wg.Done()
+		defer close(run.done)
+		runner(ctx)
+	}()
 	return nil
 }
 
@@ -199,6 +434,18 @@ func (m *Manager) reserveExclusiveTask(taskID, vaultID, taskType string) error {
 	key := vaultID + ":" + taskType
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return ErrTaskManagerClosed
+	}
+	if _, blocked := m.quiescingVaults[vaultID]; blocked {
+		return ErrVaultQuiescing
+	}
+	if m.runningByVaultType == nil {
+		m.runningByVaultType = make(map[string]string)
+	}
+	if m.taskRunKeys == nil {
+		m.taskRunKeys = make(map[string]string)
+	}
 	if runningID, ok := m.runningByVaultType[key]; ok {
 		return fmt.Errorf("%s task already running: %s", taskType, runningID)
 	}
@@ -222,6 +469,22 @@ func (m *Manager) releaseExclusiveTaskLocked(taskID string) {
 
 // CreateUploadTask creates a task record for tracking uploads
 func (m *Manager) CreateUploadTask(taskID, vaultID string, totalFiles int, totalBytes int64) error {
+	if m == nil {
+		return ErrTaskManagerClosed
+	}
+	m.mu.RLock()
+	if m.closed {
+		m.mu.RUnlock()
+		return ErrTaskManagerClosed
+	}
+	if _, quiescing := m.quiescingVaults[vaultID]; quiescing {
+		m.mu.RUnlock()
+		return ErrVaultQuiescing
+	}
+	if m.db == nil {
+		m.mu.RUnlock()
+		return errors.New("task database is unavailable")
+	}
 	t := &storage.TaskRecord{
 		ID:         taskID,
 		VaultID:    vaultID,
@@ -231,74 +494,281 @@ func (m *Manager) CreateUploadTask(taskID, vaultID string, totalFiles int, total
 		TotalBytes: totalBytes,
 		StartedAt:  time.Now().Unix(),
 	}
-	return m.db.CreateTask(t)
+	// Keep the read lock through the insert. QuiesceVault takes the write lock,
+	// so it cannot delete the vault's task rows between this admission check and
+	// the durable record creation.
+	err := m.db.CreateTask(t)
+	m.mu.RUnlock()
+	return err
 }
 
 // UpdateUploadProgress updates the progress of an upload task
 func (m *Manager) UpdateUploadProgress(taskID string, processedFiles int, processedBytes int64, currentFile string) {
-	t, err := m.db.GetTask(taskID)
-	if err != nil {
-		return
-	}
-	t.ProcessedFiles = processedFiles
-	t.ProcessedBytes = processedBytes
-	t.CurrentFile = currentFile
-	if processedFiles >= t.TotalFiles {
-		t.Status = "done"
-	}
-	_ = m.db.UpdateTask(t)
+	m.updateUploadTask(taskID, func(t *storage.TaskRecord) {
+		t.ProcessedFiles = processedFiles
+		t.ProcessedBytes = processedBytes
+		t.CurrentFile = currentFile
+		if processedFiles >= t.TotalFiles {
+			t.Status = "done"
+		}
+	})
 }
 
 // CompleteUploadTask marks an upload task as done
 func (m *Manager) CompleteUploadTask(taskID string) {
-	t, err := m.db.GetTask(taskID)
-	if err != nil {
-		return
-	}
-	t.Status = "done"
-	t.ProcessedFiles = t.TotalFiles
-	t.ProcessedBytes = t.TotalBytes
-	_ = m.db.UpdateTask(t)
+	m.updateUploadTask(taskID, func(t *storage.TaskRecord) {
+		t.Status = "done"
+		t.ProcessedFiles = t.TotalFiles
+		t.ProcessedBytes = t.TotalBytes
+	})
 }
 
 // FailUploadTask marks an upload task as error
 func (m *Manager) FailUploadTask(taskID, errMsg string) {
+	m.updateUploadTask(taskID, func(t *storage.TaskRecord) {
+		t.Status = "error"
+		t.ErrorMsg = errMsg
+	})
+}
+
+// updateUploadTask serializes progress writes with vault quiescing. Uploads
+// are driven by HTTP requests rather than Manager worker goroutines, so the
+// read lock is the lifecycle barrier that prevents a vault delete from
+// removing its record concurrently with a final progress update.
+func (m *Manager) updateUploadTask(taskID string, update func(*storage.TaskRecord)) {
+	if m == nil || m.db == nil || taskID == "" || update == nil {
+		return
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return
+	}
 	t, err := m.db.GetTask(taskID)
 	if err != nil {
 		return
 	}
-	t.Status = "error"
-	t.ErrorMsg = errMsg
-	_ = m.db.UpdateTask(t)
+	if _, blocked := m.quiescingVaults[t.VaultID]; blocked {
+		return
+	}
+	update(t)
+	m.updateTask(t)
 }
 
 // CancelTask cancels a running task
 func (m *Manager) CancelTask(taskID string) bool {
 	m.mu.Lock()
-	cancel, ok := m.running[taskID]
-	if ok {
-		close(cancel)
-		delete(m.running, taskID)
-		m.releaseExclusiveTaskLocked(taskID)
-	}
+	run, ok := m.running[taskID]
 	m.mu.Unlock()
 
 	if ok {
-		t, err := m.db.GetTask(taskID)
-		if err == nil {
-			t.Status = "cancelled"
-			_ = m.db.UpdateTask(t)
-		}
+		// Keep the lifecycle handle registered until the goroutine has actually
+		// exited. This preserves exclusivity and lets shutdown wait for all
+		// filesystem/DB work to finish.
+		run.cancel()
 	}
 	return ok
 }
 
-func (m *Manager) runImport(t *storage.TaskRecord, vaultPath string, keys *crypto.VaultKeys, cancel chan struct{}) {
-	defer func() {
-		m.mu.Lock()
-		delete(m.running, t.ID)
-		m.releaseExclusiveTaskLocked(t.ID)
+// QuiesceVault cancels and waits for all import/index tasks belonging to a
+// vault. Once quiesced, new background tasks for the vault are rejected until
+// ResumeVault is called. It is used as a barrier before vault deletion.
+func (m *Manager) QuiesceVault(ctx context.Context, vaultID string) error {
+	if m == nil {
+		return ErrTaskManagerClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Block the short durable-create/admission phase of a starter before
+	// publishing the vault tombstone. A starter that is still doing source
+	// validation will observe the tombstone when it reaches admission and will
+	// never create a task row or worker after deletion proceeds.
+	m.admissionMu.Lock()
+	m.mu.Lock()
+	if m.closed {
 		m.mu.Unlock()
+		m.admissionMu.Unlock()
+		return ErrTaskManagerClosed
+	}
+	if m.quiescingVaults == nil {
+		m.quiescingVaults = make(map[string]struct{})
+	}
+	m.quiescingVaults[vaultID] = struct{}{}
+	targets := make([]*runningTask, 0)
+	for _, run := range m.running {
+		if run != nil && run.vaultID == vaultID {
+			targets = append(targets, run)
+		}
+	}
+	pending := make([]*pendingStart, 0)
+	for _, start := range m.pendingStarts {
+		if start != nil && start.vaultID == vaultID {
+			pending = append(pending, start)
+		}
+	}
+	m.mu.Unlock()
+	m.admissionMu.Unlock()
+
+	for _, run := range targets {
+		run.cancel()
+	}
+	for _, run := range targets {
+		select {
+		case <-run.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	for _, start := range pending {
+		select {
+		case <-start.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// ResumeVault allows new tasks after a failed/deferred destructive operation.
+func (m *Manager) ResumeVault(vaultID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	for _, run := range m.running {
+		if run != nil && run.vaultID == vaultID {
+			// A timed-out quiesce may still be waiting for a filesystem call to
+			// return. Keep the tombstone until the same owner has actually
+			// exited; reopening the vault here would reintroduce the delete race.
+			if m.resumeVaults == nil {
+				m.resumeVaults = make(map[string]struct{})
+			}
+			m.resumeVaults[vaultID] = struct{}{}
+			m.mu.Unlock()
+			return
+		}
+	}
+	for _, start := range m.pendingStarts {
+		if start != nil && start.vaultID == vaultID {
+			// Source validation/counting happens before durable admission. Defer
+			// reopening until the public Start* call has completely returned.
+			if m.resumeVaults == nil {
+				m.resumeVaults = make(map[string]struct{})
+			}
+			m.resumeVaults[vaultID] = struct{}{}
+			m.mu.Unlock()
+			return
+		}
+	}
+	delete(m.quiescingVaults, vaultID)
+	delete(m.resumeVaults, vaultID)
+	m.mu.Unlock()
+}
+
+// ForgetVault removes a completed deletion tombstone once the database record
+// is gone. It intentionally refuses to forget a vault with a late-running
+// owner; callers can retry after that owner has exited.
+func (m *Manager) ForgetVault(vaultID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, run := range m.running {
+		if run != nil && run.vaultID == vaultID {
+			return
+		}
+	}
+	for _, start := range m.pendingStarts {
+		if start != nil && start.vaultID == vaultID {
+			// Do not remove the tombstone while a pre-admission starter could
+			// still create a task after the destructive operation.
+			return
+		}
+	}
+	delete(m.quiescingVaults, vaultID)
+	delete(m.resumeVaults, vaultID)
+}
+
+// Shutdown cancels all background import/index tasks and waits for both
+// pre-admission starters and worker goroutines before dependent resources
+// (especially the database) are closed.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Close the same admission barrier used by task starters before marking the
+	// manager closed. This makes the subsequent WaitGroup wait a complete
+	// lifecycle boundary: no starter can still be between DB work and wg.Add.
+	m.admissionMu.Lock()
+	m.mu.Lock()
+	if !m.closed {
+		m.closed = true
+		for _, run := range m.running {
+			if run != nil {
+				run.cancel()
+			}
+		}
+	}
+	m.mu.Unlock()
+	m.admissionMu.Unlock()
+	return m.Wait(ctx)
+}
+
+// Wait waits for all task starters and workers admitted before Shutdown to
+// exit. It is useful after a bounded Shutdown call reports a timeout: callers
+// must wait for this barrier before closing the database or session store that
+// workers use.
+// New work is rejected once Shutdown has marked the manager closed.
+func (m *Manager) Wait(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.RLock()
+	closed := m.closed
+	m.mu.RUnlock()
+	if !closed {
+		return ErrTaskManagerNotClosed
+	}
+	done := make(chan struct{})
+	go func() {
+		m.startWg.Wait()
+		m.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) finishRun(taskID string) {
+	m.mu.Lock()
+	vaultID := ""
+	if run := m.running[taskID]; run != nil {
+		vaultID = run.vaultID
+	}
+	delete(m.running, taskID)
+	m.releaseExclusiveTaskLocked(taskID)
+	if vaultID != "" {
+		m.maybeResumeVaultLocked(vaultID)
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) runImport(t *storage.TaskRecord, vaultPath string, keys *crypto.VaultKeys, ctx context.Context) {
+	defer func() {
+		keys.Zero()
+		m.finishRun(t.ID)
 	}()
 
 	vault := &crypto.Vault{
@@ -307,9 +777,9 @@ func (m *Manager) runImport(t *storage.TaskRecord, vaultPath string, keys *crypt
 		Keys: keys,
 	}
 
-	err := m.encryptDirRecursive(vault, keys, t, t.SourcePath, t.DestPath, cancel)
+	err := m.encryptDirRecursive(ctx, vault, keys, t, t.SourcePath, t.DestPath)
 	if err != nil {
-		if err.Error() == errTaskCancelled {
+		if errors.Is(err, errTaskCancelled) || errors.Is(err, context.Canceled) {
 			t.Status = "cancelled"
 			t.ErrorMsg = ""
 		} else {
@@ -322,33 +792,31 @@ func (m *Manager) runImport(t *storage.TaskRecord, vaultPath string, keys *crypt
 
 	// Clean up empty directories left after per-file deletion
 	if t.DeleteSource {
-		removeEmptyDirs(t.SourcePath)
+		removeEmptyDirs(ctx, t.SourcePath)
 	}
 
-	_ = m.db.UpdateTask(t)
+	m.updateTask(t)
 
 	crypto.ReleaseMemoryAfterLargeFile()
 }
 
-func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, cancel chan struct{}) {
+func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, ctx context.Context) {
 	defer func() {
-		m.mu.Lock()
-		delete(m.running, t.ID)
-		m.releaseExclusiveTaskLocked(t.ID)
-		m.mu.Unlock()
+		vault.Keys.Zero()
+		m.finishRun(t.ID)
 	}()
 
 	if err := m.db.ClearEntries(t.VaultID); err != nil {
 		t.Status = "error"
 		t.ErrorMsg = err.Error()
-		_ = m.db.UpdateTask(t)
+		m.updateTask(t)
 		return
 	}
 
-	err := m.rebuildEntryIndex(vault, t, "/", cancel)
+	err := m.rebuildEntryIndex(ctx, vault, t, "/")
 
 	if err != nil {
-		if err.Error() == errTaskCancelled {
+		if errors.Is(err, errTaskCancelled) || errors.Is(err, context.Canceled) {
 			t.Status = "cancelled"
 			t.ErrorMsg = ""
 		} else {
@@ -362,10 +830,13 @@ func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, ca
 		t.CurrentFile = ""
 	}
 
-	_ = m.db.UpdateTask(t)
+	m.updateTask(t)
 }
 
-func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKeys, t *storage.TaskRecord, srcPath, destPath string, cancel chan struct{}) error {
+func (m *Manager) encryptDirRecursive(ctx context.Context, vault *crypto.Vault, keys *crypto.VaultKeys, t *storage.TaskRecord, srcPath, destPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(srcPath)
 	if err != nil {
 		return fmt.Errorf("read dir %s: %w", srcPath, err)
@@ -374,13 +845,18 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 	for _, entry := range entries {
 		// Check cancellation
 		select {
-		case <-cancel:
-			return fmt.Errorf(errTaskCancelled)
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
 		}
 
 		entryPath := filepath.Join(srcPath, entry.Name())
 		virtualPath := filepath.Join(destPath, entry.Name())
+		if guard := m.getImportSourceGuard(); guard != nil {
+			if err := guard.ValidateEntry(entryPath); err != nil {
+				return fmt.Errorf("validate import entry %s: %w", entry.Name(), err)
+			}
+		}
 
 		if entry.IsDir() {
 			if err := vault.CreateEncryptedDirectory(virtualPath); err != nil {
@@ -389,7 +865,7 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, true, false, 0, 0, ""); err != nil {
 				return fmt.Errorf("index dir %s: %w", virtualPath, err)
 			}
-			if err := m.encryptDirRecursive(vault, keys, t, entryPath, virtualPath, cancel); err != nil {
+			if err := m.encryptDirRecursive(ctx, vault, keys, t, entryPath, virtualPath); err != nil {
 				return err
 			}
 			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, true, true, 0, 0, ""); err != nil {
@@ -397,7 +873,7 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			}
 		} else {
 			t.CurrentFile = entry.Name()
-			_ = m.db.UpdateTask(t)
+			m.updateTask(t)
 
 			info, _ := entry.Info()
 			var release func()
@@ -419,13 +895,16 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 				if release != nil {
 					defer release()
 				}
-				return crypto.EncryptSingleFile(vault, keys, entryPath, virtualPath)
+				return crypto.EncryptSingleFileContext(ctx, vault, keys, entryPath, virtualPath)
 			}()
 			if err != nil {
 				// EncryptSingleFile writes to a private temporary file and only
 				// renames after fsync, so a failed replacement leaves the previous
 				// destination intact and cleans its own partial output.
 				return fmt.Errorf("encrypt %s: %w", virtualPath, err)
+			}
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 
 			protectedHash := crypto.ProtectContentHash(keys.MACKey, vault.ID, result.ContentHash)
@@ -439,7 +918,20 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			// Delete source file only after encryption is fully synced to disk.
 			// EncryptSingleFile now fsync's before returning, so this is safe.
 			if t.DeleteSource {
-				_ = os.Remove(entryPath)
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if guard := m.getImportSourceGuard(); guard != nil {
+					// Re-check immediately before unlinking. The source may have
+					// been replaced while encryption was running; failing closed is
+					// safer than deleting an unexpected path.
+					if err := guard.ValidateEntry(entryPath); err != nil {
+						return fmt.Errorf("validate source before removal %s: %w", entry.Name(), err)
+					}
+				}
+				if err := os.Remove(entryPath); err != nil {
+					return fmt.Errorf("remove source %s: %w", entryPath, err)
+				}
 			}
 
 			// Enqueue thumbnail generation for supported expensive previews.
@@ -455,17 +947,15 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			} else {
 				t.ProcessedBytes += result.PlaintextSize
 			}
-			_ = m.db.UpdateTask(t)
+			m.updateTask(t)
 		}
 	}
 	return nil
 }
 
-func (m *Manager) rebuildEntryIndex(vault *crypto.Vault, t *storage.TaskRecord, dirPath string, cancel chan struct{}) error {
-	select {
-	case <-cancel:
-		return fmt.Errorf(errTaskCancelled)
-	default:
+func (m *Manager) rebuildEntryIndex(ctx context.Context, vault *crypto.Vault, t *storage.TaskRecord, dirPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	entries, err := vault.ListDirectory(dirPath)
@@ -478,21 +968,21 @@ func (m *Manager) rebuildEntryIndex(vault *crypto.Vault, t *storage.TaskRecord, 
 
 	for _, entry := range entries {
 		select {
-		case <-cancel:
-			return fmt.Errorf(errTaskCancelled)
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
 		}
 
 		virtualPath := joinVirtualPath(dirPath, entry.Name)
 		if entry.IsDir {
-			if err := m.rebuildEntryIndex(vault, t, virtualPath, cancel); err != nil {
+			if err := m.rebuildEntryIndex(ctx, vault, t, virtualPath); err != nil {
 				return err
 			}
 			continue
 		}
 
 		t.CurrentFile = virtualPath
-		_ = m.db.UpdateTask(t)
+		m.updateTask(t)
 
 		hash, err := vault.HashVirtualFile(virtualPath)
 		if err != nil {
@@ -594,9 +1084,17 @@ func GenerateID() (string, error) {
 
 // removeEmptyDirs walks bottom-up and removes empty directories.
 // Leaves non-empty directories (containing failed files) intact.
-func removeEmptyDirs(root string) {
+func removeEmptyDirs(ctx context.Context, root string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var dirs []string
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if err != nil {
 			return nil
 		}
@@ -607,6 +1105,13 @@ func removeEmptyDirs(root string) {
 	})
 	// Reverse order = deepest first, os.Remove only succeeds on empty dirs
 	for i := len(dirs) - 1; i >= 0; i-- {
-		os.Remove(dirs[i])
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if err := os.Remove(dirs[i]); err != nil && !os.IsNotExist(err) {
+			log.Printf("task: remove empty source directory %s: %v", dirs[i], err)
+		}
 	}
 }

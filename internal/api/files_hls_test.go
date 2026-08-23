@@ -5,12 +5,35 @@ import (
 	"errors"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
+
+// TestMain doubles as a tiny fake-FFmpeg executable for the lifecycle test
+// below. It is activated only in a child process through an environment flag,
+// so normal package tests retain their usual runner.
+func TestMain(m *testing.M) {
+	if os.Getenv("CRYP_FAKE_FFMPEG_HELPER") == "1" {
+		playlist := os.Args[len(os.Args)-1]
+		if strings.HasPrefix(playlist, "-") {
+			os.Exit(0)
+		}
+		dir := filepath.Dir(playlist)
+		_ = os.MkdirAll(dir, 0o700)
+		const segment = "segment_00000.ts"
+		_ = os.WriteFile(filepath.Join(dir, segment), []byte("fake segment"), 0o600)
+		_ = os.WriteFile(playlist, []byte("#EXTM3U\n#EXTINF:1,\n"+segment+"\n"), 0o600)
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	os.Exit(m.Run())
+}
 
 func TestCompleteHLSStartBroadcastsFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -271,6 +294,33 @@ func TestHLSContentURLUsesConfiguredPort(t *testing.T) {
 	}
 }
 
+func TestHLSCommandCanBeStoppedAndWaited(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group cleanup test requires Unix signals")
+	}
+	t.Setenv("CRYP_FFMPEG_BIN", os.Args[0])
+	t.Setenv("CRYP_FAKE_FFMPEG_HELPER", "1")
+	dir := t.TempDir()
+	cmd, cancel, _, err := startHLSCommand(context.Background(), cpuTranscodeProfile(), dir, "http://127.0.0.1/content", "session")
+	if err != nil {
+		t.Fatalf("startHLSCommand: %v", err)
+	}
+	stream := &hlsStream{cmd: cmd, cancel: cancel}
+	if err := waitForHLSReady(context.Background(), cmd, dir, 2*time.Second); err != nil {
+		stopAndWaitHLS(stream)
+		t.Fatalf("waitForHLSReady: %v", err)
+	}
+	stopAndWaitHLS(stream)
+	// A killed process reports an exit error; the important contract is that
+	// the single Wait owner returns promptly and can be called repeatedly.
+	if err := waitHLSCommand(stream); err == nil {
+		t.Log("fake ffmpeg exited cleanly")
+	}
+	if err := waitHLSCommand(stream); err != stream.waitErr {
+		t.Fatalf("second wait returned a different error: %v vs %v", err, stream.waitErr)
+	}
+}
+
 func TestWaitForHLSStopTargetsReportsTimeoutAndCompletion(t *testing.T) {
 	done := make(chan struct{})
 	s := &Server{}
@@ -305,6 +355,32 @@ func TestHLSPendingReusableRejectsStoppedAndExpiredStarts(t *testing.T) {
 	}
 }
 
+func TestHLSHardwareProfileFailureCooldown(t *testing.T) {
+	t.Setenv("CRYP_FFMPEG_BIN", "ffmpeg-test-hls-cooldown")
+	profile := transcodeProfile{
+		name:            "vaapi",
+		beforeInputArgs: []string{"-vaapi_device", "/dev/dri/renderD128"},
+		videoArgs:       []string{"-c:v", "h264_vaapi"},
+	}
+
+	defer clearHLSProfileFailure(profile)
+
+	if hlsProfileCoolingDown(profile) {
+		t.Fatal("profile was cooling down before a failure was recorded")
+	}
+	markHLSProfileFailure(profile)
+	if !hlsProfileCoolingDown(profile) {
+		t.Fatal("failed hardware profile was not cooled down")
+	}
+	if hlsProfileCoolingDown(cpuTranscodeProfile()) {
+		t.Fatal("CPU fallback unexpectedly entered hardware cooldown")
+	}
+	clearHLSProfileFailure(profile)
+	if hlsProfileCoolingDown(profile) {
+		t.Fatal("successful profile clear left a stale cooldown")
+	}
+}
+
 func TestServerShutdownStopsAllHLS(t *testing.T) {
 	pendingDone := make(chan struct{})
 	close(pendingDone)
@@ -336,6 +412,23 @@ func TestServerShutdownStopsAllHLS(t *testing.T) {
 	}
 	if !pendingCancelled || !streamCancelled {
 		t.Fatalf("shutdown cancellation flags = pending %v, stream %v; want both true", pendingCancelled, streamCancelled)
+	}
+}
+
+func TestServerShutdownHonorsLifecycleBarrierTimeout(t *testing.T) {
+	s := &Server{
+		hls:        make(map[string]*hlsStream),
+		hlsPending: make(map[hlsKey]*hlsPending),
+	}
+	s.hlsLifeMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if err := s.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want context deadline", err)
+	}
+	s.hlsLifeMu.Unlock()
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown after barrier release = %v", err)
 	}
 }
 
