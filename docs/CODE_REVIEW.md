@@ -204,10 +204,20 @@
 
 | 编号 | 级别 | 问题与影响 | 关键位置 | 计划 |
 | --- | --- | --- | --- | --- |
-| T-36 | P1 | `waitForHLSReady` 通过 `cmd.ProcessState` 判断 FFmpeg 是否退出，但该字段只有 `Wait` 执行后才会填充；FFmpeg 立即失败时会完整等待 5 秒，硬件 profile 失败再叠加 CPU fallback，放大启动延迟、pending 占用和客户端重试风暴。 | `internal/api/files.go:908-938` | 引入单一进程退出通知，ready 等待立即感知退出，并与统一 `Wait` 结果复用。 |
-| Q-10 | P2 | 加密 Range/seek 是 FFmpeg content URL 的关键依赖，但缺少 206、416、负值、多 Range、空文件和请求取消的直接回归测试；边界回归只能靠间接 HLS 测试发现。 | `internal/api/files.go:1785-2007` | 补充 focused Range 测试，锁定协议和资源释放契约。 |
-| Q-11 | P2 | `task.Manager` 的可选 guard setter/getter nil receiver 行为不一致；上传任务还绕过 `Start*` 的 task ID/计数约束，并且 DB 错误包装不统一，增加嵌入式调用 panic 和诊断分支。 | `internal/task/manager.go:131-174,486-517` | 统一 nil 安全和输入校验，补单元测试并保持现有 API 兼容。 |
-| A-05 | P2 | `internal/api/files.go` 仍是约 2.7k 行单体，混合普通文件传输、HLS、上传、删除、索引和缩略图 HTTP；继续在同一文件堆叠生命周期补丁会增加冲突和回归概率。 | `internal/api/files.go` | 先按同 package、无行为变化的边界拆出 content/download 与 HLS 文件，再评估跨 package FFmpeg 能力层。 |
+| T-36 | P1 | `waitForHLSReady` 通过 `cmd.ProcessState` 判断 FFmpeg 是否退出，但该字段只有 `Wait` 执行后才会填充；FFmpeg 立即失败时会完整等待 5 秒，硬件 profile 失败再叠加 CPU fallback，放大启动延迟、pending 占用和客户端重试风暴。 | `internal/api/files_hls.go:470-520` | 已修复：注册单一进程退出通知，ready 等待立即感知退出，并与统一 `Wait` 结果复用；增加 fake FFmpeg 立即退出回归。 |
+| Q-10 | P2 | 加密 Range/seek 是 FFmpeg content URL 的关键依赖，但缺少 206、416、负值、多 Range、空文件和请求取消的直接回归测试；边界回归只能靠间接 HLS 测试发现。 | `internal/api/files_content.go:190-300` | 已改善：新增 focused Range 测试覆盖显式、后缀、开放端、多 Range、EOF 探针和不可满足范围；请求取消仍需集成测试。 |
+| Q-11 | P2 | `task.Manager` 的可选 guard setter/getter nil receiver 行为不一致；上传任务还绕过 `Start*` 的 task ID/计数约束，并且 DB 错误包装不统一，增加嵌入式调用 panic 和诊断分支。 | `internal/task/manager.go:131-174,486-517`; `internal/api/tasks.go:342-362` | 已修复：统一 nil 安全、API/manager ID 与负数元数据校验和 `create task` 错误包装，并补单元测试。 |
+| A-05 | P2 | `internal/api/files.go` 曾是约 2.8k 行单体，混合普通文件传输、HLS、上传、删除、索引和缩略图 HTTP；继续在同一文件堆叠生命周期补丁会增加冲突和回归概率。 | `internal/api/files.go`, `internal/api/files_hls.go`, `internal/api/files_content.go` | 已部分修复：同 package 无行为拆出 HLS 与 content/download，核心文件降至约 900 行；上传/删除/索引/缩略图的进一步拆分保留为后续小步改造。 |
 | A-06 | P2 | HLS 与 thumbnail 各自维护 FFmpeg binary、硬件探测和 profile 模型；直接抽共享包可能改变解码/编码语义，当前缺少真实硬件矩阵，暂不贸然合并。 | `internal/api/files.go`, `internal/thumbnail/thumbnail.go` | 本轮只统一生命周期/测试契约；共享 `internal/ffmpeg` 延后至有硬件集成测试后。 |
 
 本节的 T-36、Q-10、Q-11 为本轮优先修复项；A-05 采用机械拆分并逐步验证，A-06 保留为明确的后续架构债务。
+
+## 11. 本轮优化落地（2026-08-23）
+
+除上述项目外，复核缩略图外部进程和临时文件路径时发现并处理了一个低风险资源错误：
+
+| 编号 | 级别 | 问题与影响 | 处理状态 |
+| --- | --- | --- | --- |
+| M-12 | P2 | FFmpeg/HEIF 探测和缩略图生成创建的临时文件直接忽略 `Close` 错误；文件系统在关闭/刷新阶段失败时，后续外部进程可能读取不完整文件，真实原因被掩盖。 | 已修复：统一 `closeTempFile`，关闭失败立即清理并终止当前尝试；正常路径继续由 defer 做最终清理。 |
+
+本轮新增结构化改动均保持同 package 私有符号和路由协议不变：`files_hls.go` 集中 HLS/FFmpeg 生命周期，`files_content.go` 集中加密内容、Range 和下载；Range、早退 FFmpeg、任务 guard 及缩略图临时文件路径均有单元覆盖。验证目标仍包括真实 FFmpeg/VAAPI、多浏览器和长视频磁盘压力，这些不能由当前 fake/单元测试替代。

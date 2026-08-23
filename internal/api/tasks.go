@@ -346,6 +346,10 @@ func (s *Server) handleCreateUploadTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "totalFiles required"})
 		return
 	}
+	if req.TotalFiles < 0 || req.TotalBytes < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "upload totals must be non-negative", "code": "task_metadata_invalid"})
+		return
+	}
 
 	taskID, err := task.GenerateID()
 	if err != nil {

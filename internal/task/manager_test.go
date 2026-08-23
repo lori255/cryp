@@ -55,6 +55,50 @@ func TestCancelKeepsExclusiveSlotUntilWorkerExits(t *testing.T) {
 	}
 }
 
+func TestOptionalGuardsAreNilReceiverSafe(t *testing.T) {
+	var m *Manager
+	m.SetThumbEnqueuer(nil)
+	m.SetReplaceGuard(nil)
+	m.SetReplaceLeaseGuard(nil)
+	m.SetImportSourceGuard(nil)
+	if m.getThumbEnqueuer() != nil || m.getReplaceGuard() != nil || m.getReplaceLeaseGuard() != nil || m.getImportSourceGuard() != nil {
+		t.Fatal("nil manager guard access returned a non-nil value")
+	}
+}
+
+func TestCreateUploadTaskValidatesMetadataBeforeAdmission(t *testing.T) {
+	m := bareManager()
+	tests := []struct {
+		name       string
+		taskID     string
+		vaultID    string
+		totalFiles int
+		totalBytes int64
+		want       string
+	}{
+		{name: "empty task id", taskID: "", vaultID: "vault", want: "task id is empty"},
+		{name: "empty vault id", taskID: "task", vaultID: "", want: "vault id is empty"},
+		{name: "negative files", taskID: "task", vaultID: "vault", totalFiles: -1, want: "total files cannot be negative"},
+		{name: "negative bytes", taskID: "task", vaultID: "vault", totalBytes: -1, want: "total bytes cannot be negative"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := m.CreateUploadTask(tt.taskID, tt.vaultID, tt.totalFiles, tt.totalBytes)
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("CreateUploadTask error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestCancelTaskToleratesNilLifecycleHandle(t *testing.T) {
+	m := bareManager()
+	m.running["task"] = nil
+	if !m.CancelTask("task") {
+		t.Fatal("CancelTask returned false for a registered nil handle")
+	}
+}
+
 func TestShutdownWaitsForWorkersAndRejectsNewTasks(t *testing.T) {
 	m := bareManager()
 	ctx, cancel := context.WithCancel(context.Background())

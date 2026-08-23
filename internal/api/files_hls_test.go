@@ -19,6 +19,9 @@ import (
 // so normal package tests retain their usual runner.
 func TestMain(m *testing.M) {
 	if os.Getenv("CRYP_FAKE_FFMPEG_HELPER") == "1" {
+		if os.Getenv("CRYP_FAKE_FFMPEG_EXIT_EARLY") == "1" {
+			os.Exit(17)
+		}
 		playlist := os.Args[len(os.Args)-1]
 		if strings.HasPrefix(playlist, "-") {
 			os.Exit(0)
@@ -319,6 +322,32 @@ func TestHLSCommandCanBeStoppedAndWaited(t *testing.T) {
 	if err := waitHLSCommand(stream); err != stream.waitErr {
 		t.Fatalf("second wait returned a different error: %v vs %v", err, stream.waitErr)
 	}
+}
+
+func TestWaitForHLSReadyDetectsImmediateExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group cleanup test requires Unix signals")
+	}
+	t.Setenv("CRYP_FFMPEG_BIN", os.Args[0])
+	t.Setenv("CRYP_FAKE_FFMPEG_HELPER", "1")
+	t.Setenv("CRYP_FAKE_FFMPEG_EXIT_EARLY", "1")
+	dir := t.TempDir()
+	cmd, cancel, _, err := startHLSCommand(context.Background(), cpuTranscodeProfile(), dir, "http://127.0.0.1/content", "session")
+	if err != nil {
+		t.Fatalf("startHLSCommand: %v", err)
+	}
+	stream := &hlsStream{cmd: cmd, cancel: cancel}
+	started := time.Now()
+	err = waitForHLSReady(context.Background(), cmd, dir, 2*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "ffmpeg exited") {
+		stopAndWaitHLS(stream)
+		t.Fatalf("waitForHLSReady error = %v, want early ffmpeg exit", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		stopAndWaitHLS(stream)
+		t.Fatalf("early exit detection took %s, want less than one second", elapsed)
+	}
+	stopAndWaitHLS(stream)
 }
 
 func TestWaitForHLSStopTargetsReportsTimeoutAndCompletion(t *testing.T) {

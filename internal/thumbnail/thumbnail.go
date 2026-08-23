@@ -293,8 +293,10 @@ func canUseFFmpegAttemptWithRunner(bin string, attempt ffmpegAttempt, timeout ti
 		return false
 	}
 	probePath := probeFile.Name()
-	probeFile.Close()
-	defer os.Remove(probePath)
+	if err := closeTempFile(probeFile, probePath); err != nil {
+		return false
+	}
+	defer func() { _ = os.Remove(probePath) }()
 
 	// Keep the encoder and decoder probes on independent deadlines.  The
 	// encoder probe can legitimately consume most of probeTimeout on a cold
@@ -907,8 +909,10 @@ func (g *Generator) generate(job thumbJob) error {
 		return fmt.Errorf("create thumbnail temp: %w", err)
 	}
 	thumbTmp := tmpFile.Name()
-	tmpFile.Close()
-	defer os.Remove(thumbTmp)
+	if err := closeTempFile(tmpFile, thumbTmp); err != nil {
+		return fmt.Errorf("close thumbnail temp: %w", err)
+	}
+	defer func() { _ = os.Remove(thumbTmp) }()
 
 	var lastErr error
 	for _, attempt := range g.ffmpeg.attempts {
@@ -1019,8 +1023,10 @@ func (g *Generator) generateHEIFWithContext(job thumbJob, baseCtx context.Contex
 		return fmt.Errorf("create thumbnail temp: %w", err)
 	}
 	thumbTmp := tmpFile.Name()
-	tmpFile.Close()
-	defer os.Remove(thumbTmp)
+	if err := closeTempFile(tmpFile, thumbTmp); err != nil {
+		return fmt.Errorf("close thumbnail temp: %w", err)
+	}
+	defer func() { _ = os.Remove(thumbTmp) }()
 
 	if err := g.writeDecryptedFileWithContext(job, heifPath, baseCtx); err != nil {
 		return fmt.Errorf("decrypt heif: %w", err)
@@ -1253,6 +1259,21 @@ func zeroVaultKeys(keys *crypto.VaultKeys) {
 	if keys != nil {
 		keys.Zero()
 	}
+}
+
+// closeTempFile makes temporary-file ownership explicit. A close failure can
+// leave buffered data unwritten (or a descriptor unusable for the next
+// process), so callers fail before handing the path to FFmpeg and remove the
+// partial file best-effort.
+func closeTempFile(file *os.File, path string) error {
+	if file == nil {
+		return nil
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 // encryptFile reads a plaintext file, encrypts it using the same format as vault

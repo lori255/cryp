@@ -129,6 +129,9 @@ func (m *Manager) getThumbEnqueuer() ThumbEnqueuer {
 // SetReplaceGuard installs an optional lifecycle guard for imported file
 // replacements. It is a callback to keep task and API packages decoupled.
 func (m *Manager) SetReplaceGuard(guard ReplaceGuard) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	m.replaceGuard = guard
 	m.mu.Unlock()
@@ -138,6 +141,9 @@ func (m *Manager) SetReplaceGuard(guard ReplaceGuard) {
 // across the actual encryption write. It is optional for compatibility with
 // callers that only need the pre-replacement callback.
 func (m *Manager) SetReplaceLeaseGuard(guard ReplaceLeaseGuard) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	m.replaceLeaseGuard = guard
 	m.mu.Unlock()
@@ -147,12 +153,18 @@ func (m *Manager) SetReplaceLeaseGuard(guard ReplaceLeaseGuard) {
 // directory browser. The manager repeats validation defensively because task
 // creation may later gain non-HTTP callers.
 func (m *Manager) SetImportSourceGuard(guard *pathguard.Guard) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	m.importGuard = guard
 	m.mu.Unlock()
 }
 
 func (m *Manager) getImportSourceGuard() *pathguard.Guard {
+	if m == nil {
+		return nil
+	}
 	m.mu.RLock()
 	guard := m.importGuard
 	m.mu.RUnlock()
@@ -160,6 +172,9 @@ func (m *Manager) getImportSourceGuard() *pathguard.Guard {
 }
 
 func (m *Manager) getReplaceGuard() ReplaceGuard {
+	if m == nil {
+		return nil
+	}
 	m.mu.RLock()
 	guard := m.replaceGuard
 	m.mu.RUnlock()
@@ -167,6 +182,9 @@ func (m *Manager) getReplaceGuard() ReplaceGuard {
 }
 
 func (m *Manager) getReplaceLeaseGuard() ReplaceLeaseGuard {
+	if m == nil {
+		return nil
+	}
 	m.mu.RLock()
 	guard := m.replaceLeaseGuard
 	m.mu.RUnlock()
@@ -487,6 +505,18 @@ func (m *Manager) CreateUploadTask(taskID, vaultID string, totalFiles int, total
 	if m == nil {
 		return ErrTaskManagerClosed
 	}
+	if taskID == "" {
+		return errors.New("task id is empty")
+	}
+	if vaultID == "" {
+		return errors.New("vault id is empty")
+	}
+	if totalFiles < 0 {
+		return errors.New("total files cannot be negative")
+	}
+	if totalBytes < 0 {
+		return errors.New("total bytes cannot be negative")
+	}
 	m.mu.RLock()
 	if m.closed {
 		m.mu.RUnlock()
@@ -514,7 +544,10 @@ func (m *Manager) CreateUploadTask(taskID, vaultID string, totalFiles int, total
 	// the durable record creation.
 	err := m.db.CreateTask(t)
 	m.mu.RUnlock()
-	return err
+	if err != nil {
+		return fmt.Errorf("create task: %w", err)
+	}
+	return nil
 }
 
 // UpdateUploadProgress updates the progress of an upload task
@@ -576,7 +609,7 @@ func (m *Manager) CancelTask(taskID string) bool {
 	run, ok := m.running[taskID]
 	m.mu.Unlock()
 
-	if ok {
+	if ok && run != nil && run.cancel != nil {
 		// Keep the lifecycle handle registered until the goroutine has actually
 		// exited. This preserves exclusivity and lets shutdown wait for all
 		// filesystem/DB work to finish.
