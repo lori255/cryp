@@ -13,9 +13,9 @@
 - `go vet ./...`：通过。
 - `go test -race ./...`：通过。
 - `npm run build`：通过。
-- `npm run lint`：失败；`web/src/components/VideoPlayer.tsx:23` 存在 effect 内同步 `setState`，并伴有 hook 警告。
+- `npm run lint`：通过。
 - 当前审核环境没有 `ffmpeg`/`ffprobe` 可执行文件，只有 `/dev/dri/card0`，没有 `/dev/dri/renderD128`；因此未能进行真实 HLS 编码、VAAPI 和多浏览器集成验证。
-- 除加密包外，后端 HLS/API、FFmpeg 回收和前端播放器缺少自动化测试，以下结论主要由代码路径、时序和配置推导，并应在修复后用真实媒体回归。
+- 已补充 HLS pending/停止/替换屏障、会话快照、缩略图 generation/停止竞态以及加密文件原子替换单元测试；仍缺少真实 FFmpeg、多浏览器和 VAAPI 集成测试。
 
 ## 2. 最可能的故障因果链
 
@@ -127,13 +127,16 @@
 | T-24 | P2 | FFmpeg 编码器探测使用 `sync.Once`，一次超时或暂时不可执行会永久缓存空结果；运行环境随后恢复也不会重新启用 VAAPI，导致持续 CPU 转码和错误的 GPU 使用判断。 | 已修复：成功结果短 TTL 缓存，失败结果不缓存并串行重试。 |
 | T-25 | P2 | HLS owner 以 `sessionID` 集合去重，同一会话打开两个同路径播放器时，一个播放器关闭会删除唯一 owner 并停止另一播放器仍在使用的 stream。 | 已缓解：维护同会话引用计数；协议级 opaque lease/token 仍可作为后续增强。 |
 | M-06 | P1 | 缩略图旧 generation 任务在空文件路径返回 `skipped` 时，无条件写入失败冷却；若新文件/新任务已排队，会被旧任务错误地抑制 5 分钟。 | 已修复：仅当前 generation 才能写入 `failed` 状态，并增加替换竞态测试。 |
-| M-07 | P2 | HEIF 缩略图在 `heif-convert` 前完整解密到临时明文文件，没有独立读取超时或大小上限；异常/超大输入可能长期占用磁盘并拖慢单 worker。 | 待修复：为解密阶段增加可取消的 I/O/大小预算，并在超限时清理。 |
-| M-08 | P2 | 缩略图硬件探测只在 Generator 启动时执行；驱动/设备在运行中恢复或变化不会重新探测，任务只能逐个失败后回退 CPU。 | 待修复：对探测失败或设备变化采用可重试的 TTL/健康状态。 |
+| M-07 | P2 | HEIF 缩略图在 `heif-convert` 前完整解密到临时明文文件，没有独立读取超时或大小上限；异常/超大输入可能长期占用磁盘并拖慢单 worker。 | 已缓解：解密和转换输入/输出增加 512 MiB 大小预算并沿用可取消 context；底层阻塞 I/O 仍受文件系统时延影响。 |
+| M-08 | P2 | 缩略图硬件探测只在 Generator 启动时执行；驱动/设备在运行中恢复或变化不会重新探测，任务只能逐个失败后回退 CPU。 | 部分缓解：单任务增加总时限并在失败后回退 CPU；运行中设备恢复的动态重探测仍待后续。 |
 | T-26 | P1 | 删除目录/批量删除目录时只停止目录自身的 HLS；递归删除子视频前没有停止子路径 stream，FFmpeg 可能继续读取被删除/替换的密文并产生失败分片。 | 已修复：按路径前缀收集并等待所有后代 stream。 |
 | T-27 | P1 | 上传、导入或删除在停止旧 stream 后释放锁再写文件；窗口内新的播放请求可以重新启动同路径 FFmpeg，随后与覆盖/删除并发读取同一密文。 | 已修复：HLS 生命周期读写屏障覆盖上传、删除和导入写入窗口。 |
 | T-28 | P1 | logout 停止 owner 与删除 session 之间没有生命周期屏障；同一会话可在窗口内重新启动 HLS，随后内部认证 session 被删除，表现为转码/分片失败。 | 已修复：logout 与 HLS start/stop 串行化后再删除会话。 |
 | T-29 | P1 | 上传和导入使用 `os.Create` 直接截断目标密文；即使 HLS 已停止，仍在进行的普通 `/files/content` 读取会看到截断/混合内容，触发 seek 或转码失败。 | 已修复：同目录临时文件 fsync 后原子替换目标，失败不破坏旧文件。 |
-| S-06 | P1 | 缩略图响应使用 `public, max-age=86400`，普通 content 也未声明私有缓存；共享代理可能把一个会话的明文缩略图/媒体响应提供给另一个会话。 | 已修复：受保护媒体使用 `private, no-store` 并按 Cookie、`X-Session-ID` 分隔。 |
-| S-07 | P1 | HLS start 的 302 重定向未声明不可缓存；共享代理可能缓存同一路径的 stream ID，使后续会话复用旧转码或收到 404/权限错误。 | 待修复：start/stop 响应使用 `no-store` 并按会话 header 分隔。 |
+| S-06 | P1 | 缩略图响应使用 `public, max-age=86400`，普通 content 也未声明私有缓存；共享代理可能把一个会话的明文缩略图/媒体响应提供给另一个会话。 | 已修复：受保护媒体使用 `private, no-store` 并按 Origin、Cookie、`X-Session-ID` 分隔。 |
+| S-07 | P1 | HLS start 的 302 重定向未声明不可缓存；共享代理可能缓存同一路径的 stream ID，使后续会话复用旧转码或收到 404/权限错误。 | 已修复：start、stop 和 asset 响应使用 `no-store`/私有缓存并按 Origin、Cookie、`X-Session-ID` 分隔。 |
+| T-30 | P1 | 首个 HLS 请求的启动 context 脱离 HTTP 请求；浏览器在 FFmpeg ready 前断开且 stop 请求未到达时，pending 和 FFmpeg 仍可运行最长 30 秒，占用名额/GPU 并放大后续“转码失败”。 | 待修复：需在不误伤共享 pending 等待者的前提下，断开最后一个 owner 时取消启动。 |
+| T-31 | P2 | playlist/segment 文件通过存在性等待后再调用 `c.File`，期间 cleanup 可能删除 stream 目录，形成 TOCTOU，导致偶发 404 或不完整分片响应。 | 待修复：需在停止/清理与文件打开之间建立原子性或失败重试保护。 |
+| T-32 | P2 | 启动取消路径的 `stopAndWaitHLS` 与 cleanup goroutine 可能同时调用同一 `exec.Cmd.Wait`；重复 Wait 会丢失真实退出错误并导致不稳定的测试/回收行为。 | 已修复：`hlsStream` 使用 `sync.Once` 统一等待并复用退出错误。 |
 
 以上追加项与第 3 节原始编号互补；真实 FFmpeg、VAAPI 驱动和浏览器集成回归仍受当前环境缺少 `ffmpeg`/`ffprobe` 及 render node 的限制。
