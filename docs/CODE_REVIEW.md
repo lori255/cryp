@@ -292,3 +292,11 @@
 | R-11 | P2 | 普通图片加载失败时也会设置 HEIF `conversionKey`；普通图片 effect 随后把状态重新写成 `ready`，错误占位无法稳定显示。Apple 平台 HEIF 加载失败则被静默忽略并长期保持 `ready`，用户无法判断资源不可用。 | `web/src/lib/useImagePreviewSrc.ts:251-263,360-364` | 按格式区分回退：仅非 Apple HEIF 允许进入转换；其它失败清空源并标记 `unavailable`，避免错误状态抖动或假成功。 |
 
 R-11 已修复：`onPreviewError` 现在只允许非 Apple HEIF 进入原图转换；普通图片、Apple HEIF 以及已经转换失败的资源统一清空源并进入 `unavailable`。
+
+## 17. React StrictMode 资源节点复核（2026-08-23）
+
+| 编号 | 级别 | 问题与影响 | 关键位置 | 计划 |
+| --- | --- | --- | --- | --- |
+| R-12 | P2 | React 19 开发模式会重放 effect；托管图片若 cleanup 清空 `src` 却不在下一次 setup 恢复，开发环境会出现挂载节点空白并掩盖真实生命周期问题。 | `web/src/components/ManagedImage.tsx:13-25` | 让源设置/清理幂等，在 effect 重放时恢复当前 `src`，并保留新源保护。 |
+
+R-12 已修复：`ManagedImage` 在每次 effect setup 校正当前源，StrictMode 的 cleanup/setup 重放不会留下空白图片。
