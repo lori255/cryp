@@ -191,5 +191,6 @@
 | M-11 | P2 | 缩略图硬件探测把“生成测试文件”和“解码测试文件”共用一个 10 秒 context；冷启动驱动耗尽前半段预算后，第二次探测会被误判为不可用，导致无谓 CPU 回退。 | 已修复：两个探测命令使用独立超时预算，并补充探测生命周期回归覆盖。 |
 | T-34 | P2 | 已知不可用的 VAAPI profile 每次播放都会重新启动并等待 readiness 后才回退 CPU，连续播放时会制造短时 GPU 峰值和启动延迟。 | 已缓解：硬件 profile 启动失败进入按 binary/profile/设备参数隔离的 30 秒冷却；CPU fallback 不受冷却影响，成功后立即清除记录。真实驱动恢复仍需硬件集成测试。 |
 | T-35 | P2 | 前端 stop 请求忽略 202/网络失败，页面切换后无法再次确认进程组是否已完成退出；虽然后端会继续清理，但 UI 与回收状态脱节。 | 已缓解：`stopHls` 对 202 或一次网络失败按 `Retry-After` 最多重试一次，仍保持卸载场景的 best-effort 语义。 |
+| Q-08 | P2 | `task.Manager` 的缩略图 enqueuer setter 与导入 worker 直接读字段，运行时重配置会发生 data race；初始化阶段通常不触发，但接口没有明确不可变约束。 | 已修复：setter 加锁，worker 通过同步快照读取 callback；不改变初始化和循环依赖解法。 |
 
 本轮新增验证目标：除 Go 全量与 race/vet、前端 lint/build 外，还应在具备真实 FFmpeg、VAAPI render node 和带音视频样本的环境回归连续播放/停止/切换、GPU 进程退出、磁盘清理及 vault 删除失败重试。单元 fake-FFmpeg 测试只覆盖基础 ready/stop/Wait 契约，不能代替上述硬件和浏览器验证。

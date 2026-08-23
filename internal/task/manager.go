@@ -108,7 +108,22 @@ func NewManager(db *storage.DB) *Manager {
 
 // SetThumbEnqueuer sets the thumbnail enqueuer (avoids circular init)
 func (m *Manager) SetThumbEnqueuer(t ThumbEnqueuer) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
 	m.thumbs = t
+	m.mu.Unlock()
+}
+
+func (m *Manager) getThumbEnqueuer() ThumbEnqueuer {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	thumbs := m.thumbs
+	m.mu.RUnlock()
+	return thumbs
 }
 
 // SetReplaceGuard installs an optional lifecycle guard for imported file
@@ -934,12 +949,15 @@ func (m *Manager) encryptDirRecursive(ctx context.Context, vault *crypto.Vault, 
 				}
 			}
 
-			// Enqueue thumbnail generation for supported expensive previews.
-			if m.thumbs != nil && result.PlaintextSize > 0 && (thumbnail.IsVideo(entry.Name()) || thumbnail.IsHEIF(entry.Name())) {
-				if invalidator, ok := m.thumbs.(thumbInvalidator); ok {
+			// Enqueue thumbnail generation for supported expensive previews. Take
+			// one synchronized snapshot so runtime reconfiguration cannot race the
+			// worker while it invokes the callback.
+			thumbs := m.getThumbEnqueuer()
+			if thumbs != nil && result.PlaintextSize > 0 && (thumbnail.IsVideo(entry.Name()) || thumbnail.IsHEIF(entry.Name())) {
+				if invalidator, ok := thumbs.(thumbInvalidator); ok {
 					invalidator.DeleteThumbnail(vault.ID, virtualPath)
 				}
-				m.thumbs.Enqueue(vault.ID, vault.Path, keys, virtualPath)
+				thumbs.Enqueue(vault.ID, vault.Path, keys, virtualPath)
 			}
 			t.ProcessedFiles++
 			if info != nil && info.Size() > 0 {
