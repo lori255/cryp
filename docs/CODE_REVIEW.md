@@ -236,5 +236,6 @@
 | P-06 | P1 | hls.js fallback 没有 `xhrSetup`/`fetchSetup` credentials；UI/API 跨源时 manifest/segment 不带 cookie，后端鉴权返回 401，前端最终显示泛化的转码错误。 | `web/src/components/VideoPlayer.tsx:149-163`, `internal/api/router.go:141-156` | 已修复：为媒体 XHR 显式携带凭据，并细分网络/鉴权错误。 |
 | P-07 | P2 | `pagehide` 无条件 stop HLS；iOS 后台、锁屏或多任务切换也可能触发，回到前台时旧 stream 已被删除，出现黑屏/404，且没有自动恢复策略。 | `web/src/components/VideoPlayer.tsx:386-392`, `internal/api/files_hls.go:89-94,1311-1320` | 已改善：区分短暂隐藏与真正卸载，`pageshow`/可见时按需重建 source；后端超时仍保留平台限制说明。 |
 | P-08 | P2 | modal、错误状态、关闭/全屏/重试按钮缺少 dialog/alert 语义、焦点管理和 aria-label；键盘/VoiceOver 用户无法可靠操作或得知失败原因。 | `web/src/components/VideoPlayer.tsx:426-468` | 已改善：补语义、焦点回收、focus-visible 和 live region。 |
+| P-09 | P1 | 右下角自定义控件的 `mounted` 能力判断只检查 `webkitEnterFullscreen` 和标准 `requestFullscreen`，漏掉 `webkitSetPresentationMode`；在仅支持 presentation mode 的 iOS/PWA 环境会错误隐藏唯一可用的全屏按钮。 | `web/src/components/VideoPlayer.tsx:126-143` | 已修复：能力判断与实际请求逻辑共享同一 capability helper；不支持时保留可见按钮并给出明确提示。 |
 
 验收重点：iPhone Safari、iPhone standalone、iPad Safari、iPadOS 桌面 UA 和 standalone，分别验证首次点击播放、HLS 转码播放、右下角全屏进入/退出、方向变化、错误提示、切后台再回来以及刘海/Home Indicator 区域。当前环境没有 iOS 真机或浏览器集成运行器，代码测试不能替代上述真机验收。
