@@ -1,0 +1,103 @@
+# Cryp 深度代码审核记录
+
+审核日期：2026-08-23
+审核基线：`master` / `7f981c8 Improve HLS seek responsiveness`
+
+## 1. 审核范围
+
+本次审核覆盖后端 HTTP 路由与 HLS/FFmpeg 生命周期（`internal/api`）、缩略图队列与硬件加速（`internal/thumbnail`）、会话存储（`internal/session`），以及播放器、API 客户端和文件浏览器（`web/src`）。重点围绕“前几个视频可以播放，随后任意视频均提示转码失败”和“停止播放后 GPU 仍显示 100%”两个现象，沿启动、鉴权、分段读取、停止和回收的完整链路追踪。
+
+### 验证结果与限制
+
+- `go test ./...`：通过。
+- `go vet ./...`：通过。
+- `go test -race ./...`：通过。
+- `npm run build`：通过。
+- `npm run lint`：失败；`web/src/components/VideoPlayer.tsx:23` 存在 effect 内同步 `setState`，并伴有 hook 警告。
+- 当前审核环境没有 `ffmpeg`/`ffprobe` 可执行文件，只有 `/dev/dri/card0`，没有 `/dev/dri/renderD128`；因此未能进行真实 HLS 编码、VAAPI 和多浏览器集成验证。
+- 除加密包外，后端 HLS/API、FFmpeg 回收和前端播放器缺少自动化测试，以下结论主要由代码路径、时序和配置推导，并应在修复后用真实媒体回归。
+
+## 2. 最可能的故障因果链
+
+当前实现允许同一文件在一次慢启动期间启动多个 FFmpeg：
+
+1. `GET /files/hls` 先执行最长 10 秒的 `ffprobe`，随后每个转码 profile 最多等待 5 秒才认为 playlist ready（`internal/api/files.go:397-436`）。
+2. 启动调用使用 `context.Background()`，浏览器断开或 hls.js 超时不会取消后端启动（`internal/api/files.go:397`）。
+3. hls.js manifest 请求配置了重试；而服务端只有在 ready 后才写入 `s.hls`（`internal/api/files.go:406-408`），pending 启动无法去重。
+4. 每个 pending 请求都会增加 `hlsStarts`，并与已登记的 `s.hls` 一起受 `hlsMaxStreams=3` 限制（`internal/api/files.go:348-368`）。达到上限后返回 `429`，前端把包括 429 在内的 fatal 错误统一显示为“视频转码播放失败”。
+5. 自然结束的流还会在内存 map 中保留 15 分钟（`internal/api/files.go:640-654`），继续占用 3 个名额；停止请求又无法命中尚未登记的 pending stream（`internal/api/files.go:584-605`）。
+
+因此，“前几个视频正常，之后任意视频失败”与名额耗尽高度吻合；停止后 GPU/FFmpeg 仍显示忙则与 pending 启动未取消、停止后未等待进程退出，以及自然结束/分段仍在写盘的生命周期问题吻合。GPU 工具显示 100% 还可能是驱动/监控的滞后值，当前代码没有实际进程和设备指标可供确认。
+
+## 3. 问题清单
+
+严重级别：**P0** 表示会阻断播放或持续泄漏资源；**P1** 表示高概率造成故障、数据/安全风险或明显错误；**P2** 表示功能退化、维护风险或缺少保护；**P3** 表示低风险改进项。
+
+### T：转码、HLS 与资源生命周期
+
+| 编号 | 级别 | 问题与影响 | 关键位置 |
+| --- | --- | --- | --- |
+| T-01 | P0 | HLS 名额按 `len(s.hls)+s.hlsStarts` 计数，上限仅 3；达到上限返回 429。前端未区分 429，表现为后续所有视频“转码失败”。 | `internal/api/files.go:348-368` |
+| T-02 | P0 | 启动阶段使用 `context.Background()`，请求取消无效；ready 前不写入 `s.hls`，hls.js 超时重试可为同一路径并发启动多个 FFmpeg。 | `internal/api/files.go:397`, `:406-436`; `web/src/components/VideoPlayer.tsx:142-155` |
+| T-03 | P0 | stop 只遍历已登记的 `s.hls`；pending stream 尚未入 map，停止播放后无法取消，后台仍可能继续探测/转码并占用名额。 | `internal/api/files.go:397-410`, `:584-605` |
+| T-04 | P1 | profile 失败会逐个启动并 kill，单次请求可能经历 10 秒 probe 加 3×5 秒 ready 等待；慢请求与客户端重试叠加，造成启动风暴和错误放大。 | `internal/api/files.go:415-455` |
+| T-05 | P0 | FFmpeg 自然结束后固定等待 15 分钟才从 `s.hls` 删除；已结束流仍计入名额，短视频连续播放很快耗尽上限。 | `internal/api/files.go:640-654` |
+| T-06 | P1 | 后端只返回通用 500/429 文案，FFmpeg stderr 只写日志，前端将认证、文件不存在、编码器失败、网络超时全部归为“转码失败”，无法诊断或重试。 | `internal/api/files.go:398-403`, `:644-647`; `web/src/components/VideoPlayer.tsx:160-165`, `:237-246` |
+| T-07 | P1 | GPU profile 只检查 `h264_vaapi` 和固定 `/dev/dri/renderD128`，没有在 HLS 启动前做实际解码/编码探测；容器未默认映射设备/驱动时会反复失败后才回退 CPU，监控中的 GPU 状态也没有与活动进程关联。 | `internal/api/files.go:781-839`; `Dockerfile:22-24`; `docker-compose.yml:9-14` |
+| T-08 | P1 | 缩略图 FFmpeg 与 HLS 共用主机 GPU/FFmpeg 资源，没有并发配额、优先级或统一回收；缩略图任务可与播放抢占设备，放大转码失败和 GPU 峰值。 | `internal/thumbnail/thumbnail.go:69-88`, `:440-500`; `internal/api/files.go:458-502` |
+| T-09 | P1 | 停止通过取消 context/kill 直接子进程，但没有显式进程组回收、`Wait` 确认和 shutdown 统一清理；FFmpeg 子进程或驱动任务可能短时残留，造成“停止后 GPU 100%”。 | `internal/api/files.go:487-502`, `:608-655` |
+| T-10 | P0 | HLS 内部 content URL 读取 `PORT`，未设置时硬编码 9527；服务实际可由 `-port` 监听 8080，端口不一致会让 ffprobe/ffmpeg 连接失败。 | `internal/api/files.go:377-382`; `cmd/server/main.go:18-32` |
+| T-11 | P1 | `-hls_list_size 0` 且没有 `-re`，转码会尽快生成并永久保留全部 `.ts`，长视频/异常流可持续占用临时磁盘；停止清理受进程退出时序影响。 | `internal/api/files.go:475-485`, `:649-655` |
+| T-12 | P1 | GPU profile fallback 与其它 profile 复用同一输出目录；失败尝试留下的 playlist/segment 可能被下一次 `waitForHLSReady` 误判为 ready。 | `internal/api/files.go:390-426`, `:532-560` |
+| T-13 | P1 | ffprobe 成功时向客户端返回静态 VOD playlist，而 FFmpeg 同时生成自己的 playlist；duration 四舍五入、编码失败或关键帧不齐时，静态清单可能引用不存在/时长不符的 segment。 | `internal/api/files.go:415-421`, `:677-686`, `:732-758` |
+| T-14 | P2 | 分段请求等待文件最多 30 秒，停止/删除期间仍可能阻塞请求；缺少对 stream 状态、文件大小稳定性和客户端取消后的统一处理。 | `internal/api/files.go:688-696`, `:761-778` |
+
+### S：安全、会话与缓存
+
+| 编号 | 级别 | 问题与影响 | 关键位置 |
+| --- | --- | --- | --- |
+| S-01 | P1 | HLS segment 返回 `public, max-age=300`。若反向代理/浏览器缓存未按 vault/session 隔离，明文分段可能跨用户复用或在停止后继续可读。 | `internal/api/files.go:688-695` |
+| S-02 | P1 | HLS asset 仅按随机 stream ID 查 map，没有再次校验当前会话的 vault/stream 所属关系；已获得有效登录会话且知道 ID 的用户可能读取另一会话的流。 | `internal/api/files.go:658-675`; 路由 `internal/api/router.go:108-118` |
+| S-03 | P1 | `sendBeacon` 成功排队后不检查认证结果，也不能附加 `X-Session-ID`；只有 localStorage session 或跨源 cookie 不可用时，stop 会静默失败，流要等 idle timeout。 | `web/src/lib/api.ts:152-170`; `internal/api/files.go:564-581` |
+
+### R：前端播放器与文件列表
+
+| 编号 | 级别 | 问题与影响 | 关键位置 |
+| --- | --- | --- | --- |
+| R-01 | P1 | 正常入口始终使用 HLS URL，播放器的 content→HLS fallback 只在 URL 已含 `/files/content` 时触发，实际不可达。 | `web/src/lib/api.ts:144-150`; `web/src/components/FileGridItem.tsx:22-25,110-115`; `web/src/components/VideoPlayer.tsx:237-246` |
+| R-02 | P1 | Hls.js fatal、媒体错误和鉴权错误均显示同一句“视频转码播放失败”，没有重试/切换 profile/刷新 session 的入口。 | `web/src/components/VideoPlayer.tsx:160-165`, `:237-246`, `:351-355` |
+| R-03 | P2 | 文件列表请求没有 AbortController、请求序号或路径校验；切换目录/排序或触发分页时，旧响应可能晚到并覆盖新列表，造成重复播放入口和错误路径。 | `web/src/pages/FileBrowser.tsx:63-103`, `:108-122` |
+| R-04 | P2 | 视频元素/Hls.js 只带 URL，未显式传 `X-Session-ID`，播放依赖同源 cookie；跨源部署或 cookie 过期时会收到 401，但 UI 仍归类为转码失败。 | `web/src/lib/api.ts:65-80`, `:144-184`; `web/src/components/VideoPlayer.tsx:142-165` |
+
+### M：缩略图后台任务
+
+| 编号 | 级别 | 问题与影响 | 关键位置 |
+| --- | --- | --- | --- |
+| M-01 | P2 | 队列满时静默丢弃任务，无重试、持久化队列或指标；失败冷却期也不向用户暴露，文件可能永久没有缩略图。 | `internal/thumbnail/thumbnail.go:22-30`, `:290-332` |
+
+### Q：测试与可观测性
+
+| 编号 | 级别 | 问题与影响 | 关键位置 |
+| --- | --- | --- | --- |
+| Q-01 | P1 | 缺少 HLS/API 集成测试、FFmpeg fake、停止竞态测试、并发名额测试、磁盘清理测试和前端播放器错误测试；无活动流/FFmpeg/队列/GPU 实际使用指标，生产故障只能依赖零散日志。 | `internal/api/files.go`; `internal/thumbnail/thumbnail.go`; `web/src/components/VideoPlayer.tsx` |
+
+## 4. 常见 HTTP 结果与可能根因
+
+| HTTP 结果 | 用户表现 | 首要排查项 |
+| --- | --- | --- |
+| 302 → 200 | 播放正常 | 确认 manifest 和第一个 segment 来自同一 stream 目录 |
+| 429 | 统一显示“转码失败” | `hlsStarts`、`len(s.hls)`、pending/自然结束流是否未回收；是否有 hls.js 重试风暴 |
+| 500（start） | 首个视频就失败或特定编码失败 | FFmpeg stderr、ffprobe、输入 Range、GPU profile/驱动、内部端口 |
+| 401/403 | 播放器仍提示转码失败 | cookie 与 `X-Session-ID`、session 是否过期、跨源凭据策略 |
+| 404（manifest/segment） | manifest 能开但黑屏/中途失败 | stream 是否已 stop/被清理、playlist 是否引用旧目录文件、缓存是否命中旧 URL |
+| 206/416（content） | 拖动或 ffprobe 失败 | Range 解析、加密块边界、请求取消和上游 FFmpeg seek 行为 |
+
+## 5. 修复优先级
+
+1. **P0：HLS 生命周期和去重**：为 pending/active/stopping 建立按 vault+path 的状态；让启动使用可取消 context；stop 能标记并取消 pending；名额只统计真正活动流；等待 `Wait` 完成后立即释放。
+2. **P0：启动可靠性**：统一实际监听端口生成 content URL；每次 profile 使用独立目录并清理旧文件；ready 校验当前进程生成的 playlist/segment；避免静态 playlist 与 FFmpeg playlist 不一致。
+3. **P1：资源和错误处理**：进程组/退出确认、临时目录磁盘上限、shutdown 清理；GPU profile 真实 probe 与 HLS/缩略图资源配额；返回可区分的错误码和诊断 ID。
+4. **P1：前端恢复**：停止 fatal stream、提供重试和认证提示、修复 content/HLS fallback 与 URL 生命周期；为列表请求加入取消/序列保护。
+5. **P2：质量保障**：补充 fake-FFmpeg HLS 集成测试、并发/竞态/清理测试、Range 测试、播放器和文件列表测试，以及活动流/FFmpeg/队列/GPU 指标。
+
+本清单是修复前的基线；每个修复应在真实带音视频的短视频、长视频、无音轨视频、VAAPI 不可用和连续切换播放场景下回归。
