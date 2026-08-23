@@ -1,14 +1,22 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import Artplayer from 'artplayer'
 import Hls from 'hls.js'
 import { AlertCircle, Maximize, RefreshCw, X } from 'lucide-react'
 import { api } from '../lib/api'
+import {
+  getNativeVideo,
+  isIOSDevice,
+  lockLandscapeOrientation,
+  requestVideoFullscreen,
+} from '../lib/videoFullscreen'
 
 interface VideoPlayerProps {
   url: string
   title: string
   onClose: () => void
 }
+
+const HLS_RESUME_THRESHOLD_MS = 90_000
 
 export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
   const [sourceState, setSourceState] = useState({ baseUrl: url, url })
@@ -21,59 +29,51 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const artRef = useRef<Artplayer | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const fullscreenVideoRef = useRef<HTMLVideoElement | null>(null)
   const unlockOrientationRef = useRef<(() => void) | null>(null)
   const stopHlsRef = useRef<() => void>(() => {})
+  const modalRef = useRef<HTMLDivElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const hiddenAtRef = useRef<number | null>(null)
+  const wasPlayingBeforeHideRef = useRef(false)
+  const resumePositionRef = useRef<number | null>(null)
+  const titleId = useId()
+  const errorId = useId()
+  const isIOS = isIOSDevice()
 
-  const lockLandscapeOrientation = useCallback(async () => {
-    const orientationApi = screen.orientation as ScreenOrientation & {
-      lock?: (orientation: 'landscape' | 'portrait' | 'any' | 'natural') => Promise<void>
-      unlock?: () => void
-    }
-    if (!orientationApi?.lock) return null
+  const showPlayerError = useCallback((message: string) => {
+    setErrorState({ baseUrl: url, message })
+  }, [url])
 
-    try {
-      await orientationApi.lock('landscape')
-      return () => orientationApi.unlock?.()
-    } catch {
-      return null
-    }
-  }, [])
-
-  const requestNativeFullscreen = useCallback(async (video: HTMLVideoElement | null) => {
-    if (!video) return
-
-    const nativeVideo = video as HTMLVideoElement & {
-      webkitSupportsFullscreen?: boolean
-      webkitEnterFullscreen?: () => void
-      webkitSetPresentationMode?: (mode: 'inline' | 'fullscreen' | 'picture-in-picture') => void
+  const requestNativeFullscreen = useCallback((video: HTMLVideoElement | null) => {
+    if (!video) {
+      showPlayerError('视频尚未准备好，暂时无法进入全屏')
+      return
     }
 
     unlockOrientationRef.current?.()
-    const unlockOrientation = await lockLandscapeOrientation()
-    if (videoRef.current !== video) {
-      unlockOrientation?.()
+    unlockOrientationRef.current = null
+    fullscreenVideoRef.current = video
+
+    // Do not await anything before this call. WebKit requires the native
+    // fullscreen method to run inside the original button's user gesture.
+    const request = requestVideoFullscreen(video)
+    if (!request.method) {
+      fullscreenVideoRef.current = null
+      showPlayerError('当前浏览器不支持视频全屏，请使用 Safari 或更新系统')
       return
     }
-    unlockOrientationRef.current = unlockOrientation
 
-    if (nativeVideo.webkitSupportsFullscreen && nativeVideo.webkitEnterFullscreen) {
-      nativeVideo.webkitEnterFullscreen()
-      return
+    if (request.promise) {
+      void request.promise.catch(() => {
+        if (fullscreenVideoRef.current !== video) return
+        fullscreenVideoRef.current = null
+        unlockOrientationRef.current?.()
+        unlockOrientationRef.current = null
+        showPlayerError('浏览器拒绝了全屏请求，请再次点击全屏按钮')
+      })
     }
-
-    if (nativeVideo.webkitSetPresentationMode) {
-      try {
-        nativeVideo.webkitSetPresentationMode('fullscreen')
-        return
-      } catch {
-        // Fall through to the standard API.
-      }
-    }
-
-    if (video.requestFullscreen) {
-      void video.requestFullscreen().catch(() => {})
-    }
-  }, [lockLandscapeOrientation])
+  }, [showPlayerError])
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -91,7 +91,6 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     }
     stopHlsRef.current = stopStream
 
-    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
     const hlsInstances: Hls[] = []
     const destroyHlsInstances = () => {
       while (hlsInstances.length > 0) {
@@ -102,7 +101,10 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     const art = new Artplayer({
       container: containerRef.current,
       url: activeUrl,
-      type: activeUrl.includes('/files/hls') || activeUrl.includes('.m3u8') ? 'm3u8' : undefined,
+      // Artplayer validates `type` at construction time. The content endpoint
+      // is intentionally used for native-compatible media, so it still needs
+      // an explicit non-HLS type instead of `undefined`.
+      type: activeUrl.includes('/files/hls') || activeUrl.includes('.m3u8') ? 'm3u8' : 'mp4',
       volume: 0.7,
       isLive: false,
       muted: false,
@@ -123,6 +125,10 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       hotkey: true,
       theme: '#3b82f6',
       autoOrientation: isIOS,
+      moreVideoAttr: {
+        playsInline: true,
+        preload: 'metadata',
+      },
       controls: isIOS ? [{
         name: 'ios-native-fullscreen',
         position: 'right',
@@ -130,16 +136,6 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
         tooltip: '原生全屏',
         html: '<div class="art-icon"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M7 3H3v4h2V5h2V3zm14 0h-4v2h2v2h2V3zM5 17H3v4h4v-2H5v-2zm16 0h-2v2h-2v2h4v-4z"/></svg></div>',
         click: () => requestNativeFullscreen(videoRef.current),
-        mounted: (element: HTMLElement) => {
-          const nativeVideo = videoRef.current as (HTMLVideoElement & {
-            webkitSupportsFullscreen?: boolean
-            webkitEnterFullscreen?: () => void
-          }) | null
-
-          if (!nativeVideo?.webkitEnterFullscreen && !videoRef.current?.requestFullscreen) {
-            element.style.display = 'none'
-          }
-        },
       }] : [],
       customType: {
         m3u8: function (video: HTMLVideoElement, sourceUrl: string) {
@@ -151,6 +147,23 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
               enableWorker: true,
               lowLatencyMode: false,
               backBufferLength: 30,
+              // Native video elements cannot receive our X-Session-ID header,
+              // so hls.js must carry the session cookie on cross-origin media
+              // requests. Fetch also gets the header when localStorage auth is
+              // the available credential.
+              xhrSetup: (xhr) => {
+                xhr.withCredentials = true
+              },
+              fetchSetup: (context, initParams) => {
+                initParams.credentials = 'include'
+                const sessionId = api.getSessionId()
+                if (sessionId) {
+                  const headers = new Headers(initParams.headers)
+                  headers.set('X-Session-ID', sessionId)
+                  initParams.headers = headers
+                }
+                return new Request(context.url, initParams)
+              },
               manifestLoadingMaxRetry: 2,
               manifestLoadingRetryDelay: 1000,
               manifestLoadingMaxRetryTimeout: 5000,
@@ -207,6 +220,10 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
                 message = '转码资源繁忙，请稍后重试'
               } else if (typeof status === 'number' && status >= 500) {
                 message = '转码服务暂时不可用，请重试'
+              } else if (data.type === 'networkError') {
+                message = '网络连接失败，请检查网络后重试'
+              } else if (data.type === 'mediaError') {
+                message = '浏览器无法解码该视频，请尝试转码播放'
               }
               setErrorState({ baseUrl: activeBaseUrl, message })
             })
@@ -228,12 +245,56 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       videoEl.setAttribute('webkit-playsinline', '')
       videoEl.playsInline = true
 
+      let pendingResumeTime = resumePositionRef.current
+      resumePositionRef.current = null
+      const restorePlaybackPosition = () => {
+        if (pendingResumeTime === null || !Number.isFinite(pendingResumeTime)) return
+        const duration = Number.isFinite(videoEl.duration) ? videoEl.duration : pendingResumeTime
+        videoEl.currentTime = Math.min(Math.max(0, pendingResumeTime), Math.max(0, duration - 0.05))
+        pendingResumeTime = null
+      }
+      if (pendingResumeTime !== null) {
+        videoEl.addEventListener('loadedmetadata', restorePlaybackPosition)
+      }
+
       const releaseOrientationLock = () => {
+        if (fullscreenVideoRef.current !== videoEl) return
         unlockOrientationRef.current?.()
         unlockOrientationRef.current = null
+        fullscreenVideoRef.current = null
       }
+
+      const lockOrientationForFullscreen = () => {
+        if (disposed || fullscreenVideoRef.current !== videoEl) return
+
+        void lockLandscapeOrientation().then((unlockOrientation) => {
+          if (disposed || fullscreenVideoRef.current !== videoEl) {
+            unlockOrientation?.()
+            return
+          }
+          unlockOrientationRef.current?.()
+          unlockOrientationRef.current = unlockOrientation
+        })
+      }
+
+      const handleNativeFullscreenStart = () => {
+        fullscreenVideoRef.current = videoEl
+        lockOrientationForFullscreen()
+      }
+
+      const handlePresentationModeChange = () => {
+        const mode = getNativeVideo(videoEl).webkitPresentationMode
+        if (mode === 'fullscreen') {
+          handleNativeFullscreenStart()
+        } else if (mode === 'inline') {
+          releaseOrientationLock()
+        }
+      }
+
       const handleFullscreenChange = () => {
-        if (!document.fullscreenElement) {
+        if (document.fullscreenElement === videoEl) {
+          handleNativeFullscreenStart()
+        } else if (!document.fullscreenElement) {
           releaseOrientationLock()
         }
       }
@@ -327,11 +388,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
           }).catch((err: unknown) => {
             if (disposed || (err instanceof DOMException && err.name === 'AbortError')) return
             stopStream()
-            setErrorState(null)
-            setSourceState({
-              baseUrl: activeBaseUrl,
-              url: activeUrl.replace('/files/content', '/files/hls'),
-            })
+            setErrorState({ baseUrl: activeBaseUrl, message: '网络连接失败，请检查网络后重试' })
           })
           return
         }
@@ -339,7 +396,9 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
         setErrorState({ baseUrl: activeBaseUrl, message: '视频转码播放失败' })
       }
 
+      videoEl.addEventListener('webkitbeginfullscreen', handleNativeFullscreenStart)
       videoEl.addEventListener('webkitendfullscreen', releaseOrientationLock)
+      videoEl.addEventListener('webkitpresentationmodechanged', handlePresentationModeChange)
       document.addEventListener('fullscreenchange', handleFullscreenChange)
       videoEl.addEventListener('play', scheduleInitialStallRecovery)
       videoEl.addEventListener('timeupdate', handleTimeUpdate)
@@ -351,8 +410,11 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       art.on('destroy', () => {
         disposed = true
         destroyHlsInstances()
+        videoEl.removeEventListener('webkitbeginfullscreen', handleNativeFullscreenStart)
         videoEl.removeEventListener('webkitendfullscreen', releaseOrientationLock)
+        videoEl.removeEventListener('webkitpresentationmodechanged', handlePresentationModeChange)
         document.removeEventListener('fullscreenchange', handleFullscreenChange)
+        videoEl.removeEventListener('loadedmetadata', restorePlaybackPosition)
         videoEl.removeEventListener('play', scheduleInitialStallRecovery)
         videoEl.removeEventListener('timeupdate', handleTimeUpdate)
         videoEl.removeEventListener('pause', handlePause)
@@ -374,20 +436,62 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       if (videoRef.current === videoEl) {
         videoRef.current = null
       }
-      unlockOrientationRef.current?.()
-      unlockOrientationRef.current = null
+      if (fullscreenVideoRef.current === videoEl) {
+        unlockOrientationRef.current?.()
+        unlockOrientationRef.current = null
+        fullscreenVideoRef.current = null
+      }
       if (artRef.current === art) {
         art.destroy(false)
         artRef.current = null
       }
     }
-  }, [currentUrl, retryNonce, requestNativeFullscreen, url])
+  }, [currentUrl, isIOS, retryNonce, requestNativeFullscreen, url])
 
   useEffect(() => {
-    const handlePageHide = () => stopHlsRef.current()
+    const markHidden = () => {
+      if (document.visibilityState !== 'hidden') return
+      hiddenAtRef.current = Date.now()
+      wasPlayingBeforeHideRef.current = Boolean(videoRef.current && !videoRef.current.paused)
+    }
+
+    const resumeIfStale = () => {
+      const hiddenAt = hiddenAtRef.current
+      hiddenAtRef.current = null
+      if (!hiddenAt || !wasPlayingBeforeHideRef.current) return
+      wasPlayingBeforeHideRef.current = false
+
+      if (Date.now() - hiddenAt < HLS_RESUME_THRESHOLD_MS) return
+      resumePositionRef.current = videoRef.current?.currentTime ?? null
+      setRetryNonce((value) => value + 1)
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        markHidden()
+      } else {
+        resumeIfStale()
+      }
+    }
+
+    const handlePageHide = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        markHidden()
+        return
+      }
+      // A non-persisted pagehide is a real unload/navigation. A bfcache
+      // transition keeps the stream alive so pageshow can recover it.
+      stopHlsRef.current()
+    }
+
+    const handlePageShow = () => resumeIfStale()
+    document.addEventListener('visibilitychange', handleVisibilityChange)
     window.addEventListener('pagehide', handlePageHide)
+    window.addEventListener('pageshow', handlePageShow)
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
       window.removeEventListener('pagehide', handlePageHide)
+      window.removeEventListener('pageshow', handlePageShow)
     }
   }, [])
 
@@ -414,42 +518,90 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
   }, [])
 
   useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape') {
+    const modal = modalRef.current
+    const previousActiveElement = document.activeElement as HTMLElement | null
+    closeButtonRef.current?.focus()
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
         onClose()
+        return
+      }
+      if (event.key !== 'Tab' || !modal) return
+
+      const focusable = Array.from(modal.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )).filter((element) => element.offsetParent !== null)
+      if (focusable.length === 0) {
+        event.preventDefault()
+        modal.focus()
+        return
+      }
+
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
       }
     }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
+
+    modal?.addEventListener('keydown', handleKeyDown)
+    return () => {
+      modal?.removeEventListener('keydown', handleKeyDown)
+      if (previousActiveElement?.isConnected) previousActiveElement.focus()
+    }
   }, [onClose])
 
   return (
-    <div className="fixed inset-0 bg-black/90 z-50 flex flex-col" onClick={onClose}>
+    <div
+      ref={modalRef}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+      aria-describedby={error ? errorId : undefined}
+      tabIndex={-1}
+      className="player-modal fixed inset-0 z-50 flex flex-col bg-black/90 outline-none"
+      onClick={onClose}
+    >
       {/* Title bar */}
-      <div className="flex items-center justify-between px-4 py-3 flex-shrink-0" onClick={(e) => e.stopPropagation()}>
-        <h3 className="text-white font-medium truncate">{title}</h3>
+      <div className="player-modal__header flex items-center justify-between flex-shrink-0" onClick={(e) => e.stopPropagation()}>
+        <h3 id={titleId} className="text-white font-medium truncate">{title}</h3>
         <div className="flex items-center gap-1">
-          {/iPad|iPhone|iPod/.test(navigator.userAgent) && (
+          {isIOS && (
             <button
+              type="button"
               onClick={() => requestNativeFullscreen(videoRef.current)}
-              className="p-2 text-gray-400 hover:text-white transition-colors"
+              className="player-icon-button p-2 text-gray-400 transition-colors"
               title="原生全屏"
+              aria-label="进入原生全屏"
             >
               <Maximize className="w-5 h-5" />
             </button>
           )}
-          <button onClick={onClose} className="p-2 text-gray-400 hover:text-white transition-colors">
+          <button
+            ref={closeButtonRef}
+            type="button"
+            onClick={onClose}
+            className="player-icon-button p-2 text-gray-400 transition-colors"
+            aria-label="关闭播放器"
+            title="关闭播放器"
+          >
             <X className="w-6 h-6" />
           </button>
         </div>
       </div>
 
       {/* Player */}
-      <div className="flex-1 flex items-center justify-center px-4 pb-4" onClick={(e) => e.stopPropagation()}>
-        <div className="w-full max-w-6xl h-[60vh] sm:h-[75vh] touch-manipulation">
+      <div className="player-modal__content flex-1 flex items-center justify-center" onClick={(e) => e.stopPropagation()}>
+        <div className="player-stage w-full max-w-6xl touch-manipulation">
           <div ref={containerRef} className="w-full h-full" />
           {error && (
-            <div className="mt-3 flex items-center justify-center gap-3 text-sm text-red-300">
+            <div id={errorId} role="alert" aria-live="assertive" className="player-error mt-3 flex items-center justify-center gap-3 text-sm text-red-300">
               <AlertCircle className="w-4 h-4" />
               <span>{error}</span>
               <button
@@ -460,7 +612,8 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
                   setSourceState({ baseUrl: url, url })
                   setRetryNonce((value) => value + 1)
                 }}
-                className="inline-flex items-center gap-1 rounded border border-red-400/40 px-2 py-1 text-red-200 hover:bg-red-400/10"
+                className="inline-flex items-center gap-1 rounded border border-red-400/40 px-2 py-1 text-red-200 hover:bg-red-400/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400"
+                aria-label="重试播放"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
                 重试

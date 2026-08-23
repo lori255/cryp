@@ -212,6 +212,11 @@ func (s *Server) SetupRouter() *gin.Engine {
 		fileServer := http.FileServer(http.FS(s.staticFS))
 		r.GET("/assets/*filepath", gin.WrapH(fileServer))
 		r.GET("/vite.svg", gin.WrapH(fileServer))
+		// Root-level PWA resources must be explicit routes. Otherwise the SPA
+		// fallback returns index.html for these URLs, which makes iOS reject the
+		// manifest/icon during “Add to Home Screen”.
+		r.GET("/manifest.webmanifest", gin.WrapH(fileServer))
+		r.GET("/cryp.svg", gin.WrapH(fileServer))
 	}
 
 	r.NoRoute(func(c *gin.Context) {

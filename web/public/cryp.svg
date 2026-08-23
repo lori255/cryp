@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-labelledby="title">
+  <title id="title">Cryp</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#172554"/>
+      <stop offset="1" stop-color="#030712"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <rect width="192" height="192" rx="42" fill="url(#bg)"/>
+  <path fill="none" stroke="url(#mark)" stroke-linecap="round" stroke-linejoin="round" stroke-width="14" d="M58 88V70c0-21 15-36 38-36s38 15 38 36v18"/>
+  <rect x="42" y="82" width="108" height="76" rx="18" fill="#0f172a" stroke="url(#mark)" stroke-width="8"/>
+  <circle cx="96" cy="118" r="10" fill="#67e8f9"/>
+  <path fill="none" stroke="#67e8f9" stroke-linecap="round" stroke-width="8" d="M96 128v13"/>
+</svg>
