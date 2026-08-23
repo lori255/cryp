@@ -14,7 +14,7 @@ import (
 
 const (
 	cacheDropInterval = 8 * 1024 * 1024 // 8MB - keep low to limit page cache in containers
-	copyBufSize       = 32 * 1024        // 32KB
+	copyBufSize       = 32 * 1024       // 32KB
 )
 
 // EncryptResult describes an encrypted file written into the vault.
@@ -136,55 +136,67 @@ func EncryptSingleFile(vault *Vault, keys *VaultKeys, srcPath, virtualPath strin
 		return result, err
 	}
 
-	outFile, err := os.Create(encPath)
+	outFile, err := os.CreateTemp(filepath.Dir(encPath), ".cryp-encrypt-*")
 	if err != nil {
 		return result, err
 	}
-	defer outFile.Close()
+	tmpPath := outFile.Name()
+	defer func() {
+		_ = outFile.Close()
+		_ = os.Remove(tmpPath)
+	}()
 
 	unix.Fadvise(int(srcFile.Fd()), 0, 0, unix.FADV_SEQUENTIAL|unix.FADV_NOREUSE)
 
 	contentKey := make([]byte, MasterKeySize)
 	if _, err := rand.Read(contentKey); err != nil {
-		os.Remove(encPath)
+		os.Remove(tmpPath)
 		return result, err
 	}
 
 	header, err := WriteFileHeader(outFile, keys.MasterKey, contentKey)
 	if err != nil {
-		os.Remove(encPath)
+		os.Remove(tmpPath)
 		return result, err
 	}
 
 	writer, err := NewEncryptingWriter(outFile, header.ContentKey, header.Nonce)
 	if err != nil {
-		os.Remove(encPath)
+		os.Remove(tmpPath)
 		return result, err
 	}
 
 	hasher := sha256.New()
 	written, err := CopyWithCacheDrop(io.MultiWriter(writer, hasher), srcFile, outFile)
 	if err != nil {
-		os.Remove(encPath)
+		os.Remove(tmpPath)
 		return result, err
 	}
 	result.PlaintextSize = written
 	result.ContentHash = hex.EncodeToString(hasher.Sum(nil))
 
 	if err := writer.Close(); err != nil {
-		os.Remove(encPath)
+		os.Remove(tmpPath)
 		return result, err
 	}
 
 	// Fsync to ensure encrypted data is durable on disk before caller
 	// may delete the source file.
 	if err := outFile.Sync(); err != nil {
-		os.Remove(encPath)
+		os.Remove(tmpPath)
 		return result, fmt.Errorf("fsync encrypted file: %w", err)
 	}
 
 	DropFileCache(srcFile)
 	DropFileCache(outFile)
+	if err := outFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return result, fmt.Errorf("close encrypted file: %w", err)
+	}
+	if err := os.Rename(tmpPath, encPath); err != nil {
+		os.Remove(tmpPath)
+		return result, fmt.Errorf("replace encrypted file: %w", err)
+	}
 	return result, nil
 }
 

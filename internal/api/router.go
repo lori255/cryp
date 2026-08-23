@@ -17,31 +17,60 @@ import (
 
 // Server holds all dependencies for the API
 type Server struct {
-	db        *storage.DB
-	sessions  *session.Store
-	tasks     *task.Manager
-	thumbs    *thumbnail.Generator
-	vaultDir  string
-	staticFS  fs.FS
-	scryptSem chan struct{} // limits concurrent scrypt derivations to prevent OOM
-	corsAllow map[string]struct{}
-	hlsMu     sync.Mutex
-	hls       map[string]*hlsStream
-	hlsStarts int
+	db         *storage.DB
+	sessions   *session.Store
+	tasks      *task.Manager
+	thumbs     *thumbnail.Generator
+	vaultDir   string
+	port       string
+	staticFS   fs.FS
+	scryptSem  chan struct{} // limits concurrent scrypt derivations to prevent OOM
+	corsAllow  map[string]struct{}
+	hlsLifeMu  sync.RWMutex // coordinates HLS starts with destructive replacements
+	hlsMu      sync.Mutex
+	hls        map[string]*hlsStream
+	hlsPending map[hlsKey]*hlsPending
+	hlsActive  int
+	hlsStarts  int
+	hlsClosing bool
 }
 
 func NewServer(db *storage.DB, sessions *session.Store, tasks *task.Manager, thumbs *thumbnail.Generator, vaultDir string, staticFS fs.FS) *Server {
-	return &Server{
-		db:        db,
-		sessions:  sessions,
-		tasks:     tasks,
-		thumbs:    thumbs,
-		vaultDir:  vaultDir,
-		staticFS:  staticFS,
-		scryptSem: make(chan struct{}, 2), // max 2 concurrent scrypt ops (~64MB peak)
-		corsAllow: parseAllowedOrigins(os.Getenv("CRYP_ALLOWED_ORIGINS")),
-		hls:       make(map[string]*hlsStream),
+	return NewServerWithPort(db, sessions, tasks, thumbs, vaultDir, serverPortFromEnv(), staticFS)
+}
+
+// NewServerWithPort creates an API server and uses port for internal loopback
+// requests made by FFmpeg. Keeping this value alongside the listener avoids
+// failures when the -port flag is used without PORT in the environment.
+func NewServerWithPort(db *storage.DB, sessions *session.Store, tasks *task.Manager, thumbs *thumbnail.Generator, vaultDir, port string, staticFS fs.FS) *Server {
+	if strings.TrimSpace(port) == "" {
+		port = serverPortFromEnv()
 	}
+	server := &Server{
+		db:         db,
+		sessions:   sessions,
+		tasks:      tasks,
+		thumbs:     thumbs,
+		vaultDir:   vaultDir,
+		port:       port,
+		staticFS:   staticFS,
+		scryptSem:  make(chan struct{}, 2), // max 2 concurrent scrypt ops (~64MB peak)
+		corsAllow:  parseAllowedOrigins(os.Getenv("CRYP_ALLOWED_ORIGINS")),
+		hls:        make(map[string]*hlsStream),
+		hlsPending: make(map[hlsKey]*hlsPending),
+	}
+	if tasks != nil {
+		tasks.SetReplaceGuard(server.PrepareFileReplacement)
+		tasks.SetReplaceLeaseGuard(server.BeginFileReplacement)
+	}
+	return server
+}
+
+func serverPortFromEnv() string {
+	if port := strings.TrimSpace(os.Getenv("PORT")); port != "" {
+		return port
+	}
+	return "8080"
 }
 
 func parseAllowedOrigins(raw string) map[string]struct{} {

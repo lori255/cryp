@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Artplayer from 'artplayer'
 import Hls from 'hls.js'
-import { AlertCircle, Maximize, X } from 'lucide-react'
+import { AlertCircle, Maximize, RefreshCw, X } from 'lucide-react'
 import { api } from '../lib/api'
 
 interface VideoPlayerProps {
@@ -11,25 +11,20 @@ interface VideoPlayerProps {
 }
 
 export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
-  const [currentUrl, setCurrentUrl] = useState(url)
-  const [error, setError] = useState('')
+  const [sourceState, setSourceState] = useState({ baseUrl: url, url })
+  const [errorState, setErrorState] = useState<{ baseUrl: string; message: string } | null>(null)
+  const [retryNonce, setRetryNonce] = useState(0)
+  // When the parent changes url, ignore a fallback retained for the previous
+  // item without needing a setState call inside an effect.
+  const currentUrl = sourceState.baseUrl === url ? sourceState.url : url
+  const error = errorState?.baseUrl === url ? errorState.message : ''
   const containerRef = useRef<HTMLDivElement>(null)
   const artRef = useRef<Artplayer | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const unlockOrientationRef = useRef<(() => void) | null>(null)
-  const hlsUrlRef = useRef(url)
+  const stopHlsRef = useRef<() => void>(() => {})
 
-  useEffect(() => {
-    setCurrentUrl(url)
-    hlsUrlRef.current = url
-    setError('')
-  }, [url])
-
-  useEffect(() => {
-    hlsUrlRef.current = currentUrl
-  }, [currentUrl])
-
-  async function lockLandscapeOrientation() {
+  const lockLandscapeOrientation = useCallback(async () => {
     const orientationApi = screen.orientation as ScreenOrientation & {
       lock?: (orientation: 'landscape' | 'portrait' | 'any' | 'natural') => Promise<void>
       unlock?: () => void
@@ -42,9 +37,9 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     } catch {
       return null
     }
-  }
+  }, [])
 
-  async function requestNativeFullscreen(video: HTMLVideoElement | null) {
+  const requestNativeFullscreen = useCallback(async (video: HTMLVideoElement | null) => {
     if (!video) return
 
     const nativeVideo = video as HTMLVideoElement & {
@@ -78,10 +73,22 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     if (video.requestFullscreen) {
       void video.requestFullscreen().catch(() => {})
     }
-  }
+  }, [lockLandscapeOrientation])
 
   useEffect(() => {
     if (!containerRef.current) return
+
+    const activeUrl = currentUrl
+    const activeBaseUrl = url
+    let disposed = false
+    let streamStopped = false
+    let activeHlsUrl = activeUrl
+    const stopStream = () => {
+      if (streamStopped) return
+      streamStopped = true
+      api.stopHls(activeHlsUrl)
+    }
+    stopHlsRef.current = stopStream
 
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
     const hlsInstances: Hls[] = []
@@ -93,8 +100,8 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
 
     const art = new Artplayer({
       container: containerRef.current,
-      url: currentUrl,
-      type: currentUrl.includes('/files/hls') || currentUrl.includes('.m3u8') ? 'm3u8' : undefined,
+      url: activeUrl,
+      type: activeUrl.includes('/files/hls') || activeUrl.includes('.m3u8') ? 'm3u8' : undefined,
       volume: 0.7,
       isLive: false,
       muted: false,
@@ -155,13 +162,52 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
             hls.attachMedia(video)
             hlsInstances.push(hls)
             hls.on(Hls.Events.MANIFEST_LOADED, (_, data) => {
-              hlsUrlRef.current = data.networkDetails?.responseURL || data.url || sourceUrl
-            })
-            hls.on(Hls.Events.ERROR, (_, data) => {
-              if (data.fatal) {
-                destroyHlsInstances()
-                setError('视频转码播放失败')
+              const candidates = [data.networkDetails?.responseURL, data.url, sourceUrl]
+              for (const candidate of candidates) {
+                if (!candidate) continue
+                try {
+                  const candidatePath = new URL(candidate, window.location.origin).pathname
+                  if (candidatePath.endsWith('/index.m3u8') || candidatePath.endsWith('/files/hls')) {
+                    activeHlsUrl = candidate
+                    break
+                  }
+                } catch {
+                  // Keep the previously known source when an event payload
+                  // contains a malformed/non-URL value.
+                }
               }
+            })
+            let mediaRecoveryCount = 0
+            hls.on(Hls.Events.ERROR, (_, data) => {
+              if (disposed || !data.fatal) return
+
+              // A single media recovery handles transient decoder state. Do
+              // not retry fatal network errors indefinitely: each retry can
+              // otherwise create another slow backend HLS startup.
+              if (data.type === 'mediaError' && mediaRecoveryCount < 1) {
+                mediaRecoveryCount++
+                hls.recoverMediaError()
+                return
+              }
+
+              stopStream()
+              destroyHlsInstances()
+              const detail = data as typeof data & {
+                response?: { code?: number }
+                networkDetails?: { status?: number }
+              }
+              const status = detail.response?.code ?? detail.networkDetails?.status
+              let message = '视频转码播放失败'
+              if (status === 401 || status === 403) {
+                message = '登录状态已失效，请重新登录'
+              } else if (status === 404) {
+                message = '视频或转码分片不存在'
+              } else if (status === 429) {
+                message = '转码资源繁忙，请稍后重试'
+              } else if (typeof status === 'number' && status >= 500) {
+                message = '转码服务暂时不可用，请重试'
+              }
+              setErrorState({ baseUrl: activeBaseUrl, message })
             })
             return
           }
@@ -192,7 +238,8 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       }
       let stallCheckTimer: number | null = null
       let hasRecoveredInitialStall = false
-      let hasTriedHlsFallback = currentUrl.includes('/files/hls')
+      let hasTriedHlsFallback = activeUrl.includes('/files/hls')
+      let contentFallbackInProgress = false
 
       const clearStallCheck = () => {
         if (stallCheckTimer !== null) {
@@ -235,14 +282,55 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       }
 
       const handleVideoError = () => {
+        if (disposed) return
         clearStallCheck()
-        if (!hasTriedHlsFallback && currentUrl.includes('/files/content')) {
+        if (!hasTriedHlsFallback && activeUrl.includes('/files/content')) {
           hasTriedHlsFallback = true
-          setError('')
-          setCurrentUrl(currentUrl.replace('/files/content', '/files/hls'))
+          if (contentFallbackInProgress) return
+          contentFallbackInProgress = true
+          // A native video element exposes no HTTP status for `error`. Probe
+          // one byte before starting FFmpeg so authentication/file failures do
+          // not get misreported as a transcoding failure.
+          const probeHeaders: Record<string, string> = { Range: 'bytes=0-0' }
+          const probeSessionId = api.getSessionId()
+          if (probeSessionId) probeHeaders['X-Session-ID'] = probeSessionId
+          void fetch(activeUrl, {
+            credentials: 'include',
+            headers: probeHeaders,
+          }).then(async (response) => {
+            await response.body?.cancel()
+            if (disposed) return
+            if (response.status === 401 || response.status === 403) {
+              setErrorState({ baseUrl: activeBaseUrl, message: '登录状态已失效，请重新登录' })
+              return
+            }
+            if (response.status === 404) {
+              setErrorState({ baseUrl: activeBaseUrl, message: '视频文件不存在或已被删除' })
+              return
+            }
+            if (response.status >= 500) {
+              setErrorState({ baseUrl: activeBaseUrl, message: '文件服务暂时不可用，请重试' })
+              return
+            }
+            stopStream()
+            setErrorState(null)
+            setSourceState({
+              baseUrl: activeBaseUrl,
+              url: activeUrl.replace('/files/content', '/files/hls'),
+            })
+          }).catch(() => {
+            if (disposed) return
+            stopStream()
+            setErrorState(null)
+            setSourceState({
+              baseUrl: activeBaseUrl,
+              url: activeUrl.replace('/files/content', '/files/hls'),
+            })
+          })
           return
         }
-        setError('视频转码播放失败')
+        stopStream()
+        setErrorState({ baseUrl: activeBaseUrl, message: '视频转码播放失败' })
       }
 
       videoEl.addEventListener('webkitendfullscreen', releaseOrientationLock)
@@ -255,6 +343,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       art.on('video:error', handleVideoError)
 
       art.on('destroy', () => {
+        disposed = true
         destroyHlsInstances()
         videoEl.removeEventListener('webkitendfullscreen', releaseOrientationLock)
         document.removeEventListener('fullscreenchange', handleFullscreenChange)
@@ -270,24 +359,28 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     artRef.current = art
 
     return () => {
-      api.stopHls(hlsUrlRef.current)
-      videoRef.current = null
+      disposed = true
+      stopStream()
+      if (stopHlsRef.current === stopStream) {
+        stopHlsRef.current = () => {}
+      }
+      if (videoRef.current === videoEl) {
+        videoRef.current = null
+      }
       unlockOrientationRef.current?.()
       unlockOrientationRef.current = null
-      if (artRef.current) {
-        artRef.current.destroy(false)
+      if (artRef.current === art) {
+        art.destroy(false)
         artRef.current = null
       }
     }
-  }, [currentUrl])
+  }, [currentUrl, retryNonce, requestNativeFullscreen, url])
 
   useEffect(() => {
-    const stopHls = () => api.stopHls(hlsUrlRef.current)
-    const handlePageHide = () => stopHls()
+    const handlePageHide = () => stopHlsRef.current()
     window.addEventListener('pagehide', handlePageHide)
     return () => {
       window.removeEventListener('pagehide', handlePageHide)
-      stopHls()
     }
   }, [])
 
@@ -349,9 +442,22 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
         <div className="w-full max-w-6xl h-[60vh] sm:h-[75vh] touch-manipulation">
           <div ref={containerRef} className="w-full h-full" />
           {error && (
-            <div className="mt-3 flex items-center justify-center gap-2 text-sm text-red-300">
+            <div className="mt-3 flex items-center justify-center gap-3 text-sm text-red-300">
               <AlertCircle className="w-4 h-4" />
               <span>{error}</span>
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setErrorState(null)
+                  setSourceState({ baseUrl: url, url })
+                  setRetryNonce((value) => value + 1)
+                }}
+                className="inline-flex items-center gap-1 rounded border border-red-400/40 px-2 py-1 text-red-200 hover:bg-red-400/10"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                重试
+              </button>
             </div>
           )}
         </div>

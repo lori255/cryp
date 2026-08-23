@@ -19,6 +19,20 @@ type ThumbEnqueuer interface {
 	Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, virtualPath string)
 }
 
+type thumbInvalidator interface {
+	DeleteThumbnail(vaultID, virtualPath string)
+}
+
+// ReplaceGuard runs immediately before an imported file is written to its
+// destination. Implementations can stop readers/transcoders that still use
+// the old bytes and return an error when it is unsafe to replace the file.
+type ReplaceGuard func(vaultID, virtualPath string) error
+
+// ReplaceLeaseGuard is the lifecycle-safe form of ReplaceGuard. It returns a
+// release function that remains held until the encrypted replacement has been
+// written, preventing a new reader from starting in the stop/write window.
+type ReplaceLeaseGuard func(vaultID, virtualPath string) (release func(), err error)
+
 // Manager handles background task execution
 type Manager struct {
 	db                 *storage.DB
@@ -27,6 +41,8 @@ type Manager struct {
 	runningByVaultType map[string]string        // vaultID:type -> taskID
 	taskRunKeys        map[string]string        // taskID -> vaultID:type
 	thumbs             ThumbEnqueuer
+	replaceGuard       ReplaceGuard
+	replaceLeaseGuard  ReplaceLeaseGuard
 }
 
 const errTaskCancelled = "task cancelled"
@@ -47,6 +63,37 @@ func NewManager(db *storage.DB) *Manager {
 // SetThumbEnqueuer sets the thumbnail enqueuer (avoids circular init)
 func (m *Manager) SetThumbEnqueuer(t ThumbEnqueuer) {
 	m.thumbs = t
+}
+
+// SetReplaceGuard installs an optional lifecycle guard for imported file
+// replacements. It is a callback to keep task and API packages decoupled.
+func (m *Manager) SetReplaceGuard(guard ReplaceGuard) {
+	m.mu.Lock()
+	m.replaceGuard = guard
+	m.mu.Unlock()
+}
+
+// SetReplaceLeaseGuard installs a guard that can hold a replacement barrier
+// across the actual encryption write. It is optional for compatibility with
+// callers that only need the pre-replacement callback.
+func (m *Manager) SetReplaceLeaseGuard(guard ReplaceLeaseGuard) {
+	m.mu.Lock()
+	m.replaceLeaseGuard = guard
+	m.mu.Unlock()
+}
+
+func (m *Manager) getReplaceGuard() ReplaceGuard {
+	m.mu.RLock()
+	guard := m.replaceGuard
+	m.mu.RUnlock()
+	return guard
+}
+
+func (m *Manager) getReplaceLeaseGuard() ReplaceLeaseGuard {
+	m.mu.RLock()
+	guard := m.replaceLeaseGuard
+	m.mu.RUnlock()
+	return guard
 }
 
 // recoverTasks marks any tasks that were "running" when server restarted as "error"
@@ -353,13 +400,31 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 			_ = m.db.UpdateTask(t)
 
 			info, _ := entry.Info()
-			result, err := crypto.EncryptSingleFile(vault, keys, entryPath, virtualPath)
-			if err != nil {
-				// On failure (including cancellation), clean up the partially
-				// written encrypted file to avoid leaving corrupted data.
-				if encPath, resolveErr := vault.GetEncryptedFilePath(virtualPath); resolveErr == nil {
-					os.Remove(encPath)
+			var release func()
+			if guard := m.getReplaceLeaseGuard(); guard != nil {
+				var guardErr error
+				release, guardErr = guard(vault.ID, virtualPath)
+				if guardErr != nil {
+					if release != nil {
+						release()
+					}
+					return fmt.Errorf("prepare replacement %s: %w", virtualPath, guardErr)
 				}
+			} else if guard := m.getReplaceGuard(); guard != nil {
+				if guardErr := guard(vault.ID, virtualPath); guardErr != nil {
+					return fmt.Errorf("prepare replacement %s: %w", virtualPath, guardErr)
+				}
+			}
+			result, err := func() (crypto.EncryptResult, error) {
+				if release != nil {
+					defer release()
+				}
+				return crypto.EncryptSingleFile(vault, keys, entryPath, virtualPath)
+			}()
+			if err != nil {
+				// EncryptSingleFile writes to a private temporary file and only
+				// renames after fsync, so a failed replacement leaves the previous
+				// destination intact and cleans its own partial output.
 				return fmt.Errorf("encrypt %s: %w", virtualPath, err)
 			}
 
@@ -379,6 +444,9 @@ func (m *Manager) encryptDirRecursive(vault *crypto.Vault, keys *crypto.VaultKey
 
 			// Enqueue thumbnail generation for supported expensive previews.
 			if m.thumbs != nil && result.PlaintextSize > 0 && (thumbnail.IsVideo(entry.Name()) || thumbnail.IsHEIF(entry.Name())) {
+				if invalidator, ok := m.thumbs.(thumbInvalidator); ok {
+					invalidator.DeleteThumbnail(vault.ID, virtualPath)
+				}
 				m.thumbs.Enqueue(vault.ID, vault.Path, keys, virtualPath)
 			}
 			t.ProcessedFiles++

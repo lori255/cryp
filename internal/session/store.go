@@ -3,6 +3,7 @@ package session
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"sync"
 	"time"
 
@@ -29,16 +30,40 @@ type Session struct {
 type Store struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	closed   bool
 }
 
 // NewStore creates a new session store
 func NewStore() *Store {
 	s := &Store{
 		sessions: make(map[string]*Session),
+		stopCh:   make(chan struct{}),
 	}
 	// Start cleanup goroutine
 	go s.cleanup()
 	return s
+}
+
+// Close stops the cleanup goroutine and zeroes any remaining keys. It is safe
+// to call more than once and should be used when the server shuts down.
+func (s *Store) Close() {
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+		defer s.mu.Unlock()
+		for id, session := range s.sessions {
+			zeroVaultKeys(session.Keys)
+			delete(s.sessions, id)
+		}
+	})
 }
 
 // Create creates a new session for an unlocked vault
@@ -48,15 +73,24 @@ func (s *Store) Create(vaultID, vaultPath string, keys *crypto.VaultKeys) (strin
 		return "", err
 	}
 
+	ownedKeys := keys.Clone()
 	session := &Session{
 		ID:        id,
 		VaultID:   vaultID,
 		VaultPath: vaultPath,
-		Keys:      keys,
+		Keys:      ownedKeys,
 		ExpiresAt: time.Now().Add(SessionExpiry),
 	}
 
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		zeroVaultKeys(ownedKeys)
+		return "", errors.New("session store is closed")
+	}
+	if s.sessions == nil {
+		s.sessions = make(map[string]*Session)
+	}
 	s.sessions[id] = session
 	s.mu.Unlock()
 
@@ -77,7 +111,12 @@ func (s *Store) Get(id string) (*Session, bool) {
 		return nil, false
 	}
 
-	return session, true
+	// Return a snapshot. Handlers often use keys after this lock is released;
+	// returning the store-owned pointer would race with logout/expiry, which
+	// zeroes keys while removing a session.
+	snapshot := *session
+	snapshot.Keys = session.Keys.Clone()
+	return &snapshot, true
 }
 
 // Delete removes a session
@@ -87,8 +126,7 @@ func (s *Store) Delete(id string) {
 
 	if session, ok := s.sessions[id]; ok {
 		// Zero out keys in memory
-		zeroBytes(session.Keys.MasterKey)
-		zeroBytes(session.Keys.MACKey)
+		zeroVaultKeys(session.Keys)
 		delete(s.sessions, id)
 	}
 }
@@ -100,8 +138,7 @@ func (s *Store) DeleteByVault(vaultID string) {
 
 	for id, session := range s.sessions {
 		if session.VaultID == vaultID {
-			zeroBytes(session.Keys.MasterKey)
-			zeroBytes(session.Keys.MACKey)
+			zeroVaultKeys(session.Keys)
 			delete(s.sessions, id)
 		}
 	}
@@ -121,17 +158,21 @@ func (s *Store) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		s.mu.Lock()
-		now := time.Now()
-		for id, session := range s.sessions {
-			if now.After(session.ExpiresAt) {
-				zeroBytes(session.Keys.MasterKey)
-				zeroBytes(session.Keys.MACKey)
-				delete(s.sessions, id)
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			now := time.Now()
+			for id, session := range s.sessions {
+				if now.After(session.ExpiresAt) {
+					zeroVaultKeys(session.Keys)
+					delete(s.sessions, id)
+				}
 			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 }
 
@@ -147,4 +188,12 @@ func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+func zeroVaultKeys(keys *crypto.VaultKeys) {
+	if keys == nil {
+		return
+	}
+	zeroBytes(keys.MasterKey)
+	zeroBytes(keys.MACKey)
 }

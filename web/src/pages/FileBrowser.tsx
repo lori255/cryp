@@ -59,12 +59,28 @@ export default function FileBrowser() {
     }
   })
   const loadMoreRef = useRef<HTMLDivElement | null>(null)
+  const listRequestIdRef = useRef(0)
+  const listAbortRef = useRef<AbortController | null>(null)
+  const loadingMoreRef = useRef(false)
+  const cancelListRequest = useCallback(() => {
+    listRequestIdRef.current += 1
+    listAbortRef.current?.abort()
+  }, [])
 
   const loadFiles = useCallback(async (offset = 0, append = false) => {
     if (!vaultId) return
+    if (append && loadingMoreRef.current) return
+
+    const requestId = ++listRequestIdRef.current
+    listAbortRef.current?.abort()
+    const controller = new AbortController()
+    listAbortRef.current = controller
     if (append) {
+      loadingMoreRef.current = true
       setLoadingMore(true)
     } else {
+      loadingMoreRef.current = false
+      setLoadingMore(false)
       setLoading(true)
       setError('')
     }
@@ -74,33 +90,45 @@ export default function FileBrowser() {
         limit: PAGE_SIZE,
         sortField,
         sortDirection,
+        signal: controller.signal,
       })
+      if (requestId !== listRequestIdRef.current) return
       const nextFiles = data.files || []
       setIndexRequired(Boolean(data.indexRequired))
       setFiles((prev) => append ? [...prev, ...nextFiles] : nextFiles)
       setHasMore(Boolean(data.hasMore))
       setNextOffset(data.nextOffset ?? (offset + nextFiles.length))
     } catch (err) {
+      if (controller.signal.aborted || requestId !== listRequestIdRef.current) return
       if (err instanceof Error && err.message.includes('session')) {
         navigate('/')
         return
       }
       setError(err instanceof Error ? err.message : '加载失败')
     } finally {
-      if (append) {
-        setLoadingMore(false)
-      } else {
-        setLoading(false)
+      if (requestId === listRequestIdRef.current) {
+        if (append) {
+          loadingMoreRef.current = false
+          setLoadingMore(false)
+        } else {
+          setLoading(false)
+        }
       }
     }
   }, [vaultId, currentPath, navigate, sortField, sortDirection])
 
   useEffect(() => {
+    cancelListRequest()
+    loadingMoreRef.current = false
+    setLoadingMore(false)
     setFiles([])
     setHasMore(false)
     setNextOffset(0)
     void loadFiles(0, false)
-  }, [loadFiles])
+    return () => {
+      cancelListRequest()
+    }
+  }, [cancelListRequest, loadFiles])
   useEffect(() => {
     localStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ field: sortField, direction: sortDirection }))
   }, [sortField, sortDirection])

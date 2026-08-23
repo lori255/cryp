@@ -2,8 +2,10 @@ package thumbnail
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,24 +13,34 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"cryp/internal/crypto"
+	"cryp/internal/procgroup"
 	"cryp/internal/session"
 )
 
 const (
-	thumbDir      = "thumbnails"
-	thumbWidth    = 320
-	thumbHeight   = 180
-	imageThumbMax = 1024
-	queueSize     = 1000
-	maxRetries    = 1
-	failCooldown  = 5 * time.Minute
-	maxFailedJobs = 5000
+	thumbDir            = "thumbnails"
+	thumbWidth          = 320
+	thumbHeight         = 180
+	imageThumbMax       = 1024
+	queueSize           = 1000
+	maxRetries          = 1
+	failCooldown        = 5 * time.Minute
+	maxFailedJobs       = 5000
+	ffmpegTimeout       = 2 * time.Minute
+	thumbnailJobTimeout = 5 * time.Minute
+	probeTimeout        = 10 * time.Second
+	detectTimeout       = 5 * time.Second
+	maxHEIFBytes        = 512 << 20
 )
+
+var errThumbnailStale = errors.New("thumbnail job superseded")
+var errThumbnailSkipped = errors.New("thumbnail generation skipped")
 
 // videoExtensions lists supported video file extensions
 var videoExtensions = map[string]bool{
@@ -60,10 +72,11 @@ func IsHEIF(name string) bool {
 
 // thumbJob represents a thumbnail generation request
 type thumbJob struct {
-	VaultID   string
-	VaultPath string
-	Keys      *crypto.VaultKeys
-	FilePath  string // virtual path within vault
+	VaultID    string
+	VaultPath  string
+	Keys       *crypto.VaultKeys
+	FilePath   string // virtual path within vault
+	generation uint64
 }
 
 // Generator manages async thumbnail generation with a single-worker queue.
@@ -73,18 +86,23 @@ type thumbJob struct {
 //   - MP4 moov-at-end works — FFmpeg sends Range requests to seek
 //   - Only a few MB of data is transferred for a single frame extraction
 type Generator struct {
-	vaultDir string
-	sessions *session.Store
-	port     string
-	jobs     chan thumbJob
-	ffmpeg   ffmpegConfig
-	wg       sync.WaitGroup
-	scanWg   sync.WaitGroup
-	mu       sync.Mutex
-	queued   map[string]struct{}
-	failed   map[string]time.Time
-	scanning map[string]struct{}
-	stopped  bool
+	vaultDir    string
+	sessions    *session.Store
+	port        string
+	jobs        chan thumbJob
+	ffmpeg      ffmpegConfig
+	wg          sync.WaitGroup
+	scanWg      sync.WaitGroup
+	mu          sync.Mutex
+	commitMu    sync.Mutex
+	queued      map[string]struct{}
+	failed      map[string]time.Time
+	scanning    map[string]struct{}
+	generations map[string]uint64
+	stopped     bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	stopOnce    sync.Once
 }
 
 type ffmpegConfig struct {
@@ -118,15 +136,19 @@ func NewGenerator(vaultDir string, sessions *session.Store, port string) *Genera
 		log.Printf("thumbnail: active backend order: %s", formatFFmpegAttempts(cfg.attempts))
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	g := &Generator{
-		vaultDir: vaultDir,
-		sessions: sessions,
-		port:     port,
-		jobs:     make(chan thumbJob, queueSize),
-		ffmpeg:   cfg,
-		queued:   make(map[string]struct{}),
-		failed:   make(map[string]time.Time),
-		scanning: make(map[string]struct{}),
+		vaultDir:    vaultDir,
+		sessions:    sessions,
+		port:        port,
+		jobs:        make(chan thumbJob, queueSize),
+		ffmpeg:      cfg,
+		queued:      make(map[string]struct{}),
+		failed:      make(map[string]time.Time),
+		scanning:    make(map[string]struct{}),
+		generations: make(map[string]uint64),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 	g.wg.Add(1)
 	go g.worker()
@@ -167,7 +189,11 @@ func buildFFmpegAttempts(cfg ffmpegConfig) []ffmpegAttempt {
 }
 
 func detectFFmpegHwaccels(bin string) map[string]bool {
-	out, err := exec.Command(bin, "-hide_banner", "-hwaccels").CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), detectTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-hide_banner", "-hwaccels")
+	procgroup.Configure(cmd)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return map[string]bool{}
 	}
@@ -215,9 +241,18 @@ func probeFFmpegAttempts(bin string, attempts []ffmpegAttempt) []ffmpegAttempt {
 }
 
 func canUseFFmpegAttempt(bin string, attempt ffmpegAttempt) bool {
-	probePath := "/tmp/cryp-ffmpeg-probe.mp4"
+	probeFile, err := os.CreateTemp("", "cryp-ffmpeg-probe-*.mp4")
+	if err != nil {
+		return false
+	}
+	probePath := probeFile.Name()
+	probeFile.Close()
 	defer os.Remove(probePath)
-	createCmd := exec.Command(
+
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	createCmd := exec.CommandContext(
+		ctx,
 		bin,
 		"-hide_banner",
 		"-loglevel", "error",
@@ -227,6 +262,7 @@ func canUseFFmpegAttempt(bin string, attempt ffmpegAttempt) bool {
 		"-c:v", "h264",
 		"-y", probePath,
 	)
+	procgroup.Configure(createCmd)
 	if out, err := createCmd.CombinedOutput(); err != nil {
 		_ = out
 		return false
@@ -237,7 +273,8 @@ func canUseFFmpegAttempt(bin string, attempt ffmpegAttempt) bool {
 	probeArgs = appendAttemptHwArgs(probeArgs, attempt)
 	probeArgs = append(probeArgs, "-i", probePath, "-frames:v", "1", "-f", "null", "-")
 
-	runCmd := exec.Command(bin, probeArgs...)
+	runCmd := exec.CommandContext(ctx, bin, probeArgs...)
+	procgroup.Configure(runCmd)
 	out, err := runCmd.CombinedOutput()
 	if err != nil {
 		_ = out
@@ -252,14 +289,35 @@ func appendAttemptHwArgs(args []string, attempt ffmpegAttempt) []string {
 	}
 	args = append(args, "-hwaccel", attempt.hwaccel)
 	if attempt.hwaccel == "vaapi" {
-		if _, err := os.Stat("/dev/dri/renderD128"); err == nil {
-			args = append(args, "-hwaccel_device", "/dev/dri/renderD128")
+		if device := findVAAPIDevice(); device != "" {
+			args = append(args, "-hwaccel_device", device)
 		}
 	}
 	if attempt.hwaccelOutputFormat != "" {
 		args = append(args, "-hwaccel_output_format", attempt.hwaccelOutputFormat)
 	}
 	return args
+}
+
+func findVAAPIDevice() string {
+	devices, err := filepath.Glob("/dev/dri/renderD*")
+	if err != nil || len(devices) == 0 {
+		return ""
+	}
+	sort.Strings(devices)
+	for _, device := range devices {
+		info, statErr := os.Stat(device)
+		if statErr != nil || info.Mode()&os.ModeCharDevice == 0 {
+			continue
+		}
+		fd, openErr := os.OpenFile(device, os.O_RDWR, 0)
+		if openErr != nil {
+			continue
+		}
+		_ = fd.Close()
+		return device
+	}
+	return ""
 }
 
 func formatFFmpegAttempts(attempts []ffmpegAttempt) string {
@@ -279,12 +337,21 @@ func formatFFmpegAttempts(attempts []ffmpegAttempt) string {
 
 // Stop gracefully shuts down the generator
 func (g *Generator) Stop() {
-	g.mu.Lock()
-	g.stopped = true
-	g.mu.Unlock()
-	g.scanWg.Wait()
-	close(g.jobs)
-	g.wg.Wait()
+	g.stopOnce.Do(func() {
+		g.mu.Lock()
+		g.stopped = true
+		g.mu.Unlock()
+		if g.cancel != nil {
+			g.cancel()
+		}
+		g.scanWg.Wait()
+		if g.jobs != nil {
+			g.mu.Lock()
+			close(g.jobs)
+			g.mu.Unlock()
+		}
+		g.wg.Wait()
+	})
 }
 
 // Enqueue adds a thumbnail generation job to the queue.
@@ -293,6 +360,16 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 	if g.HasThumbnail(vaultID, virtualPath) {
 		return
 	}
+	// Jobs outlive the request/session that enqueued them. Keep an owned copy
+	// so session expiry or logout cannot zero the key slices while the worker is
+	// still decrypting a queued file.
+	keysCopy := keys.Clone()
+	transferred := false
+	defer func() {
+		if !transferred {
+			zeroVaultKeys(keysCopy)
+		}
+	}()
 
 	key := thumbJobKey(vaultID, virtualPath)
 	now := time.Now()
@@ -314,22 +391,23 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 		delete(g.failed, key)
 	}
 	g.queued[key] = struct{}{}
-	g.mu.Unlock()
-
 	job := thumbJob{
-		VaultID:   vaultID,
-		VaultPath: vaultPath,
-		Keys:      keys,
-		FilePath:  virtualPath,
+		VaultID:    vaultID,
+		VaultPath:  vaultPath,
+		Keys:       keysCopy,
+		FilePath:   virtualPath,
+		generation: g.generations[key],
 	}
+	// Keep the non-blocking send under the same lock used by Stop. This closes
+	// the send/close race that otherwise could panic during server shutdown.
 	select {
 	case g.jobs <- job:
+		transferred = true
 	default:
-		g.mu.Lock()
 		delete(g.queued, key)
-		g.mu.Unlock()
-		// Queue full, skip this thumbnail.
+		log.Printf("thumbnail: queue full, dropping %s", virtualPath)
 	}
+	g.mu.Unlock()
 }
 
 func (g *Generator) pruneFailedLocked(now time.Time) {
@@ -363,11 +441,20 @@ func (g *Generator) HasThumbnail(vaultID, virtualPath string) bool {
 // DeleteThumbnail removes a cached thumbnail for a file if it exists.
 func (g *Generator) DeleteThumbnail(vaultID, virtualPath string) {
 	p := g.thumbPath(vaultID, virtualPath)
-	os.Remove(p) // ignore error if not exists
 	key := thumbJobKey(vaultID, virtualPath)
+	g.commitMu.Lock()
+	defer g.commitMu.Unlock()
 	g.mu.Lock()
+	// Invalidate any in-flight job as well as the cached file. The generation
+	// check prevents an older FFmpeg result from being committed after a file
+	// at the same virtual path is replaced.
+	if g.generations == nil {
+		g.generations = make(map[string]uint64)
+	}
+	g.generations[key]++
 	delete(g.queued, key)
 	delete(g.failed, key)
+	os.Remove(p) // ignore error if not exists
 	g.mu.Unlock()
 }
 
@@ -390,30 +477,55 @@ func thumbJobKey(vaultID, virtualPath string) string {
 func (g *Generator) worker() {
 	defer g.wg.Done()
 	for job := range g.jobs {
-		key := thumbJobKey(job.VaultID, job.FilePath)
-		finish := func(err error) {
-			g.mu.Lock()
-			defer g.mu.Unlock()
-			delete(g.queued, key)
-			if err != nil {
-				g.failed[key] = time.Now().Add(failCooldown)
-				return
-			}
-			delete(g.failed, key)
-		}
-
 		// Skip if already exists
 		if g.HasThumbnail(job.VaultID, job.FilePath) {
-			finish(nil)
+			g.finishJob(job, nil)
 			continue
 		}
 		if err := g.generate(job); err != nil {
-			finish(err)
-			log.Printf("thumbnail: failed to generate for %s: %v", job.FilePath, err)
+			g.finishJob(job, err)
+			if !errors.Is(err, errThumbnailStale) && !errors.Is(err, errThumbnailSkipped) {
+				log.Printf("thumbnail: failed to generate for %s: %v", job.FilePath, err)
+			}
 			continue
 		}
-		finish(nil)
+		g.finishJob(job, nil)
 	}
+}
+
+func (g *Generator) finishJob(job thumbJob, err error) {
+	defer zeroVaultKeys(job.Keys)
+	key := thumbJobKey(job.VaultID, job.FilePath)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// A replacement may have queued a newer generation for the same path while
+	// this job was running. Do not let the old job clear the newer job's queue
+	// marker or failure cooldown.
+	currentGeneration := g.generations[key]
+	isCurrent := currentGeneration == job.generation
+	if isCurrent {
+		delete(g.queued, key)
+	}
+	if errors.Is(err, errThumbnailStale) {
+		if isCurrent {
+			delete(g.failed, key)
+		}
+		return
+	}
+	if errors.Is(err, errThumbnailSkipped) {
+		if isCurrent {
+			g.failed[key] = time.Now().Add(failCooldown)
+		}
+		return
+	}
+	if !isCurrent {
+		return
+	}
+	if err != nil {
+		g.failed[key] = time.Now().Add(failCooldown)
+		return
+	}
+	delete(g.failed, key)
 }
 
 // generate creates a thumbnail by having FFmpeg fetch the video via the local
@@ -421,6 +533,19 @@ func (g *Generator) worker() {
 // the moov atom (even at end of file) and extract a frame — all without any
 // plaintext ever touching disk.
 func (g *Generator) generate(job thumbJob) error {
+	baseCtx := g.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	if err := baseCtx.Err(); err != nil {
+		return err
+	}
+	if !g.thumbnailJobCurrent(job) {
+		return errThumbnailStale
+	}
+	jobCtx, jobCancel := context.WithTimeout(baseCtx, thumbnailJobTimeout)
+	defer jobCancel()
+	baseCtx = jobCtx
 	vault := &crypto.Vault{
 		ID:   job.VaultID,
 		Path: job.VaultPath,
@@ -428,18 +553,22 @@ func (g *Generator) generate(job thumbJob) error {
 	}
 	if encPath, err := vault.ResolveExistingFilePath(job.FilePath); err == nil {
 		if info, statErr := os.Stat(encPath); statErr == nil && crypto.CipherSize2PlaintextSize(info.Size()) == 0 {
-			return nil
+			return errThumbnailSkipped
 		}
 	}
 
 	if IsHEIF(job.FilePath) {
-		return g.generateHEIF(job)
+		return g.generateHEIFWithContext(job, baseCtx)
 	}
 
 	keysCopy := job.Keys.Clone()
+	if keysCopy == nil {
+		return errors.New("missing thumbnail keys")
+	}
 
 	// Create a short-lived internal session so FFmpeg can authenticate
 	sessionID, err := g.sessions.Create(job.VaultID, job.VaultPath, keysCopy)
+	zeroVaultKeys(keysCopy)
 	if err != nil {
 		return fmt.Errorf("create temp session: %w", err)
 	}
@@ -455,13 +584,29 @@ func (g *Generator) generate(job thumbJob) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
-	thumbTmp := outPath + ".tmp"
+	tmpFile, err := os.CreateTemp(filepath.Dir(outPath), ".thumb-*.jpg")
+	if err != nil {
+		return fmt.Errorf("create thumbnail temp: %w", err)
+	}
+	thumbTmp := tmpFile.Name()
+	tmpFile.Close()
 	defer os.Remove(thumbTmp)
 
 	var lastErr error
 	for _, attempt := range g.ffmpeg.attempts {
+		if err := baseCtx.Err(); err != nil {
+			return err
+		}
 		ffmpegArgs := make([]string, 0, 24)
 		ffmpegArgs = appendAttemptHwArgs(ffmpegArgs, attempt)
+
+		videoFilter := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black",
+			thumbWidth, thumbHeight, thumbWidth, thumbHeight)
+		if attempt.hwaccel != "" && attempt.hwaccelOutputFormat != "" {
+			// Hardware decoders return device surfaces; thumbnails are software
+			// JPEGs, so explicitly download frames before scale/pad.
+			videoFilter = "hwdownload,format=nv12," + videoFilter
+		}
 
 		ffmpegArgs = append(ffmpegArgs,
 			"-probesize", "100M",
@@ -473,18 +618,26 @@ func (g *Generator) generate(job thumbJob) error {
 			// Extract a single frame
 			"-frames:v", "1",
 			// Scale to thumbnail size with padding to maintain aspect ratio
-			"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black",
-				thumbWidth, thumbHeight, thumbWidth, thumbHeight),
+			"-vf", videoFilter,
 			"-q:v", "5",
 			"-f", "image2",
 			"-y", thumbTmp,
 		)
 
 		var stderrBuf bytes.Buffer
-		cmd := exec.Command(g.ffmpeg.bin, ffmpegArgs...)
+		cmdCtx, cancel := context.WithTimeout(baseCtx, ffmpegTimeout)
+		cmd := exec.CommandContext(cmdCtx, g.ffmpeg.bin, ffmpegArgs...)
+		cmd.WaitDelay = 2 * time.Second
+		procgroup.Configure(cmd)
 		cmd.Stderr = &stderrBuf
 
-		if err := cmd.Run(); err != nil {
+		err := cmd.Run()
+		ctxErr := cmdCtx.Err()
+		cancel()
+		if err != nil {
+			if ctxErr != nil {
+				return ctxErr
+			}
 			errOut := stderrBuf.String()
 			if len(errOut) > 500 {
 				errOut = errOut[len(errOut)-500:]
@@ -493,7 +646,15 @@ func (g *Generator) generate(job thumbJob) error {
 			if attempt.hwaccel != "" {
 				log.Printf("thumbnail: hwaccel=%s failed, fallback next backend: %v", attempt.hwaccel, err)
 			}
-			lastErr = fmt.Errorf("ffmpeg: %w: %s", err, errOut)
+			if ctxErr == context.DeadlineExceeded {
+				lastErr = fmt.Errorf("ffmpeg timeout after %s: %s", ffmpegTimeout, errOut)
+			} else {
+				lastErr = fmt.Errorf("ffmpeg: %w: %s", err, errOut)
+			}
+			continue
+		}
+		if info, statErr := os.Stat(thumbTmp); statErr != nil || info.Size() == 0 {
+			lastErr = fmt.Errorf("ffmpeg produced no thumbnail")
 			continue
 		}
 
@@ -506,7 +667,7 @@ func (g *Generator) generate(job thumbJob) error {
 	}
 
 	// Encrypt the thumbnail JPEG before storing
-	if err := g.encryptFile(thumbTmp, outPath, job.Keys.MasterKey); err != nil {
+	if err := g.encryptThumbnail(job, thumbTmp, outPath); err != nil {
 		return fmt.Errorf("encrypt thumbnail: %w", err)
 	}
 
@@ -514,6 +675,14 @@ func (g *Generator) generate(job thumbJob) error {
 }
 
 func (g *Generator) generateHEIF(job thumbJob) error {
+	baseCtx := g.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	return g.generateHEIFWithContext(job, baseCtx)
+}
+
+func (g *Generator) generateHEIFWithContext(job thumbJob, baseCtx context.Context) error {
 	outPath := g.thumbPath(job.VaultID, job.FilePath)
 	if err := os.MkdirAll(filepath.Dir(outPath), 0700); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
@@ -527,22 +696,44 @@ func (g *Generator) generateHEIF(job thumbJob) error {
 
 	heifPath := filepath.Join(tmpDir, "input"+strings.ToLower(filepath.Ext(job.FilePath)))
 	fullJPEGPath := filepath.Join(tmpDir, "full.jpg")
-	thumbTmp := outPath + ".tmp"
+	tmpFile, err := os.CreateTemp(filepath.Dir(outPath), ".thumb-*.jpg")
+	if err != nil {
+		return fmt.Errorf("create thumbnail temp: %w", err)
+	}
+	thumbTmp := tmpFile.Name()
+	tmpFile.Close()
 	defer os.Remove(thumbTmp)
 
-	if err := g.writeDecryptedFile(job, heifPath); err != nil {
+	if err := g.writeDecryptedFileWithContext(job, heifPath, baseCtx); err != nil {
 		return fmt.Errorf("decrypt heif: %w", err)
+	}
+	if err := baseCtx.Err(); err != nil {
+		return err
 	}
 
 	var heifErr bytes.Buffer
-	convertCmd := exec.Command("heif-convert", heifPath, fullJPEGPath)
+	convertCtx, convertCancel := context.WithTimeout(baseCtx, ffmpegTimeout)
+	convertCmd := exec.CommandContext(convertCtx, "heif-convert", heifPath, fullJPEGPath)
+	convertCmd.WaitDelay = 2 * time.Second
+	procgroup.Configure(convertCmd)
 	convertCmd.Stderr = &heifErr
-	if err := convertCmd.Run(); err != nil {
+	convertErr := convertCmd.Run()
+	convertCtxErr := convertCtx.Err()
+	convertCancel()
+	if convertErr != nil {
+		if convertCtxErr != nil {
+			return convertCtxErr
+		}
 		errOut := heifErr.String()
 		if len(errOut) > 500 {
 			errOut = errOut[len(errOut)-500:]
 		}
-		return fmt.Errorf("heif-convert: %w: %s", err, errOut)
+		return fmt.Errorf("heif-convert: %w: %s", convertErr, errOut)
+	}
+	if info, statErr := os.Stat(fullJPEGPath); statErr != nil {
+		return fmt.Errorf("heif-convert produced no image: %w", statErr)
+	} else if info.Size() > maxHEIFBytes {
+		return fmt.Errorf("converted heif exceeds %d-byte limit", maxHEIFBytes)
 	}
 
 	ffmpegArgs := []string{
@@ -556,23 +747,61 @@ func (g *Generator) generateHEIF(job thumbJob) error {
 	}
 
 	var ffmpegErr bytes.Buffer
-	cmd := exec.Command(g.ffmpeg.bin, ffmpegArgs...)
+	ffmpegCtx, ffmpegCancel := context.WithTimeout(baseCtx, ffmpegTimeout)
+	cmd := exec.CommandContext(ffmpegCtx, g.ffmpeg.bin, ffmpegArgs...)
+	cmd.WaitDelay = 2 * time.Second
+	procgroup.Configure(cmd)
 	cmd.Stderr = &ffmpegErr
-	if err := cmd.Run(); err != nil {
+	ffmpegRunErr := cmd.Run()
+	ffmpegCtxErr := ffmpegCtx.Err()
+	ffmpegCancel()
+	if ffmpegRunErr != nil {
+		if ffmpegCtxErr != nil {
+			return ffmpegCtxErr
+		}
 		errOut := ffmpegErr.String()
 		if len(errOut) > 500 {
 			errOut = errOut[len(errOut)-500:]
 		}
-		return fmt.Errorf("ffmpeg scale heif: %w: %s", err, errOut)
+		return fmt.Errorf("ffmpeg scale heif: %w: %s", ffmpegRunErr, errOut)
 	}
 
-	if err := g.encryptFile(thumbTmp, outPath, job.Keys.MasterKey); err != nil {
+	if err := g.encryptThumbnail(job, thumbTmp, outPath); err != nil {
 		return fmt.Errorf("encrypt thumbnail: %w", err)
 	}
 	return nil
 }
 
+func (g *Generator) thumbnailJobCurrent(job thumbJob) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.generations[thumbJobKey(job.VaultID, job.FilePath)] == job.generation
+}
+
+func (g *Generator) encryptThumbnail(job thumbJob, srcPath, outPath string) error {
+	// Serialize the final commit with DeleteThumbnail. This closes the
+	// check/rename window where an upload could invalidate a job just after it
+	// checked its generation, without holding the state mutex during disk I/O.
+	g.commitMu.Lock()
+	defer g.commitMu.Unlock()
+	g.mu.Lock()
+	current := g.generations[thumbJobKey(job.VaultID, job.FilePath)] == job.generation
+	g.mu.Unlock()
+	if !current {
+		return errThumbnailStale
+	}
+	return g.encryptFile(srcPath, outPath, job.Keys.MasterKey)
+}
+
 func (g *Generator) writeDecryptedFile(job thumbJob, outPath string) error {
+	ctx := g.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return g.writeDecryptedFileWithContext(job, outPath, ctx)
+}
+
+func (g *Generator) writeDecryptedFileWithContext(job thumbJob, outPath string, ctx context.Context) error {
 	vault := &crypto.Vault{
 		ID:   job.VaultID,
 		Path: job.VaultPath,
@@ -588,6 +817,11 @@ func (g *Generator) writeDecryptedFile(job thumbJob, outPath string) error {
 		return err
 	}
 	defer in.Close()
+	if info, statErr := in.Stat(); statErr == nil {
+		if plaintextSize := crypto.CipherSize2PlaintextSize(info.Size()); plaintextSize > maxHEIFBytes {
+			return fmt.Errorf("heif input exceeds %d-byte limit", maxHEIFBytes)
+		}
+	}
 
 	header, err := crypto.ReadFileHeader(in, job.Keys.MasterKey)
 	if err != nil {
@@ -607,8 +841,29 @@ func (g *Generator) writeDecryptedFile(job thumbJob, outPath string) error {
 
 	bufp := crypto.CopyBufPool.Get().(*[]byte)
 	defer crypto.CopyBufPool.Put(bufp)
-	if _, err := io.CopyBuffer(out, reader, *bufp); err != nil {
-		return err
+	var written int64
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		n, readErr := reader.Read(*bufp)
+		if n > 0 {
+			written += int64(n)
+			if written > maxHEIFBytes {
+				return fmt.Errorf("heif input exceeds %d-byte limit", maxHEIFBytes)
+			}
+			if _, writeErr := out.Write((*bufp)[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
 	}
 	if err := out.Sync(); err != nil {
 		return err
@@ -638,6 +893,7 @@ func (g *Generator) ScanVault(vaultID, vaultPath string, keys *crypto.VaultKeys)
 	keysCopy := keys.Clone()
 	go func() {
 		defer func() {
+			zeroVaultKeys(keysCopy)
 			g.mu.Lock()
 			delete(g.scanning, vaultID)
 			g.mu.Unlock()
@@ -653,12 +909,18 @@ func (g *Generator) ScanVault(vaultID, vaultPath string, keys *crypto.VaultKeys)
 }
 
 func (g *Generator) scanDir(vault *crypto.Vault, dirPath string) {
+	if g.contextErr() != nil {
+		return
+	}
 	files, err := vault.ListDirectory(dirPath)
 	if err != nil {
 		return
 	}
 
 	for _, f := range files {
+		if g.contextErr() != nil {
+			return
+		}
 		fullPath := dirPath
 		if fullPath == "/" {
 			fullPath = "/" + f.Name
@@ -674,6 +936,25 @@ func (g *Generator) scanDir(vault *crypto.Vault, dirPath string) {
 	}
 }
 
+func (g *Generator) contextErr() error {
+	if g.ctx == nil {
+		return nil
+	}
+	return g.ctx.Err()
+}
+
+func zeroVaultKeys(keys *crypto.VaultKeys) {
+	if keys == nil {
+		return
+	}
+	for i := range keys.MasterKey {
+		keys.MasterKey[i] = 0
+	}
+	for i := range keys.MACKey {
+		keys.MACKey[i] = 0
+	}
+}
+
 // encryptFile reads a plaintext file, encrypts it using the same format as vault
 // content files (header + AES-256-GCM chunks), and writes the result to outPath.
 func (g *Generator) encryptFile(srcPath, outPath string, masterKey []byte) error {
@@ -683,47 +964,49 @@ func (g *Generator) encryptFile(srcPath, outPath string, masterKey []byte) error
 	}
 	defer src.Close()
 
-	out, err := os.Create(outPath)
+	tmpFile, err := os.CreateTemp(filepath.Dir(outPath), ".thumb-encrypt-*")
 	if err != nil {
 		return err
 	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	out := tmpFile
 	defer out.Close()
 
 	contentKey := make([]byte, crypto.MasterKeySize)
 	if _, err := rand.Read(contentKey); err != nil {
-		os.Remove(outPath)
 		return err
 	}
 
 	header, err := crypto.WriteFileHeader(out, masterKey, contentKey)
 	if err != nil {
-		os.Remove(outPath)
 		return err
 	}
 
 	writer, err := crypto.NewEncryptingWriter(out, header.ContentKey, header.Nonce)
 	if err != nil {
-		os.Remove(outPath)
 		return err
 	}
 
 	if _, err := crypto.CopyWithCacheDrop(writer, src, out); err != nil {
-		os.Remove(outPath)
 		return err
 	}
 
 	if err := writer.Close(); err != nil {
-		os.Remove(outPath)
 		return err
 	}
 
 	if err := out.Sync(); err != nil {
-		os.Remove(outPath)
 		return err
 	}
-
 	crypto.DropFileCache(src)
 	crypto.DropFileCache(out)
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		return err
+	}
 
 	return nil
 }

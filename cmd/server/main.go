@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"io/fs"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"cryp/internal/api"
 	"cryp/internal/session"
@@ -41,6 +47,7 @@ func main() {
 
 	// Initialize session store
 	sessions := session.NewStore()
+	defer sessions.Close()
 
 	// Initialize task manager
 	tasks := task.NewManager(db)
@@ -65,14 +72,54 @@ func main() {
 
 	// Setup API server
 	gin.SetMode(gin.ReleaseMode)
-	server := api.NewServer(db, sessions, tasks, thumbs, *vaultDir, staticFS)
+	server := api.NewServerWithPort(db, sessions, tasks, thumbs, *vaultDir, *port, staticFS)
 	router := server.SetupRouter()
 
 	log.Printf("Cryp server starting on :%s", *port)
 	log.Printf("  Data dir: %s", *dataDir)
 	log.Printf("  Vault dir: %s", *vaultDir)
 
-	if err := router.Run(":" + *port); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	httpServer := &http.Server{
+		Addr:    ":" + *port,
+		Handler: router,
+	}
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- httpServer.ListenAndServe()
+	}()
+
+	// Stop accepting requests and cancel every HLS process on a normal
+	// container/OS shutdown. HLS FFmpeg commands run in independent process
+	// groups, so merely returning from main would otherwise orphan them and
+	// leave GPU work and temporary files behind.
+	shutdown := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		hlsDone := make(chan error, 1)
+		go func() { hlsDone <- server.Shutdown(ctx) }()
+		if err := httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP graceful shutdown failed: %v", err)
+			// Force-close connections that ignored the bounded graceful window;
+			// otherwise an upload/long response could keep the process alive
+			// while dependent resources are being torn down.
+			_ = httpServer.Close()
+		}
+		if err := <-hlsDone; err != nil {
+			log.Printf("HLS graceful shutdown incomplete: %v", err)
+		}
+	}
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	select {
+	case sig := <-signals:
+		log.Printf("Received %s, shutting down", sig)
+		shutdown()
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("Failed to serve HTTP: %v", err)
+			shutdown()
+		}
 	}
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 	"os"
 
@@ -85,7 +86,22 @@ func (s *Server) handleLogout(c *gin.Context) {
 	}
 
 	if sessionID != "" {
-		s.sessions.Delete(sessionID)
+		if sess, ok := s.sessions.Get(sessionID); ok {
+			// Serialize logout with HLS starts and destructive replacements. This
+			// closes the window where a new stream could be registered after the
+			// owner stop but before its internal auth session is deleted.
+			s.hlsLifeMu.Lock()
+			// Logout is a common page teardown path. Stop streams owned by this
+			// session before deleting its credentials so FFmpeg does not linger
+			// until the idle timeout.
+			if !s.stopHLSForOwner(sess.VaultID, sessionID) {
+				log.Printf("hls: logout requested while stream cleanup is still pending for session %s", sessionID)
+			}
+			s.sessions.Delete(sessionID)
+			s.hlsLifeMu.Unlock()
+		} else {
+			s.sessions.Delete(sessionID)
+		}
 	}
 
 	c.SetSameSite(http.SameSiteStrictMode)
@@ -214,6 +230,21 @@ func (s *Server) handleDeleteVault(c *gin.Context) {
 	vault, err := s.db.GetVault(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "vault not found"})
+		return
+	}
+
+	// Prevent new HLS starts while streams are stopped and the vault is
+	// removed. Otherwise a start racing this handler could recreate a reader
+	// between cleanup and deletion.
+	s.hlsLifeMu.Lock()
+	defer s.hlsLifeMu.Unlock()
+
+	// Stop any HLS/FFmpeg work before deleting the vault or its keys. Otherwise
+	// a background transcode can keep reading a vault that is being removed and
+	// hold GPU/file resources until an eventual authentication failure.
+	if !s.stopHLSForVault(id) {
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "active video streams are still stopping; retry vault deletion"})
 		return
 	}
 

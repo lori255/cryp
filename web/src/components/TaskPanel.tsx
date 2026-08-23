@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useCallback, useState, useEffect, useRef } from 'react'
 import { api, type TaskRecord, formatSize, formatETA } from '../lib/api'
 import { X, FolderInput, Upload, Trash2, XCircle, ListTodo, Loader2, ScanSearch } from 'lucide-react'
 
@@ -20,19 +20,22 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
   const [actionError, setActionError] = useState<TaskActionError | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const prevTasksRef = useRef<TaskRecord[]>([])
+  const pollAbortRef = useRef<AbortController | null>(null)
+  const pollRequestIdRef = useRef(0)
+  const cancelPolling = useCallback(() => {
+    pollRequestIdRef.current += 1
+    pollAbortRef.current?.abort()
+    pollAbortRef.current = null
+  }, [])
 
-  useEffect(() => {
-    if (!open) return
-    loadTasks()
-    intervalRef.current = setInterval(loadTasks, 2000)
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current)
-    }
-  }, [open, vaultId])
-
-  async function loadTasks() {
+  const loadTasks = useCallback(async () => {
+    if (pollAbortRef.current) return
+    const requestId = ++pollRequestIdRef.current
+    const controller = new AbortController()
+    pollAbortRef.current = controller
     try {
-      const data = await api.listTasks(vaultId)
+      const data = await api.listTasks(vaultId, controller.signal)
+      if (requestId !== pollRequestIdRef.current) return
       const newTasks = data.tasks || []
       
       const prevTasks = prevTasksRef.current
@@ -51,11 +54,25 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
       prevTasksRef.current = newTasks
       setTasks(newTasks)
     } catch {
+      if (controller.signal.aborted || requestId !== pollRequestIdRef.current) return
       setActionError({ message: '任务列表加载失败' })
     } finally {
-      setLoading(false)
+      if (requestId === pollRequestIdRef.current) {
+        pollAbortRef.current = null
+        setLoading(false)
+      }
     }
-  }
+  }, [vaultId, onRefresh])
+
+  useEffect(() => {
+    if (!open) return
+    void loadTasks()
+    intervalRef.current = setInterval(() => void loadTasks(), 2000)
+    return () => {
+      cancelPolling()
+      if (intervalRef.current) clearInterval(intervalRef.current)
+    }
+  }, [open, loadTasks, cancelPolling])
 
   async function handleCancel(taskId: string) {
     setActionError(null)

@@ -126,7 +126,13 @@ class ApiClient {
   async listFiles(
     vaultId: string,
     path: string,
-    options?: { offset?: number; limit?: number; sortField?: 'name' | 'modTime' | 'size'; sortDirection?: 'asc' | 'desc' },
+    options?: {
+      offset?: number
+      limit?: number
+      sortField?: 'name' | 'modTime' | 'size'
+      sortDirection?: 'asc' | 'desc'
+      signal?: AbortSignal
+    },
   ) {
     const offset = options?.offset ?? 0;
     const limit = options?.limit ?? 100;
@@ -134,6 +140,7 @@ class ApiClient {
     const sortDirection = options?.sortDirection ?? 'asc';
     return this.request<{ path: string; files: FileItem[]; hasMore: boolean; nextOffset: number; indexRequired?: boolean }>(
       `/vaults/${vaultId}/files?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}&sortField=${sortField}&sortDirection=${sortDirection}`,
+      { signal: options?.signal },
     );
   }
 
@@ -146,20 +153,26 @@ class ApiClient {
   }
 
   getVideoUrl(vaultId: string, path: string): string {
-    return this.getHlsUrl(vaultId, path);
+    // Let browsers play codecs they support directly. VideoPlayer promotes
+    // an incompatible/failed content response to HLS, which avoids spawning
+    // FFmpeg for every ordinary MP4 and reduces pressure on the HLS pool.
+    return this.getContentUrl(vaultId, path);
   }
 
   stopHls(url: string): void {
     const endpoint = this.getHlsStopUrl(url);
     if (!endpoint) return;
 
-    if (navigator.sendBeacon?.(endpoint)) {
-      return;
-    }
-
     const headers: Record<string, string> = {};
     if (this.sessionId) {
       headers['X-Session-ID'] = this.sessionId;
+    }
+
+    // Beacon cannot carry X-Session-ID. Prefer keepalive fetch whenever the
+    // client relies on localStorage auth; otherwise use Beacon for its unload
+    // reliability and let the HttpOnly cookie authenticate it.
+    if (!this.sessionId && navigator.sendBeacon?.(endpoint)) {
+      return;
     }
     void fetch(endpoint, {
       method: 'POST',
@@ -170,7 +183,12 @@ class ApiClient {
   }
 
   private getHlsStopUrl(url: string): string | null {
-    const parsed = new URL(url, window.location.origin);
+    let parsed: URL;
+    try {
+      parsed = new URL(url, window.location.origin);
+    } catch {
+      return null;
+    }
     const path = parsed.pathname;
     if (path.includes('/files/hls/') && path.endsWith('/index.m3u8')) {
       parsed.pathname = path.replace(/\/index\.m3u8$/, '/stop');
@@ -275,8 +293,8 @@ class ApiClient {
   }
 
   // Tasks
-  async listTasks(vaultId: string) {
-    return this.request<{ tasks: TaskRecord[] }>(`/vaults/${vaultId}/tasks`);
+  async listTasks(vaultId: string, signal?: AbortSignal) {
+    return this.request<{ tasks: TaskRecord[] }>(`/vaults/${vaultId}/tasks`, { signal });
   }
 
   async getTask(vaultId: string, taskId: string) {

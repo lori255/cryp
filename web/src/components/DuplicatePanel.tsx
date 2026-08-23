@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { PhotoProvider, PhotoView } from 'react-photo-view'
 import { X, CopyMinus, Loader2, RefreshCw, Trash2, ScanSearch, Image as ImageIcon, Film, File as FileIcon, ShieldCheck, ChevronDown, ChevronRight } from 'lucide-react'
 import VideoPlayer from './VideoPlayer'
@@ -61,12 +61,7 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
   const [nextOffset, setNextOffset] = useState(0)
   const [activeVideo, setActiveVideo] = useState<{ url: string; title: string } | null>(null)
 
-  useEffect(() => {
-    if (!open) return
-    void loadGroups()
-  }, [open, vaultId])
-
-  async function loadGroups() {
+  const loadGroups = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
@@ -92,7 +87,12 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
     } finally {
       setLoading(false)
     }
-  }
+  }, [vaultId])
+
+  useEffect(() => {
+    if (!open) return
+    void loadGroups()
+  }, [open, loadGroups])
 
   async function loadMoreGroups() {
     if (loadingMore || loading || !hasMore) return
