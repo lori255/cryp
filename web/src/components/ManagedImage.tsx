@@ -9,20 +9,28 @@ import { useEffect, useRef, type ImgHTMLAttributes } from 'react'
  */
 export default function ManagedImage({ src, loading = 'lazy', ...props }: ImgHTMLAttributes<HTMLImageElement>) {
   const imageRef = useRef<HTMLImageElement | null>(null)
+  const resolvedSrc = src ?? ''
 
   useEffect(() => {
     const image = imageRef.current
     if (!image) return
 
+    // React StrictMode may replay an effect without replaying the DOM prop.
+    // Restore the source after a development-only cleanup so the replay does
+    // not leave a mounted image blank.
+    if (image.getAttribute('src') !== resolvedSrc) {
+      image.setAttribute('src', resolvedSrc)
+    }
+
     return () => {
       // React may already have committed a newer source before this passive
       // cleanup runs. Only clear the source this effect owns in that case.
       const currentSource = image.getAttribute('src')
-      if (currentSource === src || image.src === src) {
+      if (currentSource === resolvedSrc || image.src === resolvedSrc) {
         image.removeAttribute('src')
       }
     }
-  }, [src])
+  }, [resolvedSrc])
 
-  return <img ref={imageRef} src={src} loading={loading} {...props} />
+  return <img ref={imageRef} src={resolvedSrc} loading={loading} {...props} />
 }
