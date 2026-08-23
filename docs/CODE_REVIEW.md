@@ -254,3 +254,17 @@
 | PR-05 | P1 | 若在当前 master 上直接解决冲突，容易用旧版 `generateHEIF` 覆盖已有 context 取消、进程组回收、generation 和 512 MiB 限制，反而回退此前修复。 | `internal/thumbnail/thumbnail.go:999-1118` | 集成要求：只手工移植 PNG/Lanczos/质量参数，保留现有生命周期保护。 |
 
 结论：PR 的图像质量方向合理，外部工具参数未发现直接兼容性阻断；但应先处理 PR-01/PR-02，并以当前 master 为基线手工移植后再考虑合并。当前未对 PR 分支或业务代码做修改，也未向 PR 发布评论。
+
+## 14. 媒体预览请求生命周期复核（2026-08-23）
+
+针对“打开包含大量图片/视频的目录后立即返回，媒体仍在后台加载”的路径，沿 React 挂载、视口观察、原生图片请求、HEIF 缩略图轮询和 WASM 解码重新核查。该问题与目录 API 请求无关：`FileBrowser` 已取消目录请求，残留负载来自条目组件自己的媒体任务。
+
+| 编号 | 级别 | 问题与影响 | 关键位置 | 计划 |
+| --- | --- | --- | --- | --- |
+| R-06 | P1 | `useImagePreviewSrc` 对每个条目立即执行 HEIF 缩略图请求/404 重试，必要时下载原图并启动 libheif WASM；没有等待条目进入视口。大目录会并发产生网络、CPU 和内存负载，离开目录后已开始的 WASM 解码仍无法中断。 | `web/src/lib/useImagePreviewSrc.ts:101-251`; `web/src/components/FileGridItem.tsx:22-26`; `web/src/components/FileListItem.tsx:15-17` | 增加可见性门控和 `enabled` 生命周期；离开视口/卸载时取消 fetch、回收对象 URL，并避免列表中不可见图片启动转换。 |
+| R-07 | P1 | 视频缩略图直接渲染 `<img>`，没有 `loading="lazy"` 或卸载清空 `src`；一个目录中的全部视频可同时发起缩略图请求，返回目录后仍可能继续下载/解码。 | `web/src/components/FileGridItem.tsx:7-11,110-118`; `web/src/components/DuplicatePanel.tsx:506-514` | 统一托管图片元素的请求生命周期，默认懒加载并在 URL 变化/卸载时清空源。 |
+| R-08 | P2 | HEIF fallback 的 `new Image()` probe 在 cleanup 时只设置取消标志，没有清空 `probe.src` 或移除回调；浏览器原生下载因此不能尽力停止。 | `web/src/lib/useImagePreviewSrc.ts:182-200` | cleanup 中解除回调并清空 probe 源，保留 AbortController 和对象 URL 回收。 |
+| R-09 | P2 | 列表项、目录项及非图片条目也无条件调用预览 Hook；列表行并不渲染缩略图，却仍可能触发 HEIF 处理，造成无意义工作并放大快速导航竞态。 | `web/src/components/FileListItem.tsx:15-17`; `web/src/components/FileGridItem.tsx:22-26`; `web/src/components/DuplicatePanel.tsx:408-414` | Hook 保持无条件调用以遵守 Rules of Hooks，但通过 `enabled` 关闭非图片任务，并让图片容器承担可见性观察。 |
+| R-10 | P2 | 普通原生 `<img>` 没有统一的卸载/源切换清理策略；`loading="lazy"` 只能延迟请求，不能取消已开始的下载或解码。 | `web/src/components/FileGridItem.tsx:86-95`; `web/src/components/DuplicatePanel.tsx:500-503` | 引入可复用的 managed image 元素，显式清空旧源，减少离开目录后的残留请求。 |
+
+验收重点：大目录网格和列表模式快速进入/返回、快速滚动、HEIC 无缩略图 fallback、视频缩略图、重复文件面板多组展开，以及 iOS/桌面浏览器的网络请求取消、对象 URL 数量和 CPU/GPU 活动。`loading="lazy"` 与 `IntersectionObserver` 只负责延迟启动；真正的回收仍必须由 AbortController、`src=''` 和组件卸载清理共同保证。
