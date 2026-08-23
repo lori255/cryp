@@ -358,10 +358,16 @@ export function useImagePreviewSrc(
   }, [contentUrl, fileName, forceConvert, previewKey, shouldLoad, thumbnailUrl])
 
   const onPreviewError = useCallback(() => {
-    if (!enabled || !shouldLoad || isApplePlatform()) return
+    if (!enabled || !shouldLoad) return
+    const isHeif = heifExtRe.test(fileName)
+    if (!isHeif || isApplePlatform() || forceConvert) {
+      setSrc('')
+      setStatus('unavailable')
+      return
+    }
     setStatus('loading')
     setConversionKey(previewKey)
-  }, [enabled, previewKey, shouldLoad])
+  }, [enabled, fileName, forceConvert, previewKey, shouldLoad])
 
   const isCurrentPreview = shouldLoad && resolvedKeyRef.current === previewKey
   return {

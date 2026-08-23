@@ -290,3 +290,5 @@
 | 编号 | 级别 | 问题与影响 | 关键位置 | 计划 |
 | --- | --- | --- | --- | --- |
 | R-11 | P2 | 普通图片加载失败时也会设置 HEIF `conversionKey`；普通图片 effect 随后把状态重新写成 `ready`，错误占位无法稳定显示。Apple 平台 HEIF 加载失败则被静默忽略并长期保持 `ready`，用户无法判断资源不可用。 | `web/src/lib/useImagePreviewSrc.ts:251-263,360-364` | 按格式区分回退：仅非 Apple HEIF 允许进入转换；其它失败清空源并标记 `unavailable`，避免错误状态抖动或假成功。 |
+
+R-11 已修复：`onPreviewError` 现在只允许非 Apple HEIF 进入原图转换；普通图片、Apple HEIF 以及已经转换失败的资源统一清空源并进入 `unavailable`。
