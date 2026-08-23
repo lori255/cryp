@@ -1,23 +1,57 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 const heifExtRe = /\.(heic|heif)$/i
+const defaultRootMargin = '200px'
+
+export type ImagePreviewStatus = 'idle' | 'loading' | 'ready' | 'unavailable'
+
+export interface ImagePreviewOptions {
+  /** Disable all preview work for entries that cannot render a preview. */
+  enabled?: boolean
+  /** Wait until the observed preview container is close to the viewport. */
+  lazy?: boolean
+  /** How far outside the viewport work may be prefetched. */
+  rootMargin?: string
+}
+
+export interface ImagePreviewResult {
+  src: string
+  status: ImagePreviewStatus
+  onPreviewError: () => void
+  previewRef: (node: HTMLElement | null) => void
+}
+
+type DecodedImage = {
+  get_width: () => number
+  get_height: () => number
+  display: (imageData: ImageData, cb: (displayData?: ImageData) => void) => void
+}
 
 type LibheifModule = {
   HeifDecoder: new () => {
-    decode: (data: Uint8Array) => Array<{
-      get_width: () => number
-      get_height: () => number
-      display: (imageData: ImageData, cb: (displayData?: ImageData) => void) => void
-    }>
+    decode: (data: Uint8Array) => DecodedImage[]
   }
 }
 
-async function decodeHeifToJpegBlob(inputBlob: Blob): Promise<Blob> {
+function abortError(): DOMException {
+  return new DOMException('Aborted', 'AbortError')
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw abortError()
+  }
+}
+
+async function decodeHeifToJpegBlob(inputBlob: Blob, signal?: AbortSignal): Promise<Blob> {
+  throwIfAborted(signal)
   const mod = await import('libheif-js/wasm-bundle')
+  throwIfAborted(signal)
   const libheif = (mod.default ?? mod) as unknown as LibheifModule
 
   const decoder = new libheif.HeifDecoder()
   const bytes = new Uint8Array(await inputBlob.arrayBuffer())
+  throwIfAborted(signal)
   const images = decoder.decode(bytes)
   if (!images || images.length === 0) {
     throw new Error('no decodable HEIF image found')
@@ -37,16 +71,35 @@ async function decodeHeifToJpegBlob(inputBlob: Blob): Promise<Blob> {
 
   const imageData = ctx.createImageData(width, height)
   await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      callback()
+    }
+
+    if (signal?.aborted) {
+      finish(() => reject(abortError()))
+      return
+    }
+
+    const onAbort = () => finish(() => reject(abortError()))
+    signal?.addEventListener('abort', onAbort, { once: true })
+
     first.display(imageData, (displayData) => {
-      if (!displayData) {
-        reject(new Error('HEIF decode failed'))
-        return
-      }
-      ctx.putImageData(displayData, 0, 0)
-      resolve()
+      signal?.removeEventListener('abort', onAbort)
+      finish(() => {
+        if (!displayData) {
+          reject(new Error('HEIF decode failed'))
+          return
+        }
+        ctx.putImageData(displayData, 0, 0)
+        resolve()
+      })
     })
   })
 
+  throwIfAborted(signal)
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (!blob) {
@@ -72,25 +125,37 @@ function isApplePlatform(): boolean {
 function wait(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      reject(new DOMException('Aborted', 'AbortError'))
+      reject(abortError())
       return
     }
-    const timer = window.setTimeout(resolve, ms)
-    signal?.addEventListener('abort', () => {
+
+    let settled = false
+    const timer = window.setTimeout(() => {
+      settled = true
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      if (settled) return
+      settled = true
       window.clearTimeout(timer)
-      reject(new DOMException('Aborted', 'AbortError'))
-    }, { once: true })
+      reject(abortError())
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
   })
 }
 
-async function fetchThumbnailBlob(thumbnailUrl: string, shouldCancel: () => boolean, signal?: AbortSignal): Promise<Blob> {
+async function fetchThumbnailBlob(thumbnailUrl: string, signal: AbortSignal): Promise<Blob> {
   const attempts = 12
   for (let i = 0; i < attempts; i++) {
+    throwIfAborted(signal)
     const res = await fetch(thumbnailUrl, { credentials: 'include', signal })
     if (res.ok) {
-      return res.blob()
+      const blob = await res.blob()
+      throwIfAborted(signal)
+      return blob
     }
-    if (res.status !== 404 || i === attempts - 1 || shouldCancel()) {
+    if (res.status !== 404 || i === attempts - 1) {
       throw new Error(`failed to fetch thumbnail: ${res.status}`)
     }
     await wait(800, signal)
@@ -98,53 +163,111 @@ async function fetchThumbnailBlob(thumbnailUrl: string, shouldCancel: () => bool
   throw new Error('thumbnail unavailable')
 }
 
-export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbnailUrl?: string): {
-  src: string
-  status: 'loading' | 'ready' | 'unavailable'
-  onPreviewError: () => void
-} {
-  const [src, setSrc] = useState(contentUrl)
-  const [status, setStatus] = useState<'loading' | 'ready' | 'unavailable'>('ready')
-  const [forceConvert, setForceConvert] = useState(false)
+function revokeObjectUrl(objectUrlRef: { current: string | null }): void {
+  if (!objectUrlRef.current) return
+  URL.revokeObjectURL(objectUrlRef.current)
+  objectUrlRef.current = null
+}
+
+export function useImagePreviewSrc(
+  fileName: string,
+  contentUrl: string,
+  thumbnailUrl?: string,
+  options: ImagePreviewOptions = {},
+): ImagePreviewResult {
+  const enabled = options.enabled ?? true
+  const lazy = options.lazy ?? false
+  const rootMargin = options.rootMargin ?? defaultRootMargin
+  const previewKey = `${fileName}\u0000${contentUrl}\u0000${thumbnailUrl ?? ''}`
+  const [previewNode, setPreviewNode] = useState<HTMLElement | null>(null)
+  const [visibleNode, setVisibleNode] = useState<HTMLElement | null>(null)
+  const [src, setSrc] = useState('')
+  const [status, setStatus] = useState<ImagePreviewStatus>('idle')
+  const [conversionKey, setConversionKey] = useState<string | null>(null)
   const objectUrlRef = useRef<string | null>(null)
+  const resolvedKeyRef = useRef<string | null>(null)
+
+  const previewRef = useCallback((node: HTMLElement | null) => {
+    setPreviewNode(node)
+    if (!node) {
+      setVisibleNode(null)
+    }
+  }, [])
 
   useEffect(() => {
-    const needsFallbackPath = heifExtRe.test(fileName) && !isApplePlatform()
-    setSrc(needsFallbackPath ? '' : contentUrl)
-    setStatus(needsFallbackPath ? 'loading' : 'ready')
-    setForceConvert(false)
+    if (!enabled) {
+      setVisibleNode(null)
+      return
+    }
+    if (!lazy) {
+      setVisibleNode(previewNode)
+      return
+    }
+    if (!previewNode) {
+      setVisibleNode(null)
+      return
+    }
+    if (typeof IntersectionObserver === 'undefined') {
+      setVisibleNode(previewNode)
+      return
+    }
 
-    return
-  }, [fileName, contentUrl])
+    let active = true
+    setVisibleNode(null)
+    const observer = new IntersectionObserver((entries) => {
+      if (!active) return
+      const entry = entries[0]
+      if (!entry) return
+      setVisibleNode(entry.isIntersecting || entry.intersectionRatio > 0 ? previewNode : null)
+    }, { rootMargin, threshold: 0.01 })
+    observer.observe(previewNode)
+    return () => {
+      active = false
+      observer.disconnect()
+    }
+  }, [enabled, lazy, previewNode, rootMargin])
+
+  const shouldLoad = enabled && (!lazy || (previewNode !== null && visibleNode === previewNode))
+  const forceConvert = conversionKey === previewKey
 
   useEffect(() => {
     let cancelled = false
+
+    const cleanup = () => {
+      cancelled = true
+      revokeObjectUrl(objectUrlRef)
+      if (resolvedKeyRef.current === previewKey) {
+        resolvedKeyRef.current = null
+      }
+    }
+
+    if (!shouldLoad) {
+      revokeObjectUrl(objectUrlRef)
+      setSrc('')
+      setStatus('idle')
+      return cleanup
+    }
+
+    resolvedKeyRef.current = previewKey
+    const needsFallbackPath = heifExtRe.test(fileName) && !isApplePlatform()
+    setSrc(needsFallbackPath ? '' : contentUrl)
+    setStatus(needsFallbackPath ? 'loading' : 'ready')
+
     if (!heifExtRe.test(fileName)) {
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(objectUrlRef.current)
-        objectUrlRef.current = null
-      }
-      setStatus('ready')
-      return () => {
-        cancelled = true
-      }
+      revokeObjectUrl(objectUrlRef)
+      return cleanup
     }
 
     if (isApplePlatform()) {
-      setSrc(contentUrl)
-      setStatus('ready')
-      return () => {
-        cancelled = true
-      }
+      return cleanup
     }
 
-    if (thumbnailUrl) {
+    if (thumbnailUrl && !forceConvert) {
       const controller = new AbortController()
       const run = async () => {
         try {
-          setStatus('loading')
-          setSrc('')
-          const outputBlob = await fetchThumbnailBlob(thumbnailUrl, () => cancelled, controller.signal)
+          const outputBlob = await fetchThumbnailBlob(thumbnailUrl, controller.signal)
+          throwIfAborted(controller.signal)
           const objectUrl = URL.createObjectURL(outputBlob)
 
           if (cancelled) {
@@ -152,9 +275,7 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
             return
           }
 
-          if (objectUrlRef.current) {
-            URL.revokeObjectURL(objectUrlRef.current)
-          }
+          revokeObjectUrl(objectUrlRef)
           objectUrlRef.current = objectUrl
           setSrc(objectUrl)
           setStatus('ready')
@@ -168,19 +289,13 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
       }
 
       void run()
-
       return () => {
-        cancelled = true
+        cleanup()
         controller.abort()
-        if (objectUrlRef.current) {
-          URL.revokeObjectURL(objectUrlRef.current)
-          objectUrlRef.current = null
-        }
       }
     }
 
     if (!forceConvert) {
-      setStatus('loading')
       const probe = new Image()
       probe.onload = () => {
         if (!cancelled) {
@@ -190,30 +305,31 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
       }
       probe.onerror = () => {
         if (!cancelled) {
-          setForceConvert(true)
+          setConversionKey(previewKey)
         }
       }
       probe.src = contentUrl
       return () => {
-        cancelled = true
+        probe.onload = null
+        probe.onerror = null
+        probe.src = ''
+        cleanup()
       }
     }
 
     const controller = new AbortController()
     const run = async () => {
-      const signal = controller.signal
       try {
-        setStatus('loading')
+        const signal = controller.signal
         const res = await fetch(contentUrl, { credentials: 'include', signal })
         if (!res.ok) {
           throw new Error(`failed to fetch image: ${res.status}`)
         }
-        if (cancelled) return
-
+        throwIfAborted(signal)
         const inputBlob = await res.blob()
-        if (cancelled) return
-        const outputBlob = await decodeHeifToJpegBlob(inputBlob)
-        if (cancelled) return
+        throwIfAborted(signal)
+        const outputBlob = await decodeHeifToJpegBlob(inputBlob, signal)
+        throwIfAborted(signal)
         const objectUrl = URL.createObjectURL(outputBlob)
 
         if (cancelled) {
@@ -221,9 +337,7 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
           return
         }
 
-        if (objectUrlRef.current) {
-          URL.revokeObjectURL(objectUrlRef.current)
-        }
+        revokeObjectUrl(objectUrlRef)
         objectUrlRef.current = objectUrl
         setSrc(objectUrl)
         setStatus('ready')
@@ -237,28 +351,23 @@ export function useImagePreviewSrc(fileName: string, contentUrl: string, thumbna
     }
 
     void run()
-
     return () => {
-      cancelled = true
+      cleanup()
       controller.abort()
-      // The WASM decode itself cannot be interrupted, but aborting fetch keeps
-      // navigation away from starting or continuing large downloads.
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(objectUrlRef.current)
-        objectUrlRef.current = null
-      }
     }
-  }, [fileName, contentUrl, thumbnailUrl, forceConvert])
+  }, [contentUrl, fileName, forceConvert, previewKey, shouldLoad, thumbnailUrl])
 
+  const onPreviewError = useCallback(() => {
+    if (!enabled || !shouldLoad || isApplePlatform()) return
+    setStatus('loading')
+    setConversionKey(previewKey)
+  }, [enabled, previewKey, shouldLoad])
+
+  const isCurrentPreview = shouldLoad && resolvedKeyRef.current === previewKey
   return {
-    src,
-    status,
-    onPreviewError: () => {
-      if (!isApplePlatform()) {
-        setSrc('')
-        setStatus('loading')
-        setForceConvert(true)
-      }
-    },
+    src: isCurrentPreview ? src : '',
+    status: isCurrentPreview ? status : 'idle',
+    onPreviewError,
+    previewRef,
   }
 }

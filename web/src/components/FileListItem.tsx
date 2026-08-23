@@ -14,7 +14,15 @@ export default function FileListItem({ file, vaultId, currentPath, onOpenDir, on
 }) {
   const filePath = joinPath(currentPath, file.name)
   const contentUrl = api.getContentUrl(vaultId, filePath)
-  const { src: previewUrl } = useImagePreviewSrc(file.name, contentUrl, api.getThumbnailUrl(vaultId, filePath))
+  const imageFile = !file.isDir && isImage(file.name)
+  const {
+    src: previewUrl,
+    status: previewStatus,
+    previewRef,
+  } = useImagePreviewSrc(file.name, contentUrl, api.getThumbnailUrl(vaultId, filePath), {
+    enabled: imageFile,
+    lazy: imageFile,
+  })
 
   function handleClick() {
     if (file.isDir) {
@@ -53,8 +61,12 @@ export default function FileListItem({ file, vaultId, currentPath, onOpenDir, on
     </div>
   )
 
-  if (isImage(file.name)) {
-    return <PhotoView src={previewUrl}>{row}</PhotoView>
+  if (imageFile) {
+    return (
+      <div ref={previewRef}>
+        {previewStatus === 'ready' && previewUrl ? <PhotoView src={previewUrl}>{row}</PhotoView> : row}
+      </div>
+    )
   }
 
   return row

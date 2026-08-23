@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { PhotoProvider, PhotoView } from 'react-photo-view'
 import { X, CopyMinus, Loader2, RefreshCw, Trash2, ScanSearch, Image as ImageIcon, Film, File as FileIcon, ShieldCheck, ChevronDown, ChevronRight } from 'lucide-react'
 import VideoPlayer from './VideoPlayer'
+import ManagedImage from './ManagedImage'
 import { api, type DuplicateGroup, type DuplicateFileItem, type DuplicateStats, formatDate, formatSize, isImage, isVideo } from '../lib/api'
-import { useImagePreviewSrc } from '../lib/useImagePreviewSrc'
+import { useImagePreviewSrc, type ImagePreviewStatus } from '../lib/useImagePreviewSrc'
 
 interface DuplicatePanelProps {
   vaultId: string
@@ -407,16 +408,26 @@ function DuplicateFileCard({
 }) {
   const contentUrl = api.getContentUrl(vaultId, file.path)
   const videoUrl = api.getVideoUrl(vaultId, file.path)
-  const { src: previewSrc, status: previewStatus, onPreviewError } = useImagePreviewSrc(
+  const imageFile = isImage(file.name)
+  const {
+    src: previewSrc,
+    status: previewStatus,
+    onPreviewError,
+    previewRef,
+  } = useImagePreviewSrc(
     file.name,
     contentUrl,
     api.getThumbnailUrl(vaultId, file.path),
+    {
+      enabled: imageFile,
+      lazy: imageFile,
+    },
   )
 
   return (
     <article className={`rounded-xl border p-3 ${isKeeper ? 'border-green-500/30 bg-green-500/5' : 'border-gray-800 bg-gray-950/60'}`}>
       <div className="flex gap-3">
-        <div className="w-28 h-28 rounded-lg overflow-hidden bg-gray-900 border border-gray-800 flex-shrink-0">
+        <div ref={previewRef} className="w-28 h-28 rounded-lg overflow-hidden bg-gray-900 border border-gray-800 flex-shrink-0">
           <FilePreview
             vaultId={vaultId}
             file={file}
@@ -449,7 +460,7 @@ function DuplicateFileCard({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {isImage(file.name) && previewSrc && (
+            {isImage(file.name) && previewStatus === 'ready' && previewSrc && (
               <PhotoView src={previewSrc}>
                 <button className="px-2.5 py-1.5 rounded-lg border border-gray-800 text-xs text-gray-200 hover:border-gray-700">预览图片</button>
               </PhotoView>
@@ -488,7 +499,7 @@ function FilePreview({
   vaultId: string
   file: DuplicateFileItem
   previewSrc: string
-  previewStatus: 'loading' | 'ready' | 'unavailable'
+  previewStatus: ImagePreviewStatus
   onPreviewError: () => void
   onPreviewVideo: (url: string, title: string) => void
 }) {
@@ -500,14 +511,14 @@ function FilePreview({
         </div>
       )
     }
-    return <img src={previewSrc} alt={file.name} className="w-full h-full object-cover" onError={onPreviewError} />
+    return <ManagedImage src={previewSrc} alt={file.name} className="w-full h-full object-cover" onError={onPreviewError} />
   }
 
   if (isVideo(file.name)) {
     if (file.hasThumb) {
       return (
         <button className="w-full h-full" onClick={() => onPreviewVideo(api.getVideoUrl(vaultId, file.path), file.name)}>
-          <img src={api.getThumbnailUrl(vaultId, file.path)} alt={file.name} className="w-full h-full object-cover" />
+          <ManagedImage src={api.getThumbnailUrl(vaultId, file.path)} alt={file.name} className="w-full h-full object-cover" />
         </button>
       )
     }

@@ -268,3 +268,17 @@
 | R-10 | P2 | 普通原生 `<img>` 没有统一的卸载/源切换清理策略；`loading="lazy"` 只能延迟请求，不能取消已开始的下载或解码。 | `web/src/components/FileGridItem.tsx:86-95`; `web/src/components/DuplicatePanel.tsx:500-503` | 引入可复用的 managed image 元素，显式清空旧源，减少离开目录后的残留请求。 |
 
 验收重点：大目录网格和列表模式快速进入/返回、快速滚动、HEIC 无缩略图 fallback、视频缩略图、重复文件面板多组展开，以及 iOS/桌面浏览器的网络请求取消、对象 URL 数量和 CPU/GPU 活动。`loading="lazy"` 与 `IntersectionObserver` 只负责延迟启动；真正的回收仍必须由 AbortController、`src=''` 和组件卸载清理共同保证。
+
+## 15. 媒体预览生命周期修复（2026-08-23）
+
+本轮修复已落地：
+
+| 编号 | 处理结果 |
+| --- | --- |
+| R-06 | `useImagePreviewSrc` 增加 `enabled`、视口门控和 `previewRef`；进入预取范围才启动 HEIF 请求/探测/转换，离开或卸载时取消 fetch、轮询并回收对象 URL；WASM `display` 已增加取消后的状态屏障，但底层计算仍受库限制。 |
+| R-07 | 新增 `ManagedImage`，视频和图片缩略图统一默认 `loading="lazy"`，源切换/卸载时显式移除 `src`。 |
+| R-08 | HEIF 原生 probe cleanup 移除回调并清空 `probe.src`。 |
+| R-09 | 所有 Hook 调用保持稳定顺序，通过 `enabled: false` 禁止目录、视频和非图片条目启动预览任务；列表图片也按行可见性加载。 |
+| R-10 | 网格、列表和重复文件面板改用托管图片节点；切换文件时隐藏尚未确认属于当前 key 的旧 URL，避免错图和错误 PhotoView。 |
+
+验证：`cd web && npm run lint`、`cd web && npm run build` 通过；仍需在真实桌面/iOS 浏览器用大目录、快速返回、快速滚动和 HEIF/WASM 样本检查 Network、CPU、对象 URL 回收。真实 WASM 解码一旦开始无法被 JavaScript 强制中断，服务端缩略图生成也不受本次前端取消控制。

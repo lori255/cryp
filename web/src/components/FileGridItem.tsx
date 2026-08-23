@@ -2,12 +2,13 @@ import { useState } from 'react'
 import { PhotoView } from 'react-photo-view'
 import { api, type FileItem, isImage, isVideo, formatSize, joinPath } from '../lib/api'
 import { useImagePreviewSrc } from '../lib/useImagePreviewSrc'
+import ManagedImage from './ManagedImage'
 import { Folder, File, Film, Image, Music, Trash2, Loader2, Download } from 'lucide-react'
 
 function VideoThumb({ src, alt }: { src: string; alt: string }) {
-  const [err, setErr] = useState(false)
-  if (err) return <Film className="w-10 h-10 text-purple-500" />
-  return <img src={src} alt={alt} className="w-full h-full object-cover" onError={() => setErr(true)} />
+  const [failedSrc, setFailedSrc] = useState<string | null>(null)
+  if (failedSrc === src) return <Film className="w-10 h-10 text-purple-500" />
+  return <ManagedImage src={src} alt={alt} className="w-full h-full object-cover" onError={() => setFailedSrc(src)} />
 }
 
 export default function FileGridItem({ file, vaultId, currentPath, onOpenDir, onPlayVideo, onDelete, onDownload }: {
@@ -23,7 +24,16 @@ export default function FileGridItem({ file, vaultId, currentPath, onOpenDir, on
   const contentUrl = api.getContentUrl(vaultId, filePath)
   const videoUrl = api.getVideoUrl(vaultId, filePath)
   const thumbnailUrl = api.getThumbnailUrl(vaultId, filePath)
-  const { src: previewUrl, status: previewStatus, onPreviewError } = useImagePreviewSrc(file.name, contentUrl, thumbnailUrl)
+  const imageFile = !file.isDir && isImage(file.name)
+  const {
+    src: previewUrl,
+    status: previewStatus,
+    onPreviewError,
+    previewRef,
+  } = useImagePreviewSrc(file.name, contentUrl, thumbnailUrl, {
+    enabled: imageFile,
+    lazy: imageFile,
+  })
 
   if (file.isDir) {
     return (
@@ -48,13 +58,18 @@ export default function FileGridItem({ file, vaultId, currentPath, onOpenDir, on
   if (isImage(file.name)) {
     if (previewStatus !== 'ready' || !previewUrl) {
       return (
-        <div className="relative group">
+        <div ref={previewRef} className="relative group">
           <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
             <div className="aspect-square bg-gray-800 flex items-center justify-center">
               {previewStatus === 'loading' ? (
                 <div className="flex flex-col items-center gap-2 text-gray-400">
                   <Loader2 className="w-5 h-5 animate-spin" />
                   <span className="text-xs">加载中...</span>
+                </div>
+              ) : previewStatus === 'idle' ? (
+                <div className="flex flex-col items-center gap-2 text-gray-500">
+                  <Image className="w-6 h-6" />
+                  <span className="text-xs">等待预览</span>
                 </div>
               ) : (
                 <div className="flex flex-col items-center gap-2 text-gray-500">
@@ -82,11 +97,11 @@ export default function FileGridItem({ file, vaultId, currentPath, onOpenDir, on
     }
 
     return (
-      <div className="relative group">
+      <div ref={previewRef} className="relative group">
         <PhotoView src={previewUrl}>
           <div className="bg-gray-900 border border-gray-800 hover:border-gray-700 rounded-xl overflow-hidden cursor-pointer transition-all">
             <div className="aspect-square bg-gray-800">
-              <img src={previewUrl} alt={file.name} className="w-full h-full object-cover" loading="lazy" onError={onPreviewError} />
+              <ManagedImage src={previewUrl} alt={file.name} className="w-full h-full object-cover" onError={onPreviewError} />
             </div>
             <div className="p-2">
               <p className="text-xs text-gray-400 truncate">{file.name}</p>
