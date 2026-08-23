@@ -51,7 +51,8 @@ func (s *Server) handleListFiles(c *gin.Context) {
 
 	files, ok, err := s.listIndexedFiles(sess, path)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list indexed directory: " + err.Error()})
+		log.Printf("files: list indexed vault=%s path=%s: %v", sess.VaultID, path, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list indexed directory", "code": "file_list_failed"})
 		return
 	}
 	if !ok {
@@ -2053,7 +2054,8 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 			break
 		}
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read multipart: " + err.Error()})
+			log.Printf("upload: read multipart vault=%s: %v", sess.VaultID, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid multipart body", "code": "multipart_invalid"})
 			return
 		}
 		if p.FormName() == "file" {
@@ -2092,7 +2094,8 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 
 	encPath, err := vault.GetEncryptedFilePath(virtualPath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve path: " + err.Error()})
+		log.Printf("upload: resolve encrypted path vault=%s path=%s: %v", sess.VaultID, virtualPath, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve upload path", "code": "upload_path_resolve_failed"})
 		return
 	}
 
@@ -2221,7 +2224,8 @@ func (s *Server) handleMkdir(c *gin.Context) {
 	}
 
 	if err := vault.CreateEncryptedDirectory(req.Path); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create directory: " + err.Error()})
+		log.Printf("mkdir: create encrypted directory vault=%s path=%s: %v", sess.VaultID, req.Path, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create directory", "code": "directory_create_failed"})
 		return
 	}
 	if err := s.upsertEntry(sess.Keys.MACKey, sess.VaultID, req.Path, true, true, 0, 0, ""); err != nil {

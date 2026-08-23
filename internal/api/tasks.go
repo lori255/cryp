@@ -1,11 +1,14 @@
 package api
 
 import (
+	"database/sql"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"cryp/internal/pathguard"
 	"cryp/internal/storage"
@@ -13,6 +16,78 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// taskResponse deliberately omits raw worker diagnostics. TaskRecord keeps
+// absolute source paths and wrapped filesystem errors for server-side
+// recovery, but serializing it directly would disclose host layout and
+// implementation details to any authenticated vault client.
+type taskResponse struct {
+	ID             string `json:"id"`
+	VaultID        string `json:"vaultId"`
+	Type           string `json:"type"`
+	Status         string `json:"status"`
+	TotalFiles     int    `json:"totalFiles"`
+	ProcessedFiles int    `json:"processedFiles"`
+	TotalBytes     int64  `json:"totalBytes"`
+	ProcessedBytes int64  `json:"processedBytes"`
+	CurrentFile    string `json:"currentFile"`
+	ErrorMsg       string `json:"errorMsg,omitempty"`
+	SourcePath     string `json:"sourcePath,omitempty"`
+	DestPath       string `json:"destPath,omitempty"`
+	DeleteSource   bool   `json:"deleteSource"`
+	StartedAt      int64  `json:"startedAt"`
+	CreatedAt      int64  `json:"createdAt"`
+	UpdatedAt      int64  `json:"updatedAt"`
+}
+
+func (s *Server) toTaskResponse(t *storage.TaskRecord) taskResponse {
+	if t == nil {
+		return taskResponse{}
+	}
+	response := taskResponse{
+		ID:             t.ID,
+		VaultID:        t.VaultID,
+		Type:           t.Type,
+		Status:         t.Status,
+		TotalFiles:     t.TotalFiles,
+		ProcessedFiles: t.ProcessedFiles,
+		TotalBytes:     t.TotalBytes,
+		ProcessedBytes: t.ProcessedBytes,
+		CurrentFile:    t.CurrentFile,
+		DestPath:       t.DestPath,
+		DeleteSource:   t.DeleteSource,
+		StartedAt:      t.StartedAt,
+		CreatedAt:      t.CreatedAt,
+		UpdatedAt:      t.UpdatedAt,
+	}
+	if t.SourcePath != "" {
+		response.SourcePath = s.safeTaskSourcePath(t.SourcePath)
+	}
+	if t.Status == "error" {
+		// Keep the UI useful without returning wrapped os/sql errors or source
+		// paths. Detailed diagnostics remain in server logs.
+		response.ErrorMsg = "任务执行失败"
+	}
+	return response
+}
+
+func (s *Server) safeTaskSourcePath(sourcePath string) string {
+	if sourcePath == "" {
+		return ""
+	}
+	if s != nil && s.sourceGuard != nil {
+		root := s.sourceGuard.Root()
+		if root != "" {
+			if relative, err := filepath.Rel(root, sourcePath); err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return filepath.ToSlash(relative)
+			}
+		}
+	}
+	// Older task rows may contain paths outside the current source root. A
+	// basename is still useful for the task panel and does not disclose the
+	// host directory hierarchy.
+	return filepath.Base(filepath.Clean(sourcePath))
+}
 
 // handleBrowseDir lists directories on the host filesystem (within allowed paths)
 func (s *Server) handleBrowseDir(c *gin.Context) {
@@ -165,15 +240,19 @@ func (s *Server) handleListTasks(c *gin.Context) {
 
 	tasks, err := s.db.ListTasks(sess.VaultID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list tasks"})
+		log.Printf("tasks: list vault=%s: %v", sess.VaultID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list tasks", "code": "task_list_failed"})
 		return
 	}
 
 	if tasks == nil {
 		tasks = []storage.TaskRecord{}
 	}
-
-	c.JSON(http.StatusOK, gin.H{"tasks": tasks})
+	responses := make([]taskResponse, 0, len(tasks))
+	for i := range tasks {
+		responses = append(responses, s.toTaskResponse(&tasks[i]))
+	}
+	c.JSON(http.StatusOK, gin.H{"tasks": responses})
 }
 
 // handleGetTask returns a single task's status
@@ -185,7 +264,7 @@ func (s *Server) handleGetTask(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, t)
+	c.JSON(http.StatusOK, s.toTaskResponse(t))
 }
 
 // handleCancelTask cancels a running task
@@ -209,7 +288,12 @@ func (s *Server) handleCancelTask(c *gin.Context) {
 		// done/error state using the stale record.
 		latest, readErr := s.db.GetTask(taskID)
 		if readErr != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+			if errors.Is(readErr, sql.ErrNoRows) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+			} else {
+				log.Printf("task %s: reload after cancel: %v", taskID, readErr)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read task", "code": "task_lookup_failed"})
+			}
 			return
 		}
 		switch latest.Status {
@@ -239,7 +323,8 @@ func (s *Server) handleDeleteTask(c *gin.Context) {
 	}
 
 	if err := s.db.DeleteTask(taskID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete task"})
+		log.Printf("task %s: delete: %v", taskID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete task", "code": "task_delete_failed"})
 		return
 	}
 
@@ -293,7 +378,12 @@ func (s *Server) handleCreateUploadTask(c *gin.Context) {
 func (s *Server) taskForVault(c *gin.Context, vaultID, taskID string) (*storage.TaskRecord, bool) {
 	t, err := s.db.GetTask(taskID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		} else {
+			log.Printf("task %s: lookup: %v", taskID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read task", "code": "task_lookup_failed"})
+		}
 		return nil, false
 	}
 	if t.VaultID != vaultID {
@@ -309,7 +399,8 @@ func (s *Server) handleDeleteCompletedTasks(c *gin.Context) {
 
 	count, err := s.db.DeleteCompletedTasks(sess.VaultID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete tasks"})
+		log.Printf("tasks: delete completed vault=%s: %v", sess.VaultID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete tasks", "code": "task_cleanup_failed"})
 		return
 	}
 

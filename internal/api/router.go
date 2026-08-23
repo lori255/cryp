@@ -225,8 +225,8 @@ func (s *Server) SetupRouter() *gin.Engine {
 		if s.staticFS != nil {
 			data, err := fs.ReadFile(s.staticFS, "index.html")
 			if err != nil {
-				// Debug: log the error
-				c.String(http.StatusInternalServerError, "embed error: %v", err)
+				log.Printf("spa fallback: read index: %v", err)
+				c.String(http.StatusInternalServerError, "failed to load application")
 				return
 			}
 			c.Data(http.StatusOK, "text/html; charset=utf-8", data)

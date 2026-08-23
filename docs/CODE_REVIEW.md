@@ -192,5 +192,8 @@
 | T-34 | P2 | 已知不可用的 VAAPI profile 每次播放都会重新启动并等待 readiness 后才回退 CPU，连续播放时会制造短时 GPU 峰值和启动延迟。 | 已缓解：硬件 profile 启动失败进入按 binary/profile/设备参数隔离的 30 秒冷却；CPU fallback 不受冷却影响，成功后立即清除记录。真实驱动恢复仍需硬件集成测试。 |
 | T-35 | P2 | 前端 stop 请求忽略 202/网络失败，页面切换后无法再次确认进程组是否已完成退出；虽然后端会继续清理，但 UI 与回收状态脱节。 | 已缓解：`stopHls` 对 202 或一次网络失败按 `Retry-After` 最多重试一次，仍保持卸载场景的 best-effort 语义。 |
 | Q-08 | P2 | `task.Manager` 的缩略图 enqueuer setter 与导入 worker 直接读字段，运行时重配置会发生 data race；初始化阶段通常不触发，但接口没有明确不可变约束。 | 已修复：setter 加锁，worker 通过同步快照读取 callback；不改变初始化和循环依赖解法。 |
+| S-11 | P1 | 任务查询接口直接序列化 `storage.TaskRecord`，会把绝对源路径和导入错误中的主机/系统细节返回给同 vault 客户端。 | 已修复：引入 API 专用 task DTO；源路径只返回 source root 下的相对路径（越界旧记录退化为 basename），错误统一为稳定用户文案，原始诊断仅保留服务端日志。 |
+| Q-09 | P2 | 列表、上传路径解析、建目录、建 vault、multipart 和 SPA fallback 将底层错误字符串直接拼进响应，导致实现细节泄露且客户端无法依赖稳定错误码。 | 已修复：响应固定文案并增加稳定 code，详细错误改为结构化日志；任务查询能区分 `sql.ErrNoRows` 与数据库故障。 |
+| A-04 | P2 | browse-dir 为保持现有导入协议返回解析后的主机绝对路径，部署目录结构会暴露给已登录客户端。 | 保留兼容行为并记录为后续协议改造：需要同时引入 source-root-relative path token 和前端导航迁移，不能只改响应字段。 |
 
 本轮新增验证目标：除 Go 全量与 race/vet、前端 lint/build 外，还应在具备真实 FFmpeg、VAAPI render node 和带音视频样本的环境回归连续播放/停止/切换、GPU 进程退出、磁盘清理及 vault 删除失败重试。单元 fake-FFmpeg 测试只覆盖基础 ready/stop/Wait 契约，不能代替上述硬件和浏览器验证。

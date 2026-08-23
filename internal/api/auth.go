@@ -195,7 +195,8 @@ func (s *Server) handleCreateVault(c *gin.Context) {
 
 	config, keys, err := crypto.InitVault(vaultPath, []byte(req.Password))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create vault: " + err.Error()})
+		log.Printf("vault %s: initialize: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create vault", "code": "vault_initialize_failed"})
 		return
 	}
 	defer keys.Zero()
