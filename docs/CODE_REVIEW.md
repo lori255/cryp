@@ -240,3 +240,17 @@
 | P-10 | P0 | 普通 `/files/content` 播放入口将 Artplayer `option.type` 设为 `undefined`；Artplayer 5.x 校验要求该字段始终为字符串，实例化阶段直接抛出 `option.type require 'string' type`，导致所有普通视频黑屏且尚未发起媒体请求。 | `web/src/components/VideoPlayer.tsx:104-106`, `web/src/lib/api.ts:144-158` | 已修复：普通媒体显式传 `type: 'mp4'`（HLS 传 `m3u8`），并增加启动配置回归检查。 |
 
 验收重点：iPhone Safari、iPhone standalone、iPad Safari、iPadOS 桌面 UA 和 standalone，分别验证首次点击播放、HLS 转码播放、右下角全屏进入/退出、方向变化、错误提示、切后台再回来以及刘海/Home Indicator 区域。当前环境没有 iOS 真机或浏览器集成运行器，代码测试不能替代上述真机验收。
+
+## 13. 外部 Pull Request 复核：#1（2026-08-23）
+
+复核提交 `aeaf0bf7fa718638a90293acb528008ac1ded18a`（`Improve HEIF thumbnail quality with lossless intermediate and lanczos scaling`）。PR 基于旧基线 `09e390f`，当前 `master` 已前进到 `397cd2f`；Git 合并树确认 `internal/thumbnail/thumbnail.go` 存在内容冲突，不能直接接受整文件的 “theirs”。
+
+| 编号 | 级别 | 问题与影响 | 关键位置 | 结论 |
+| --- | --- | --- | --- | --- |
+| PR-01 | P1 | HEIF cache key 从 `heif-v2` 直接切到 `heif-v3`，旧 `.c9r` 缩略图变成不可寻址孤儿；删除/替换文件时当前 `DeleteThumbnail` 也只删除 v3，长期会持续占用 vault 磁盘。 | `internal/thumbnail/thumbnail.go:761-768,743-758`（PR 对应 `thumbPath`/`DeleteThumbnail`） | 请求修改：提供惰性迁移或一次性清理，并让删除同时回收旧版本。 |
+| PR-02 | P1 | 版本切换会让所有既有 HEIF 缩略图同时变成 miss，扫描会批量重新入队；队列容量为 1000 且满时丢弃任务，可能造成 CPU/磁盘峰值和大量永久缺图。 | `internal/thumbnail/thumbnail.go:31,637-713,1201-1280` | 请求修改：分批/限速重建，或先迁移可复用缓存；补充队列容量和失败重试指标。 |
+| PR-03 | P2 | PNG 全分辨率中间物通常比 JPEG 大很多；即使当前 master 的 `maxHEIFBytes` 最终会拒绝超限文件，仍会先完整写出 PNG，峰值临时磁盘和内存明显上升。 | `internal/thumbnail/thumbnail.go:1013-1061`；PR 对应 `generateHEIF` | 可接受但需保留输入/输出大小上限，并考虑像素维度或临时目录配额。 |
+| PR-04 | P2 | PR 没有增加 HEIF v3 路径、PNG 输出、Lanczos 参数、取消清理和旧缓存回收测试；该 PR 的 CI 只有 Docker build，没有 Go/race/真实 HEIF 回归。 | `internal/thumbnail/thumbnail_test.go`、`.github/workflows/docker-image-ci.yml` | 请求修改：增加 fake 外部命令/参数断言、缓存迁移和清理测试；补全 CI。 |
+| PR-05 | P1 | 若在当前 master 上直接解决冲突，容易用旧版 `generateHEIF` 覆盖已有 context 取消、进程组回收、generation 和 512 MiB 限制，反而回退此前修复。 | `internal/thumbnail/thumbnail.go:999-1118` | 集成要求：只手工移植 PNG/Lanczos/质量参数，保留现有生命周期保护。 |
+
+结论：PR 的图像质量方向合理，外部工具参数未发现直接兼容性阻断；但应先处理 PR-01/PR-02，并以当前 master 为基线手工移植后再考虑合并。当前未对 PR 分支或业务代码做修改，也未向 PR 发布评论。
