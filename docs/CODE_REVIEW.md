@@ -15,7 +15,7 @@
 - `npm run build`：通过。
 - `npm run lint`：通过。
 - 当前审核环境没有 `ffmpeg`/`ffprobe` 可执行文件，只有 `/dev/dri/card0`，没有 `/dev/dri/renderD128`；因此未能进行真实 HLS 编码、VAAPI 和多浏览器集成验证。
-- 已补充 HLS pending/停止/替换屏障、会话快照、缩略图 generation/停止竞态以及加密文件原子替换单元测试；仍缺少真实 FFmpeg、多浏览器和 VAAPI 集成测试。
+- 已补充 HLS pending/停止/请求取消/资产清理屏障、会话快照、缩略图 generation/停止竞态以及加密文件原子替换单元测试；仍缺少真实 FFmpeg、多浏览器和 VAAPI 集成测试。
 
 ## 2. 最可能的故障因果链
 
@@ -135,8 +135,8 @@
 | T-29 | P1 | 上传和导入使用 `os.Create` 直接截断目标密文；即使 HLS 已停止，仍在进行的普通 `/files/content` 读取会看到截断/混合内容，触发 seek 或转码失败。 | 已修复：同目录临时文件 fsync 后原子替换目标，失败不破坏旧文件。 |
 | S-06 | P1 | 缩略图响应使用 `public, max-age=86400`，普通 content 也未声明私有缓存；共享代理可能把一个会话的明文缩略图/媒体响应提供给另一个会话。 | 已修复：受保护媒体使用 `private, no-store` 并按 Origin、Cookie、`X-Session-ID` 分隔。 |
 | S-07 | P1 | HLS start 的 302 重定向未声明不可缓存；共享代理可能缓存同一路径的 stream ID，使后续会话复用旧转码或收到 404/权限错误。 | 已修复：start、stop 和 asset 响应使用 `no-store`/私有缓存并按 Origin、Cookie、`X-Session-ID` 分隔。 |
-| T-30 | P1 | 首个 HLS 请求的启动 context 脱离 HTTP 请求；浏览器在 FFmpeg ready 前断开且 stop 请求未到达时，pending 和 FFmpeg 仍可运行最长 30 秒，占用名额/GPU 并放大后续“转码失败”。 | 待修复：需在不误伤共享 pending 等待者的前提下，断开最后一个 owner 时取消启动。 |
-| T-31 | P2 | playlist/segment 文件通过存在性等待后再调用 `c.File`，期间 cleanup 可能删除 stream 目录，形成 TOCTOU，导致偶发 404 或不完整分片响应。 | 待修复：需在停止/清理与文件打开之间建立原子性或失败重试保护。 |
+| T-30 | P1 | 首个 HLS 请求的启动 context 脱离 HTTP 请求；浏览器在 FFmpeg ready 前断开且 stop 请求未到达时，pending 和 FFmpeg 仍可运行最长 30 秒，占用名额/GPU 并放大后续“转码失败”。 | 已修复：启动改为后台 pending 任务；请求取消按 owner 引用释放，最后一个 owner 消失时取消 pending，仍有共享等待者时不误伤。 |
+| T-31 | P2 | playlist/segment 文件通过存在性等待后再调用 `c.File`，期间 cleanup 可能删除 stream 目录，形成 TOCTOU，导致偶发 404 或不完整分片响应。 | 已修复：asset 读取持有 `assetMu` 读锁，目录清理取得写锁后再删除，避免等待与打开之间的竞态。 |
 | T-32 | P2 | 启动取消路径的 `stopAndWaitHLS` 与 cleanup goroutine 可能同时调用同一 `exec.Cmd.Wait`；重复 Wait 会丢失真实退出错误并导致不稳定的测试/回收行为。 | 已修复：`hlsStream` 使用 `sync.Once` 统一等待并复用退出错误。 |
 
 以上追加项与第 3 节原始编号互补；真实 FFmpeg、VAAPI 驱动和浏览器集成回归仍受当前环境缺少 `ffmpeg`/`ffprobe` 及 render node 的限制。
