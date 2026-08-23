@@ -133,5 +133,6 @@
 | T-27 | P1 | 上传、导入或删除在停止旧 stream 后释放锁再写文件；窗口内新的播放请求可以重新启动同路径 FFmpeg，随后与覆盖/删除并发读取同一密文。 | 待修复：引入替换屏障，阻止新的 HLS start 直到破坏性操作完成。 |
 | T-28 | P1 | logout 停止 owner 与删除 session 之间没有生命周期屏障；同一会话可在窗口内重新启动 HLS，随后内部认证 session 被删除，表现为转码/分片失败。 | 待修复：logout 与 HLS start/stop 串行化后再删除会话。 |
 | T-29 | P1 | 上传和导入使用 `os.Create` 直接截断目标密文；即使 HLS 已停止，仍在进行的普通 `/files/content` 读取会看到截断/混合内容，触发 seek 或转码失败。 | 待修复：先写入同目录临时文件并 fsync，再原子替换目标。 |
+| S-06 | P1 | 缩略图响应使用 `public, max-age=86400`，普通 content 也未声明私有缓存；共享代理可能把一个会话的明文缩略图/媒体响应提供给另一个会话。 | 待修复：受保护媒体统一 `private`/`no-store` 并按 Cookie、`X-Session-ID` 分隔。 |
 
 以上追加项与第 3 节原始编号互补；真实 FFmpeg、VAAPI 驱动和浏览器集成回归仍受当前环境缺少 `ffmpeg`/`ffprobe` 及 render node 的限制。
