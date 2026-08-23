@@ -197,3 +197,17 @@
 | A-04 | P2 | browse-dir 为保持现有导入协议返回解析后的主机绝对路径，部署目录结构会暴露给已登录客户端。 | 保留兼容行为并记录为后续协议改造：需要同时引入 source-root-relative path token 和前端导航迁移，不能只改响应字段。 |
 
 本轮新增验证目标：除 Go 全量与 race/vet、前端 lint/build 外，还应在具备真实 FFmpeg、VAAPI render node 和带音视频样本的环境回归连续播放/停止/切换、GPU 进程退出、磁盘清理及 vault 删除失败重试。单元 fake-FFmpeg 测试只覆盖基础 ready/stop/Wait 契约，不能代替上述硬件和浏览器验证。
+
+## 10. 继续优化审查（2026-08-23）
+
+对修复后的实现做了新一轮故障路径和架构复核，新增以下项目；本节先于代码变更提交，后续修复提交会逐项更新状态：
+
+| 编号 | 级别 | 问题与影响 | 关键位置 | 计划 |
+| --- | --- | --- | --- | --- |
+| T-36 | P1 | `waitForHLSReady` 通过 `cmd.ProcessState` 判断 FFmpeg 是否退出，但该字段只有 `Wait` 执行后才会填充；FFmpeg 立即失败时会完整等待 5 秒，硬件 profile 失败再叠加 CPU fallback，放大启动延迟、pending 占用和客户端重试风暴。 | `internal/api/files.go:908-938` | 引入单一进程退出通知，ready 等待立即感知退出，并与统一 `Wait` 结果复用。 |
+| Q-10 | P2 | 加密 Range/seek 是 FFmpeg content URL 的关键依赖，但缺少 206、416、负值、多 Range、空文件和请求取消的直接回归测试；边界回归只能靠间接 HLS 测试发现。 | `internal/api/files.go:1785-2007` | 补充 focused Range 测试，锁定协议和资源释放契约。 |
+| Q-11 | P2 | `task.Manager` 的可选 guard setter/getter nil receiver 行为不一致；上传任务还绕过 `Start*` 的 task ID/计数约束，并且 DB 错误包装不统一，增加嵌入式调用 panic 和诊断分支。 | `internal/task/manager.go:131-174,486-517` | 统一 nil 安全和输入校验，补单元测试并保持现有 API 兼容。 |
+| A-05 | P2 | `internal/api/files.go` 仍是约 2.7k 行单体，混合普通文件传输、HLS、上传、删除、索引和缩略图 HTTP；继续在同一文件堆叠生命周期补丁会增加冲突和回归概率。 | `internal/api/files.go` | 先按同 package、无行为变化的边界拆出 content/download 与 HLS 文件，再评估跨 package FFmpeg 能力层。 |
+| A-06 | P2 | HLS 与 thumbnail 各自维护 FFmpeg binary、硬件探测和 profile 模型；直接抽共享包可能改变解码/编码语义，当前缺少真实硬件矩阵，暂不贸然合并。 | `internal/api/files.go`, `internal/thumbnail/thumbnail.go` | 本轮只统一生命周期/测试契约；共享 `internal/ffmpeg` 延后至有硬件集成测试后。 |
+
+本节的 T-36、Q-10、Q-11 为本轮优先修复项；A-05 采用机械拆分并逐步验证，A-06 保留为明确的后续架构债务。
