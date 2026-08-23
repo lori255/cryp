@@ -134,5 +134,6 @@
 | T-28 | P1 | logout 停止 owner 与删除 session 之间没有生命周期屏障；同一会话可在窗口内重新启动 HLS，随后内部认证 session 被删除，表现为转码/分片失败。 | 已修复：logout 与 HLS start/stop 串行化后再删除会话。 |
 | T-29 | P1 | 上传和导入使用 `os.Create` 直接截断目标密文；即使 HLS 已停止，仍在进行的普通 `/files/content` 读取会看到截断/混合内容，触发 seek 或转码失败。 | 已修复：同目录临时文件 fsync 后原子替换目标，失败不破坏旧文件。 |
 | S-06 | P1 | 缩略图响应使用 `public, max-age=86400`，普通 content 也未声明私有缓存；共享代理可能把一个会话的明文缩略图/媒体响应提供给另一个会话。 | 已修复：受保护媒体使用 `private, no-store` 并按 Cookie、`X-Session-ID` 分隔。 |
+| S-07 | P1 | HLS start 的 302 重定向未声明不可缓存；共享代理可能缓存同一路径的 stream ID，使后续会话复用旧转码或收到 404/权限错误。 | 待修复：start/stop 响应使用 `no-store` 并按会话 header 分隔。 |
 
 以上追加项与第 3 节原始编号互补；真实 FFmpeg、VAAPI 驱动和浏览器集成回归仍受当前环境缺少 `ffmpeg`/`ffprobe` 及 render node 的限制。
