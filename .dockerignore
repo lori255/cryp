@@ -4,3 +4,17 @@ web/dist
 cmd/server/web
 .git
 *.md
+.github
+.codex
+.env*
+data
+.dev
+coverage
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.prof
+*.pprof
+*.coverprofile

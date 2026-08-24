@@ -25,6 +25,7 @@ RUN useradd -m -s /bin/bash cryp
 WORKDIR /app
 
 COPY --from=backend /cryp /app/cryp
+COPY LICENSE /licenses/Cryp/LICENSE
 
 RUN mkdir -p /data/config /data/vaults && chown -R cryp:cryp /data
 

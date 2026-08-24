@@ -7,10 +7,29 @@ cmd/server/web/
 *.test
 *.out
 .env
+.env.*
+!.env.example
 /data/
+/.dev/
 /server
 /cryp
 core
 *.prof
 *.pprof
+*.coverprofile
+coverage/
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+.DS_Store
+.idea/
+.vscode/
 .ace-tool/
+
+# Local agent state and internal engineering notes are intentionally not part
+# of the public repository. Git history remains the source for old reviews.
+/.codex
+/docs/CODE_REVIEW.md
+/docs/internal/

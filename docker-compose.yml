@@ -1,11 +1,12 @@
 services:
   cryp:
-    build: .
-    container_name: cryp
+    image: ${CRYP_IMAGE:-lori255/cryp:latest}
+    build:
+      context: .
     ports:
-      - "9527:9527"
+      - "${CRYP_PORT:-9527}:9527"
     volumes:
-      - /vol3/1000/downloads/cryp:/data
+      - "${CRYP_DATA_DIR:-./data}:/data"
     # Optional GPU acceleration for thumbnail generation (Linux VAAPI)
     # Enable only when host has /dev/dri/renderD128 and proper VAAPI driver stack.
     # devices:
@@ -13,14 +14,14 @@ services:
     # group_add:
     #   - "105" # render device group GID on host (adjust to your host)
     environment:
-      - PORT=9527
-      - DATA_DIR=/data/config
-      - VAULT_DIR=/data/vaults
+      PORT: "9527"
+      DATA_DIR: /data/config
+      VAULT_DIR: /data/vaults
       # Optional: restrict import and directory browsing to a media subtree.
-      # - SOURCE_DIR=/data/media
-      - GOMEMLIMIT=256MiB
+      SOURCE_DIR: ${CRYP_SOURCE_DIR:-/data}
+      GOMEMLIMIT: ${GOMEMLIMIT:-256MiB}
       # Optional: thumbnail hardware acceleration strategy (auto/vaapi/qsv/cuda/cpu)
-      # - CRYP_FFMPEG_HWACCEL=auto
+      CRYP_FFMPEG_HWACCEL: ${CRYP_FFMPEG_HWACCEL:-auto}
       # Optional: override the FFmpeg executable used by HLS and thumbnails.
       # - CRYP_FFMPEG_BIN=/usr/local/bin/ffmpeg
     restart: unless-stopped

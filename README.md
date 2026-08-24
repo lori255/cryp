@@ -1,181 +1,80 @@
 # Cryp
 
-一个自托管的加密文件保险库，类似 Cryptomator，通过 Web 界面实时流式解密浏览图片和视频，无需先解密到本地。
+Cryp 是一个自托管的加密文件保险库。文件内容和文件名在磁盘上保持加密，登录后可通过 Web 界面上传、导入、浏览图片并流式播放视频。
 
-## 特性
+> Cryp 不提供托管服务。部署者需要自行负责 HTTPS、访问控制、数据备份以及宿主机安全。
 
-- **AES-256-GCM 分块加密** — 文件内容按 32KB 分块加密，支持随机访问（视频拖动）
-- **AES-SIV 文件名加密** — 文件名和目录名完全加密，支持长文件名自动缩短（`.c9s`）
-- **实时流式解密** — 图片和视频直接在浏览器中查看/播放，不生成临时文件
-- **Range 请求支持** — 视频可拖动进度条，按需解密对应片段
-- **极低内存占用** — 处理 7GB 文件峰值内存约 57MB，`sync.Pool` 复用 buffer，`FADV_DONTNEED` 控制 page cache
-- **后台任务系统** — 目录导入加密、文件上传均在后台执行，实时进度反馈
-- **移动端适配** — iOS Safari PWA 支持，视频全屏横屏播放，触控友好
+## 功能
 
-## 架构
-
-```
-┌─────────────────────────────────────────┐
-│  React + Vite + TailwindCSS             │
-│  Artplayer 视频播放 / react-photo-view  │
-└─────────────┬───────────────────────────┘
-              │ HTTP API
-┌─────────────┴───────────────────────────┐
-│  Go + Gin                               │
-│  流式加解密 / Range 请求 / 任务管理      │
-│  SQLite (WAL) / Session 管理            │
-└─────────────┬───────────────────────────┘
-              │ 文件系统
-┌─────────────┴───────────────────────────┐
-│  加密文件存储                            │
-│  content.c9r / dirid.c9r / name.c9r     │
-└─────────────────────────────────────────┘
-```
+- AES-256-GCM 分块加密，支持 Range 请求和视频拖动
+- AES-SIV 文件名加密，支持长文件名映射
+- 浏览器端图片预览和视频播放，无需预先解密完整文件
+- 后台上传、目录导入、索引和缩略图任务
+- FFmpeg 视频缩略图与按需 HLS 转码
+- Docker 部署、SQLite 持久化和移动端/PWA 界面
+- 流式 I/O、复用缓冲区和 page-cache 控制，避免内存随文件大小线性增长
 
 ## 快速开始
 
-### Docker 部署（推荐）
+需要 Docker 与 Docker Compose v2：
 
 ```bash
 git clone https://github.com/lori255/cryp.git
 cd cryp
+cp .env.example .env
 docker compose pull
 docker compose up -d
 ```
 
-访问 `http://localhost:9527`
+访问 `http://localhost:9527`。默认数据保存在仓库目录下的 `data/`；生产部署请在 `.env` 中把 `CRYP_DATA_DIR` 改为独立的持久化目录。
 
-### docker-compose.yml
+若要从当前源码构建镜像：
 
-```yaml
-services:
-  cryp:
-    image: lori255/cryp:latest
-    container_name: cryp
-    ports:
-      - "9527:9527"
-    volumes:
-      - /your/data/path:/data
-    # Optional GPU acceleration for thumbnail generation (Linux VAAPI)
-    # Enable only when host has /dev/dri/renderD128 and proper VAAPI driver stack.
-    # devices:
-    #   - /dev/dri/renderD128:/dev/dri/renderD128
-    # group_add:
-    #   - "105" # render device group GID on host (adjust to your host)
-    environment:
-      - PORT=9527
-      - DATA_DIR=/data/config
-      - VAULT_DIR=/data/vaults
-      # 可选：导入/目录浏览根目录（默认 /data；config 和 vaults 自动受保护）
-      # - SOURCE_DIR=/data/media
-      - GOMEMLIMIT=256MiB
-      # Optional: thumbnail hardware acceleration strategy (auto/vaapi/qsv/cuda/cpu)
-      # - CRYP_FFMPEG_HWACCEL=auto
-      # Optional: override the FFmpeg executable (useful for a pinned build or integration tests)
-      # - CRYP_FFMPEG_BIN=/usr/local/bin/ffmpeg
-    restart: unless-stopped
+```bash
+docker compose up -d --build
 ```
 
-将 `/your/data/path` 替换为实际存储路径，保险库配置和加密文件都存储在此目录中。导入/浏览路径受 `SOURCE_DIR` 限制；建议把它设为挂载目录下的专用媒体子目录，应用的 `DATA_DIR` 与 `VAULT_DIR` 即使位于 `/data` 下也不会被导入或删除。
+首次打开后，创建保险库并妥善保存密码。没有密码就无法恢复已加密的数据。
 
-### 首次使用
+## 文档
 
-1. 打开浏览器访问 `http://<IP>:9527`
-2. 输入保险库名称和密码创建新的保险库
-3. 通过名称和密码登录进入保险库
-4. 上传文件或导入本地目录
+- [部署、配置、GPU 与备份](docs/DEPLOYMENT.md)
+- [开发环境与测试](docs/DEVELOPMENT.md)
+- [贡献指南](CONTRIBUTING.md)
+- [安全问题报告](SECURITY.md)
 
-## 加密方案
+## 加密设计
 
-| 组件 | 算法 | 说明 |
-|------|------|------|
-| 密钥派生 | scrypt | 从密码派生主密钥 |
-| 密钥包装 | AES Key Wrap (RFC 3394) | 加密存储主密钥和 MAC 密钥 |
-| 文件内容 | AES-256-GCM | 32KB 分块加密，每块独立 nonce |
-| 文件名 | AES-SIV (RFC 5297) | 确定性加密，使用目录 ID 作为 AAD |
-| 长文件名 | SHA-256 + Base64 | 超过 220 字符的加密名自动缩短 |
+| 组件 | 算法 | 用途 |
+| --- | --- | --- |
+| 密钥派生 | scrypt | 从密码派生密钥加密密钥 |
+| 密钥包装 | AES Key Wrap（RFC 3394） | 存储包装后的主密钥和 MAC 密钥 |
+| 文件内容 | AES-256-GCM | 32 KiB 独立分块，支持随机访问 |
+| 文件名 | AES-SIV（RFC 5297） | 使用目录上下文保护文件名 |
+| 长文件名 | SHA-256 映射 | 处理超出文件系统限制的密文名称 |
+
+Cryp 的加密实现仍应视为应用级安全组件，而不是经过独立密码学审计的通用库。请只从可信来源获取镜像，并为公开访问配置 HTTPS。
 
 ## 项目结构
 
+```text
+cmd/server/          服务入口与前端嵌入
+internal/api/        HTTP API、HLS 与生命周期管理
+internal/crypto/     内容、文件名和密钥加密
+internal/storage/    SQLite 数据层
+internal/task/       后台任务
+internal/thumbnail/  FFmpeg/HEIF 缩略图
+web/                 React + TypeScript 前端
+docs/                面向用户和贡献者的长期文档
 ```
-cryp/
-├── cmd/server/          # 入口、静态文件嵌入
-├── internal/
-│   ├── api/             # HTTP 路由和处理器
-│   ├── crypto/          # 加解密核心（内容、文件名、密钥、IO）
-│   ├── pathguard/       # 导入源和 vault 存储路径策略
-│   ├── session/         # 会话管理
-│   ├── storage/         # SQLite 数据库
-│   ├── task/            # 后台任务管理
-│   └── thumbnail/       # 缩略图队列与 FFmpeg 生命周期
-├── web/                 # React 前端
-│   └── src/
-│       ├── components/  # UI 组件
-│       ├── pages/       # 页面
-│       └── lib/         # API 客户端
-├── Dockerfile           # 三阶段构建
-└── docker-compose.yml
-```
-
-## 内存优化
-
-针对 Docker 容器环境做了专门的内存优化：
-
-- **零分配流式加解密** — `EncryptingWriter` / `DecryptingReader` 复用内部 buffer
-- **sync.Pool** — `DecryptingReader` 和 32KB copy buffer 跨请求复用
-- **Page Cache 控制** — `FADV_SEQUENTIAL | FADV_NOREUSE` 预声明 + `FADV_DONTNEED` 主动释放
-- **GOMEMLIMIT** — 限制 Go 堆上限为 256MB，触发更积极的 GC
-
-## GPU 加速（可选）
-
-当前版本支持在**视频缩略图生成**阶段通过 FFmpeg 启用硬件解码加速，默认 `CRYP_FFMPEG_HWACCEL=auto`：
-
-- 自动优先尝试常见硬件后端（`vaapi`、`qsv`、`cuda` 等，取决于本机 FFmpeg 支持）
-- 若硬件不可用或驱动不兼容，会自动降级到 CPU 路径
-- 兼容 AMD / Intel CPU，以及核显/独显环境（由 FFmpeg 驱动栈决定最终可用后端）
-
-可用环境变量：
-
-- `CRYP_FFMPEG_HWACCEL`：硬件加速策略（默认 `auto`；可设 `none`/`cpu` 强制 CPU，或指定 `vaapi`/`qsv`/`cuda`）
-- `CRYP_FFMPEG_BIN`：可选的 FFmpeg 可执行文件路径；HLS 和缩略图共用该设置，便于固定版本或做 fake-FFmpeg 集成测试。
-
-示例（自动探测 + 自动降级）：
-
-```yaml
-environment:
-  - CRYP_FFMPEG_HWACCEL=auto
-```
-
-示例（Intel/AMD iGPU，常见 Linux VAAPI）：
-
-```yaml
-environment:
-  - CRYP_FFMPEG_HWACCEL=vaapi
-```
-
-示例（NVIDIA）：
-
-```yaml
-environment:
-  - CRYP_FFMPEG_HWACCEL=cuda
-```
-
-说明：
-
-- 该加速仅影响 `internal/thumbnail` 的 FFmpeg 缩略图任务。
-- 即使显卡不可用，也会自动回退到 CPU，不影响功能可用性。
-- `auto` 模式会自动选择可用后端，并自动处理常见输出格式参数。
-- 服务启动时会先做一次 GPU 自检；若自检失败，会在当前进程内关闭 GPU 加速并全程使用 CPU。
-- 文件内容 AES-GCM 加解密仍走 Go 原生实现（CPU/AES-NI），保持兼容和稳定。
 
 ## 技术栈
 
-**后端**: Go 1.24, Gin, SQLite (go-sqlite3, WAL 模式)
-
-**前端**: React, TypeScript, Vite, TailwindCSS v4, Artplayer, react-photo-view
-
-**部署**: Docker 多阶段构建, debian:bookworm-slim
+- Go 1.24、Gin、SQLite
+- React 19、TypeScript、Vite、Tailwind CSS
+- FFmpeg、libheif、Artplayer、hls.js
+- Docker 多阶段构建
 
 ## License
 
-MIT
+[MIT](LICENSE)
