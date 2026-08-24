@@ -74,6 +74,22 @@ func TestCompleteHLSStartBroadcastsFailure(t *testing.T) {
 	}
 }
 
+func TestParseFFmpegEncoderListFindsRequiredEncoderBeyondBufferSizedOutput(t *testing.T) {
+	listing := strings.Repeat(" V..... unrelated_encoder unrelated encoder\n", 3000) +
+		" V..... h264_vaapi VAAPI H.264 encoder\n" +
+		strings.Repeat(" V..... trailing_encoder trailing encoder\n", 3000)
+	encoders, err := parseFFmpegEncoderList(strings.NewReader(listing))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !encoders["h264_vaapi"] {
+		t.Fatal("required encoder was lost while streaming a large listing")
+	}
+	if len(encoders) != 1 {
+		t.Fatalf("retained %d encoder names, want only the required allowlist", len(encoders))
+	}
+}
+
 func TestCompleteHLSStartRetiredPendingReturnsCancellation(t *testing.T) {
 	key := hlsKey{vaultID: "vault", virtualPath: "/video.mp4"}
 	ctx, cancel := context.WithCancel(context.Background())

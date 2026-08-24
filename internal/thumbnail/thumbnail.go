@@ -1,7 +1,6 @@
 package thumbnail
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -37,6 +36,7 @@ const (
 	probeTimeout        = 10 * time.Second
 	detectTimeout       = 5 * time.Second
 	maxHEIFBytes        = 512 << 20
+	maxProcessLogBytes  = 64 << 10
 )
 
 var errThumbnailStale = errors.New("thumbnail job superseded")
@@ -111,24 +111,25 @@ type vaultLifecycle struct {
 //   - MP4 moov-at-end works — FFmpeg sends Range requests to seek
 //   - Only a few MB of data is transferred for a single frame extraction
 type Generator struct {
-	vaultDir    string
-	sessions    *session.Store
-	port        string
-	jobs        chan thumbJob
-	ffmpeg      ffmpegConfig
-	wg          sync.WaitGroup
-	scanWg      sync.WaitGroup
-	mu          sync.Mutex
-	commitMu    sync.Mutex
-	queued      map[string]struct{}
-	failed      map[string]time.Time
-	scanning    map[string]struct{}
-	generations map[string]uint64
-	vaults      map[string]*vaultLifecycle
-	stopped     bool
-	ctx         context.Context
-	cancel      context.CancelFunc
-	stopOnce    sync.Once
+	vaultDir       string
+	sessions       *session.Store
+	port           string
+	jobs           chan thumbJob
+	ffmpeg         ffmpegConfig
+	wg             sync.WaitGroup
+	scanWg         sync.WaitGroup
+	mu             sync.Mutex
+	commitMu       sync.Mutex
+	queued         map[string]struct{}
+	failed         map[string]time.Time
+	scanning       map[string]struct{}
+	generations    map[string]uint64
+	generationRefs map[string]int
+	vaults         map[string]*vaultLifecycle
+	stopped        bool
+	ctx            context.Context
+	cancel         context.CancelFunc
+	stopOnce       sync.Once
 }
 
 type ffmpegConfig struct {
@@ -164,18 +165,19 @@ func NewGenerator(vaultDir string, sessions *session.Store, port string) *Genera
 
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &Generator{
-		vaultDir:    vaultDir,
-		sessions:    sessions,
-		port:        port,
-		jobs:        make(chan thumbJob, queueSize),
-		ffmpeg:      cfg,
-		queued:      make(map[string]struct{}),
-		failed:      make(map[string]time.Time),
-		scanning:    make(map[string]struct{}),
-		generations: make(map[string]uint64),
-		vaults:      make(map[string]*vaultLifecycle),
-		ctx:         ctx,
-		cancel:      cancel,
+		vaultDir:       vaultDir,
+		sessions:       sessions,
+		port:           port,
+		jobs:           make(chan thumbJob, queueSize),
+		ffmpeg:         cfg,
+		queued:         make(map[string]struct{}),
+		failed:         make(map[string]time.Time),
+		scanning:       make(map[string]struct{}),
+		generations:    make(map[string]uint64),
+		generationRefs: make(map[string]int),
+		vaults:         make(map[string]*vaultLifecycle),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 	g.wg.Add(1)
 	go g.worker()
@@ -226,14 +228,17 @@ func detectFFmpegHwaccels(bin string) map[string]bool {
 	ctx, cancel := context.WithTimeout(context.Background(), detectTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "-hide_banner", "-hwaccels")
+	cmd.WaitDelay = 2 * time.Second
 	procgroup.Configure(cmd)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
+	out := procgroup.NewTailBuffer(maxProcessLogBytes)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
 		return map[string]bool{}
 	}
 
 	available := make(map[string]bool)
-	lines := strings.Split(string(out), "\n")
+	lines := strings.Split(out.String(), "\n")
 	for _, line := range lines {
 		item := strings.ToLower(strings.TrimSpace(line))
 		if item == "" || strings.Contains(item, ":") {
@@ -331,8 +336,12 @@ func canUseFFmpegAttemptWithRunner(bin string, attempt ffmpegAttempt, timeout ti
 
 func runFFmpegProbeCommand(ctx context.Context, bin string, args []string) error {
 	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.WaitDelay = 2 * time.Second
 	procgroup.Configure(cmd)
-	_, err := cmd.CombinedOutput()
+	out := procgroup.NewTailBuffer(maxProcessLogBytes)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	err := cmd.Run()
 	return err
 }
 
@@ -453,6 +462,45 @@ func (g *Generator) purgeVaultCachesLocked(vaultID string) {
 			delete(g.generations, key)
 		}
 	}
+	for key := range g.generationRefs {
+		if strings.HasPrefix(key, prefix) {
+			delete(g.generationRefs, key)
+		}
+	}
+}
+
+// retainGenerationLocked records one queued or active job that still relies on
+// the current per-path generation token. Callers must hold g.mu.
+func (g *Generator) retainGenerationLocked(key string) {
+	if g.generationRefs == nil {
+		g.generationRefs = make(map[string]int)
+	}
+	g.generationRefs[key]++
+}
+
+// releaseGenerationLocked drops a job's generation ownership. The token is no
+// longer needed once no queued/active job can commit an older thumbnail.
+// Callers must hold g.mu.
+func (g *Generator) releaseGenerationLocked(key string) {
+	refs := g.generationRefs[key]
+	if refs > 1 {
+		g.generationRefs[key] = refs - 1
+		return
+	}
+	delete(g.generationRefs, key)
+	g.maybePurgeGenerationLocked(key)
+}
+
+// maybePurgeGenerationLocked removes an idle token without disturbing a newer
+// queued generation for the same virtual path. Callers must hold g.mu.
+func (g *Generator) maybePurgeGenerationLocked(key string) {
+	if g.generationRefs[key] != 0 {
+		return
+	}
+	if _, queued := g.queued[key]; queued {
+		return
+	}
+	delete(g.generations, key)
 }
 
 // beginJob claims a queued job for execution. The claim is the last gate
@@ -694,6 +742,7 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 	// the send/close race that otherwise could panic during server shutdown.
 	select {
 	case g.jobs <- job:
+		g.retainGenerationLocked(key)
 		transferred = true
 	default:
 		delete(g.queued, key)
@@ -754,6 +803,7 @@ func (g *Generator) DeleteThumbnail(vaultID, virtualPath string) {
 	g.generations[key]++
 	delete(g.queued, key)
 	delete(g.failed, key)
+	g.maybePurgeGenerationLocked(key)
 	os.Remove(p) // ignore error if not exists
 	g.mu.Unlock()
 }
@@ -791,8 +841,11 @@ func (g *Generator) worker() {
 		} else {
 			generateErr = g.generate(job)
 		}
-		g.endJob(job)
 		g.finishJob(job, generateErr)
+		// Keep the lifecycle owner until generation bookkeeping is complete.
+		// Otherwise a retiring vault could purge its maps in endJob and have
+		// finishJob recreate a failure entry immediately afterwards.
+		g.endJob(job)
 		if generateErr != nil && !errors.Is(generateErr, errThumbnailStale) && !errors.Is(generateErr, errThumbnailSkipped) {
 			log.Printf("thumbnail: failed to generate for %s: %v", job.FilePath, generateErr)
 		}
@@ -806,6 +859,7 @@ func (g *Generator) discardJob(job thumbJob) {
 	if g.generations[key] == job.generation {
 		delete(g.queued, key)
 	}
+	g.releaseGenerationLocked(key)
 	g.maybeRetireLocked(job.VaultID)
 	g.mu.Unlock()
 }
@@ -815,6 +869,7 @@ func (g *Generator) finishJob(job thumbJob, err error) {
 	key := thumbJobKey(job.VaultID, job.FilePath)
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	defer g.releaseGenerationLocked(key)
 	// A replacement may have queued a newer generation for the same path while
 	// this job was running. Do not let the old job clear the newer job's queue
 	// marker or failure cooldown.
@@ -946,12 +1001,12 @@ func (g *Generator) generate(job thumbJob) error {
 			"-y", thumbTmp,
 		)
 
-		var stderrBuf bytes.Buffer
+		stderrBuf := procgroup.NewTailBuffer(maxProcessLogBytes)
 		cmdCtx, cancel := context.WithTimeout(baseCtx, ffmpegTimeout)
 		cmd := exec.CommandContext(cmdCtx, g.ffmpeg.bin, ffmpegArgs...)
 		cmd.WaitDelay = 2 * time.Second
 		procgroup.Configure(cmd)
-		cmd.Stderr = &stderrBuf
+		cmd.Stderr = stderrBuf
 
 		err := cmd.Run()
 		ctxErr := cmdCtx.Err()
@@ -1035,12 +1090,12 @@ func (g *Generator) generateHEIFWithContext(job thumbJob, baseCtx context.Contex
 		return err
 	}
 
-	var heifErr bytes.Buffer
+	heifErr := procgroup.NewTailBuffer(maxProcessLogBytes)
 	convertCtx, convertCancel := context.WithTimeout(baseCtx, ffmpegTimeout)
 	convertCmd := exec.CommandContext(convertCtx, "heif-convert", heifPath, fullJPEGPath)
 	convertCmd.WaitDelay = 2 * time.Second
 	procgroup.Configure(convertCmd)
-	convertCmd.Stderr = &heifErr
+	convertCmd.Stderr = heifErr
 	convertErr := convertCmd.Run()
 	convertCtxErr := convertCtx.Err()
 	convertCancel()
@@ -1070,12 +1125,12 @@ func (g *Generator) generateHEIFWithContext(job thumbJob, baseCtx context.Contex
 		"-y", thumbTmp,
 	}
 
-	var ffmpegErr bytes.Buffer
+	ffmpegErr := procgroup.NewTailBuffer(maxProcessLogBytes)
 	ffmpegCtx, ffmpegCancel := context.WithTimeout(baseCtx, ffmpegTimeout)
 	cmd := exec.CommandContext(ffmpegCtx, g.ffmpeg.bin, ffmpegArgs...)
 	cmd.WaitDelay = 2 * time.Second
 	procgroup.Configure(cmd)
-	cmd.Stderr = &ffmpegErr
+	cmd.Stderr = ffmpegErr
 	ffmpegRunErr := cmd.Run()
 	ffmpegCtxErr := ffmpegCtx.Err()
 	ffmpegCancel()

@@ -24,6 +24,7 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
   const prevTasksRef = useRef<TaskRecord[]>([])
   const pollAbortRef = useRef<AbortController | null>(null)
   const pollRequestIdRef = useRef(0)
+  const mountedRef = useRef(true)
   const cancelPolling = useCallback(() => {
     pollRequestIdRef.current += 1
     pollAbortRef.current?.abort()
@@ -34,11 +35,8 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
     }
   }, [])
 
-  useEffect(() => {
-    openRef.current = open
-  }, [open])
-
   const loadTasks = useCallback(async () => {
+    if (!mountedRef.current || !openRef.current) return
     if (pollAbortRef.current) return
     if (pollTimerRef.current) {
       clearTimeout(pollTimerRef.current)
@@ -49,7 +47,7 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
     pollAbortRef.current = controller
     try {
       const data = await api.listTasks(vaultId, controller.signal)
-      if (requestId !== pollRequestIdRef.current) return
+      if (!mountedRef.current || requestId !== pollRequestIdRef.current) return
       const newTasks = data.tasks || []
       
       const prevTasks = prevTasksRef.current
@@ -69,10 +67,10 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
       setPollError('')
       setTasks(newTasks)
     } catch {
-      if (controller.signal.aborted || requestId !== pollRequestIdRef.current) return
+      if (!mountedRef.current || controller.signal.aborted || requestId !== pollRequestIdRef.current) return
       setPollError('任务列表加载失败')
     } finally {
-      if (requestId === pollRequestIdRef.current) {
+      if (mountedRef.current && requestId === pollRequestIdRef.current) {
         pollAbortRef.current = null
         setLoading(false)
         if (openRef.current && !controller.signal.aborted) {
@@ -84,15 +82,19 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
   }, [vaultId, onRefresh])
 
   useEffect(() => {
+    mountedRef.current = true
     openRef.current = open
     cancelPolling()
     prevTasksRef.current = []
-    if (!open) return
-    setLoading(true)
-    setPollError('')
-    setActionError(null)
-    void loadTasks()
+    if (open) {
+      setLoading(true)
+      setPollError('')
+      setActionError(null)
+      void loadTasks()
+    }
     return () => {
+      mountedRef.current = false
+      openRef.current = false
       cancelPolling()
     }
   }, [open, loadTasks, cancelPolling])
@@ -101,8 +103,11 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
     setActionError(null)
     try {
       await api.cancelTask(vaultId, taskId)
-      void loadTasks()
+      if (mountedRef.current) {
+        void loadTasks()
+      }
     } catch (err) {
+      if (!mountedRef.current) return
       setActionError({ taskId, message: err instanceof Error ? err.message : '取消任务失败' })
     }
   }
@@ -111,9 +116,25 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
     setActionError(null)
     try {
       await api.deleteTask(vaultId, taskId)
-      void loadTasks()
+      if (mountedRef.current) {
+        void loadTasks()
+      }
     } catch (err) {
+      if (!mountedRef.current) return
       setActionError({ taskId, message: err instanceof Error ? err.message : '删除任务失败' })
+    }
+  }
+
+  async function handleDeleteCompleted() {
+    setActionError(null)
+    try {
+      await api.deleteCompletedTasks(vaultId)
+      if (mountedRef.current) {
+        void loadTasks()
+      }
+    } catch (err) {
+      if (!mountedRef.current) return
+      setActionError({ message: err instanceof Error ? err.message : '清除已完成任务失败' })
     }
   }
 
@@ -134,15 +155,7 @@ export default function TaskPanel({ vaultId, open, onClose, onRefresh }: TaskPan
           <div className="flex items-center gap-2">
             {tasks.some(t => t.status === 'done') && (
               <button
-                onClick={async () => {
-                  setActionError(null)
-                  try {
-                    await api.deleteCompletedTasks(vaultId)
-                    void loadTasks()
-                  } catch (err) {
-                    setActionError({ message: err instanceof Error ? err.message : '清除已完成任务失败' })
-                  }
-                }}
+                onClick={() => void handleDeleteCompleted()}
                 className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-red-400 transition-colors"
               >
                 <Trash2 className="w-3.5 h-3.5" /> 清除已完成

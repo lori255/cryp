@@ -2,6 +2,7 @@ package thumbnail
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -81,6 +82,71 @@ func TestDeleteThumbnailInvalidatesQueuedGeneration(t *testing.T) {
 	defer zeroVaultKeys(job.Keys)
 	if g.thumbnailJobCurrent(job) {
 		t.Fatal("deleted thumbnail generation remained current")
+	}
+}
+
+func TestDeleteThumbnailWithoutOutstandingJobDoesNotRetainGeneration(t *testing.T) {
+	g := &Generator{
+		vaultDir:       t.TempDir(),
+		queued:         make(map[string]struct{}),
+		failed:         make(map[string]time.Time),
+		generations:    make(map[string]uint64),
+		generationRefs: make(map[string]int),
+	}
+
+	for i := 0; i < 1000; i++ {
+		g.DeleteThumbnail("vault", fmt.Sprintf("/removed-%d.mp4", i))
+	}
+	if len(g.generations) != 0 {
+		t.Fatalf("idle generations retained %d historical paths", len(g.generations))
+	}
+	if len(g.generationRefs) != 0 {
+		t.Fatalf("idle generation refs retained %d historical paths", len(g.generationRefs))
+	}
+}
+
+func TestGenerationReleasedAfterStaleAndReplacementJobsFinish(t *testing.T) {
+	const key = "vault\x00/video.mp4"
+	g := &Generator{
+		vaultDir:       t.TempDir(),
+		jobs:           make(chan thumbJob, 2),
+		queued:         make(map[string]struct{}),
+		failed:         make(map[string]time.Time),
+		scanning:       make(map[string]struct{}),
+		generations:    make(map[string]uint64),
+		generationRefs: make(map[string]int),
+	}
+	keys := &crypto.VaultKeys{MasterKey: []byte{1}, MACKey: []byte{2}}
+
+	g.Enqueue("vault", "/vault", keys, "/video.mp4")
+	oldJob := <-g.jobs
+	g.DeleteThumbnail("vault", "/video.mp4")
+	g.Enqueue("vault", "/vault", keys, "/video.mp4")
+	newJob := <-g.jobs
+	if oldJob.generation == newJob.generation {
+		t.Fatal("replacement reused the stale generation")
+	}
+	if refs := g.generationRefs[key]; refs != 2 {
+		t.Fatalf("generation refs = %d, want 2", refs)
+	}
+
+	g.finishJob(oldJob, errThumbnailStale)
+	if refs := g.generationRefs[key]; refs != 1 {
+		t.Fatalf("generation refs after stale finish = %d, want 1", refs)
+	}
+	if _, ok := g.generations[key]; !ok {
+		t.Fatal("stale job released the replacement generation")
+	}
+	if _, ok := g.queued[key]; !ok {
+		t.Fatal("stale job cleared the replacement queue marker")
+	}
+
+	g.finishJob(newJob, nil)
+	if _, ok := g.generations[key]; ok {
+		t.Fatal("completed replacement retained an idle generation")
+	}
+	if _, ok := g.generationRefs[key]; ok {
+		t.Fatal("completed replacement retained a generation reference")
 	}
 }
 

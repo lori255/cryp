@@ -108,15 +108,23 @@ func (s *Store) Get(id string) (*Session, bool) {
 	if s == nil {
 		return nil, false
 	}
+	now := time.Now()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	session, ok := s.sessions[id]
 	if !ok {
+		s.mu.RUnlock()
 		return nil, false
 	}
-
-	if time.Now().After(session.ExpiresAt) {
+	if now.After(session.ExpiresAt) {
+		s.mu.RUnlock()
+		// Upgrade only the expired path to a write lock. Re-check after the
+		// upgrade because another request may have refreshed or deleted it.
+		s.mu.Lock()
+		if current, exists := s.sessions[id]; exists && now.After(current.ExpiresAt) {
+			zeroVaultKeys(current.Keys)
+			delete(s.sessions, id)
+		}
+		s.mu.Unlock()
 		return nil, false
 	}
 
@@ -125,6 +133,7 @@ func (s *Store) Get(id string) (*Session, bool) {
 	// zeroes keys while removing a session.
 	snapshot := *session
 	snapshot.Keys = session.Keys.Clone()
+	s.mu.RUnlock()
 	return &snapshot, true
 }
 

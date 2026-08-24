@@ -147,6 +147,7 @@ func (s *Server) handleAuthStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"authenticated": false})
 		return
 	}
+	defer sess.Keys.Zero()
 
 	vault, err := s.db.GetVault(sess.VaultID)
 	if err != nil {

@@ -368,13 +368,13 @@ export default function FileBrowser() {
       {showImport && vaultId && (
         <ImportDialog vaultId={vaultId} onClose={() => setShowImport(false)} onStarted={() => { setShowImport(false); setShowTasks(true) }} />
       )}
-      {vaultId && (
-        <TaskPanel vaultId={vaultId} open={showTasks} onClose={() => setShowTasks(false)} onRefresh={loadFiles} />
+      {vaultId && showTasks && (
+        <TaskPanel vaultId={vaultId} open onClose={() => setShowTasks(false)} onRefresh={loadFiles} />
       )}
-      {vaultId && (
+      {vaultId && showDuplicates && (
         <DuplicatePanel
           vaultId={vaultId}
-          open={showDuplicates}
+          open
           onClose={() => setShowDuplicates(false)}
           onRefresh={loadFiles}
           onOpenTasks={() => setShowTasks(true)}

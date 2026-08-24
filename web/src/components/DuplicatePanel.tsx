@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PhotoProvider, PhotoView } from 'react-photo-view'
 import { X, CopyMinus, Loader2, RefreshCw, Trash2, ScanSearch, Image as ImageIcon, Film, File as FileIcon, ShieldCheck, ChevronDown, ChevronRight } from 'lucide-react'
 import VideoPlayer from './VideoPlayer'
@@ -61,12 +61,31 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
   const [hasMore, setHasMore] = useState(false)
   const [nextOffset, setNextOffset] = useState(0)
   const [activeVideo, setActiveVideo] = useState<{ url: string; title: string } | null>(null)
+  const mountedRef = useRef(true)
+  const listAbortRef = useRef<AbortController | null>(null)
+  const listRequestIdRef = useRef(0)
+  const loadingMoreRef = useRef(false)
+
+  const cancelListRequests = useCallback(() => {
+    listRequestIdRef.current += 1
+    listAbortRef.current?.abort()
+    listAbortRef.current = null
+    loadingMoreRef.current = false
+  }, [])
 
   const loadGroups = useCallback(async () => {
+    if (!mountedRef.current) return
+    const requestId = ++listRequestIdRef.current
+    listAbortRef.current?.abort()
+    const controller = new AbortController()
+    listAbortRef.current = controller
+    loadingMoreRef.current = false
+    setLoadingMore(false)
     setLoading(true)
     setError('')
     try {
-      const data = await api.listDuplicates(vaultId, 0, DUPLICATE_PAGE_SIZE)
+      const data = await api.listDuplicates(vaultId, 0, DUPLICATE_PAGE_SIZE, controller.signal)
+      if (!mountedRef.current || controller.signal.aborted || requestId !== listRequestIdRef.current) return
       const nextGroups = data.groups || []
       const defaults = buildDefaultState(nextGroups)
       setIndexRequired(Boolean(data.indexRequired))
@@ -84,36 +103,58 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
       setHasMore(Boolean(data.hasMore))
       setNextOffset(data.nextOffset ?? nextGroups.length)
     } catch (err) {
+      if (!mountedRef.current || controller.signal.aborted || requestId !== listRequestIdRef.current) return
       setError(err instanceof Error ? err.message : '查重结果加载失败')
     } finally {
-      setLoading(false)
+      if (mountedRef.current && requestId === listRequestIdRef.current) {
+        listAbortRef.current = null
+        setLoading(false)
+      }
     }
   }, [vaultId])
 
   useEffect(() => {
-    if (!open) return
-    void loadGroups()
-  }, [open, loadGroups])
+    mountedRef.current = true
+    if (open) {
+      void loadGroups()
+    }
+    return () => {
+      mountedRef.current = false
+      cancelListRequests()
+    }
+  }, [open, loadGroups, cancelListRequests])
 
   async function loadMoreGroups() {
-    if (loadingMore || loading || !hasMore) return
+    if (!mountedRef.current || loadingMoreRef.current || loading || !hasMore) return
+    const requestId = ++listRequestIdRef.current
+    listAbortRef.current?.abort()
+    const controller = new AbortController()
+    listAbortRef.current = controller
+    loadingMoreRef.current = true
+    const offset = nextOffset
     setLoadingMore(true)
     setError('')
     try {
-      const data = await api.listDuplicates(vaultId, nextOffset, DUPLICATE_PAGE_SIZE)
+      const data = await api.listDuplicates(vaultId, offset, DUPLICATE_PAGE_SIZE, controller.signal)
+      if (!mountedRef.current || controller.signal.aborted || requestId !== listRequestIdRef.current) return
       const appendedGroups = data.groups || []
       const defaults = buildDefaultState(appendedGroups)
       setIndexRequired(Boolean(data.indexRequired))
       setGroups((prev) => [...prev, ...appendedGroups])
       setSelections((prev) => ({ ...prev, ...defaults.selections }))
       setKeepers((prev) => ({ ...prev, ...defaults.keepers }))
-      setStats(data.stats ?? stats)
+      setStats((prev) => data.stats ?? prev)
       setHasMore(Boolean(data.hasMore))
-      setNextOffset(data.nextOffset ?? nextOffset + appendedGroups.length)
+      setNextOffset(data.nextOffset ?? offset + appendedGroups.length)
     } catch (err) {
+      if (!mountedRef.current || controller.signal.aborted || requestId !== listRequestIdRef.current) return
       setError(err instanceof Error ? err.message : '加载更多重复文件失败')
     } finally {
-      setLoadingMore(false)
+      if (mountedRef.current && requestId === listRequestIdRef.current) {
+        listAbortRef.current = null
+        loadingMoreRef.current = false
+        setLoadingMore(false)
+      }
     }
   }
 
@@ -123,12 +164,16 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
     setMessage('')
     try {
       await api.rebuildFileIndex(vaultId)
+      if (!mountedRef.current) return
       setMessage('重建索引任务已加入任务列表')
       onOpenTasks?.()
     } catch (err) {
+      if (!mountedRef.current) return
       setError(err instanceof Error ? err.message : '重建索引失败')
     } finally {
-      setRebuilding(false)
+      if (mountedRef.current) {
+        setRebuilding(false)
+      }
     }
   }
 
@@ -142,16 +187,21 @@ export default function DuplicatePanel({ vaultId, open, onClose, onRefresh, onOp
     setMessage('')
     try {
       const data = await api.deleteFilesBulk(vaultId, paths)
+      if (!mountedRef.current) return
       const failedCount = Object.keys(data.failed || {}).length
       setMessage(failedCount > 0
         ? `已删除 ${data.deleted.length} 个文件，${failedCount} 个删除失败`
         : `已删除 ${data.deleted.length} 个重复文件`)
       await loadGroups()
+      if (!mountedRef.current) return
       onRefresh?.()
     } catch (err) {
+      if (!mountedRef.current) return
       setError(err instanceof Error ? err.message : '批量删除失败')
     } finally {
-      setDeleting(false)
+      if (mountedRef.current) {
+        setDeleting(false)
+      }
     }
   }
 

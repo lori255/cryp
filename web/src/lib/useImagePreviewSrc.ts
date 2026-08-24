@@ -25,12 +25,18 @@ type DecodedImage = {
   get_width: () => number
   get_height: () => number
   display: (imageData: ImageData, cb: (displayData?: ImageData) => void) => void
+  free?: () => void
+}
+
+type HeifDecoder = {
+  decode: (data: Uint8Array) => DecodedImage[]
+  decoder?: unknown | null
+  free?: () => void
 }
 
 type LibheifModule = {
-  HeifDecoder: new () => {
-    decode: (data: Uint8Array) => DecodedImage[]
-  }
+  HeifDecoder: new () => HeifDecoder
+  heif_context_free?: (context: unknown) => void
 }
 
 function abortError(): DOMException {
@@ -50,65 +56,96 @@ async function decodeHeifToJpegBlob(inputBlob: Blob, signal?: AbortSignal): Prom
   const libheif = (mod.default ?? mod) as unknown as LibheifModule
 
   const decoder = new libheif.HeifDecoder()
-  const bytes = new Uint8Array(await inputBlob.arrayBuffer())
-  throwIfAborted(signal)
-  const images = decoder.decode(bytes)
-  if (!images || images.length === 0) {
-    throw new Error('no decodable HEIF image found')
-  }
-
-  const first = images[0]
-  const width = first.get_width()
-  const height = first.get_height()
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-
-  const ctx = canvas.getContext('2d')
-  if (!ctx) {
-    throw new Error('canvas context unavailable')
-  }
-
-  const imageData = ctx.createImageData(width, height)
-  await new Promise<void>((resolve, reject) => {
-    let settled = false
-    const finish = (callback: () => void) => {
-      if (settled) return
-      settled = true
-      callback()
+  let images: DecodedImage[] = []
+  try {
+    const bytes = new Uint8Array(await inputBlob.arrayBuffer())
+    throwIfAborted(signal)
+    images = decoder.decode(bytes) || []
+    if (images.length === 0) {
+      throw new Error('no decodable HEIF image found')
     }
 
-    if (signal?.aborted) {
-      finish(() => reject(abortError()))
-      return
+    const first = images[0]
+    const width = first.get_width()
+    const height = first.get_height()
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+
+    const ctx = canvas.getContext('2d')
+    if (!ctx) {
+      throw new Error('canvas context unavailable')
     }
 
-    const onAbort = () => finish(() => reject(abortError()))
-    signal?.addEventListener('abort', onAbort, { once: true })
+    const imageData = ctx.createImageData(width, height)
+    throwIfAborted(signal)
+    await new Promise<void>((resolve, reject) => {
+      let aborted = signal?.aborted ?? false
+      const onAbort = () => {
+        // libheif's display callback cannot be cancelled. Keep the handle alive
+        // until that callback returns, then report the cancellation to the caller.
+        aborted = true
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
 
-    first.display(imageData, (displayData) => {
-      signal?.removeEventListener('abort', onAbort)
-      finish(() => {
-        if (!displayData) {
-          reject(new Error('HEIF decode failed'))
+      try {
+        first.display(imageData, (displayData) => {
+          signal?.removeEventListener('abort', onAbort)
+          try {
+            if (aborted || signal?.aborted) {
+              reject(abortError())
+              return
+            }
+            if (!displayData) {
+              reject(new Error('HEIF decode failed'))
+              return
+            }
+            ctx.putImageData(displayData, 0, 0)
+            resolve()
+          } catch (err) {
+            reject(err)
+          }
+        })
+      } catch (err) {
+        signal?.removeEventListener('abort', onAbort)
+        reject(err)
+      }
+    })
+
+    throwIfAborted(signal)
+    const outputBlob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error('JPEG encode failed'))
           return
         }
-        ctx.putImageData(displayData, 0, 0)
-        resolve()
-      })
+        resolve(blob)
+      }, 'image/jpeg', 0.9)
     })
-  })
-
-  throwIfAborted(signal)
-  return new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        reject(new Error('JPEG encode failed'))
-        return
+    throwIfAborted(signal)
+    return outputBlob
+  } finally {
+    for (const image of images) {
+      try {
+        image.free?.()
+      } catch (err) {
+        console.warn('failed to release HEIF image handle', err)
       }
-      resolve(blob)
-    }, 'image/jpeg', 0.9)
-  })
+    }
+
+    try {
+      if (decoder.free) {
+        decoder.free()
+      } else if (decoder.decoder != null && libheif.heif_context_free) {
+        // libheif-js 1.19.x exposes the context pointer on the decoder but does
+        // not provide a decoder destructor. Release it through the exported C API.
+        libheif.heif_context_free(decoder.decoder)
+        decoder.decoder = null
+      }
+    } catch (err) {
+      console.warn('failed to release HEIF decoder context', err)
+    }
+  }
 }
 
 function isApplePlatform(): boolean {

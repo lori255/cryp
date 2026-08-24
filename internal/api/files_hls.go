@@ -5,11 +5,13 @@ package api
 // package so existing Server state and route symbols remain unchanged.
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -558,7 +560,7 @@ func clearHLSProfileFailure(profile transcodeProfile) {
 	hlsProfileFailuresMu.Unlock()
 }
 
-func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, contentURL, sessionID string) (*exec.Cmd, context.CancelFunc, *tailBuffer, error) {
+func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, contentURL, sessionID string) (*exec.Cmd, context.CancelFunc, *procgroup.TailBuffer, error) {
 	segmentPattern := filepath.Join(dir, "segment_%05d.ts")
 	playlistPath := filepath.Join(dir, "index.m3u8")
 	args := []string{
@@ -591,7 +593,7 @@ func startHLSCommand(ctx context.Context, profile transcodeProfile, dir, content
 	cmd := exec.CommandContext(streamCtx, ffmpegBinary(), args...)
 	cmd.WaitDelay = 2 * time.Second
 	procgroup.Configure(cmd)
-	stderr := newTailBuffer(hlsMaxStderrBytes)
+	stderr := procgroup.NewTailBuffer(hlsMaxStderrBytes)
 	cmd.Stderr = stderr
 	cmd.Cancel = func() error {
 		cancel()
@@ -697,33 +699,6 @@ func killHLSProcess(cmd *exec.Cmd, processWait *hlsProcessWait) {
 		}
 	}
 	_ = procgroup.Kill(cmd)
-}
-
-type tailBuffer struct {
-	mu    sync.Mutex
-	limit int
-	buf   []byte
-}
-
-func newTailBuffer(limit int) *tailBuffer {
-	return &tailBuffer{limit: limit}
-}
-
-func (b *tailBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.buf = append(b.buf, p...)
-	if len(b.buf) > b.limit {
-		copy(b.buf, b.buf[len(b.buf)-b.limit:])
-		b.buf = b.buf[:b.limit]
-	}
-	return len(p), nil
-}
-
-func (b *tailBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return string(b.buf)
 }
 
 func waitForHLSReady(ctx context.Context, cmd *exec.Cmd, dir string, timeout time.Duration) error {
@@ -1582,6 +1557,46 @@ func cpuTranscodeProfile() transcodeProfile {
 	}
 }
 
+func parseFFmpegEncoderList(r io.Reader) (map[string]bool, error) {
+	encoders := make(map[string]bool)
+	scanner := bufio.NewScanner(r)
+	// FFmpeg emits one encoder per short line. Bound a malformed line while
+	// continuing to stream arbitrarily long, valid listings without retaining
+	// the complete command output.
+	scanner.Buffer(make([]byte, 1024), 64<<10)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 2 && fields[1] == "h264_vaapi" {
+			encoders[fields[1]] = true
+		}
+	}
+	return encoders, scanner.Err()
+}
+
+func runFFmpegEncoderProbe(ctx context.Context, bin string) (map[string]bool, error) {
+	cmd := exec.CommandContext(ctx, bin, "-hide_banner", "-encoders")
+	cmd.WaitDelay = 2 * time.Second
+	procgroup.Configure(cmd)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	stderr := procgroup.NewTailBuffer(hlsMaxStderrBytes)
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	encoders, scanErr := parseFFmpegEncoderList(stdout)
+	waitErr := cmd.Wait()
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	if waitErr != nil {
+		return nil, fmt.Errorf("ffmpeg encoder probe: %w: %s", waitErr, trimLog(stderr.String()))
+	}
+	return encoders, nil
+}
+
 func detectFFmpegEncoders() map[string]bool {
 	// Serialize probes so a temporary ffmpeg/driver outage cannot launch one
 	// five-second process per concurrent playback request. Successful results
@@ -1597,10 +1612,7 @@ func detectFFmpegEncoders() map[string]bool {
 
 	ctx, cancel := context.WithTimeout(context.Background(), ffmpegDetectTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "-hide_banner", "-encoders")
-	cmd.WaitDelay = 2 * time.Second
-	procgroup.Configure(cmd)
-	out, err := cmd.CombinedOutput()
+	encoders, err := runFFmpegEncoderProbe(ctx, bin)
 	if err != nil {
 		ffmpegEncodersCache = nil
 		ffmpegEncodersCacheValid = false
@@ -1609,13 +1621,6 @@ func detectFFmpegEncoders() map[string]bool {
 		return map[string]bool{}
 	}
 
-	encoders := make(map[string]bool)
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			encoders[fields[1]] = true
-		}
-	}
 	ffmpegEncodersCache = encoders
 	ffmpegEncodersCachedAt = now
 	ffmpegEncodersCacheValid = true

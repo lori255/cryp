@@ -336,9 +336,10 @@ class ApiClient {
     });
   }
 
-  async listDuplicates(vaultId: string, offset = 0, limit = 20) {
+  async listDuplicates(vaultId: string, offset = 0, limit = 20, signal?: AbortSignal) {
     return this.request<{ groups: DuplicateGroup[]; hasMore: boolean; nextOffset: number; stats: DuplicateStats; indexRequired?: boolean }>(
       `/vaults/${vaultId}/files/duplicates?offset=${offset}&limit=${limit}`,
+      { signal },
     );
   }
 
