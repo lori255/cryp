@@ -276,7 +276,7 @@ type probeOutput struct {
 		ColorTransfer      string            `json:"color_transfer"`
 		ColorPrimaries     string            `json:"color_primaries"`
 		FieldOrder         string            `json:"field_order"`
-		BitsPerRawSample   int               `json:"bits_per_raw_sample"`
+		BitsPerRawSample   probeScalar       `json:"bits_per_raw_sample"`
 		SampleFormat       string            `json:"sample_fmt"`
 		Channels           int               `json:"channels"`
 		ChannelLayout      string            `json:"channel_layout"`
@@ -403,7 +403,7 @@ func decodeProbeOutput(output []byte) (Record, error) {
 			SampleAspectRatio: stream.SampleAspectRatio, DisplayAspectRatio: stream.DisplayAspectRatio,
 			Rotation: int(parseInt64(string(stream.Rotation))), ColorRange: stream.ColorRange, ColorSpace: stream.ColorSpace,
 			ColorTransfer: stream.ColorTransfer, ColorPrimaries: stream.ColorPrimaries, FieldOrder: stream.FieldOrder,
-			BitsPerRawSample: stream.BitsPerRawSample, SampleFormat: stream.SampleFormat,
+			BitsPerRawSample: int(parseInt64(string(stream.BitsPerRawSample))), SampleFormat: stream.SampleFormat,
 			SampleRate: int(parseInt64(string(stream.SampleRate))), Channels: stream.Channels, ChannelLayout: stream.ChannelLayout,
 			Language: stream.Language, Title: stream.Title, HandlerName: stream.HandlerName,
 			Disposition: stream.Disposition, Tags: stream.Tags,
