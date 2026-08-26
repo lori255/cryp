@@ -1094,6 +1094,11 @@ func (m *Manager) rebuildEntryIndex(ctx context.Context, vault *crypto.Vault, t 
 			continue
 		}
 
+		t.CurrentFile = virtualPath
+		if err := m.db.UpdateTask(t); err != nil {
+			return err
+		}
+
 		hash, err := vault.HashVirtualFileContext(ctx, virtualPath, entry.Size > rebuildHashCacheThreshold)
 		if err != nil {
 			return fmt.Errorf("hash %s: %w", virtualPath, err)
@@ -1106,9 +1111,6 @@ func (m *Manager) rebuildEntryIndex(ctx context.Context, vault *crypto.Vault, t 
 
 		t.ProcessedFiles++
 		t.ProcessedBytes += entry.Size
-		if err := m.db.UpdateTask(t); err != nil {
-			return err
-		}
 	}
 
 	return nil
