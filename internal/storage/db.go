@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -101,6 +102,15 @@ func (d *DB) migrate() error {
 
 		CREATE INDEX IF NOT EXISTS idx_vault_entries_parent ON vault_entries(vault_id, parent_key, is_dir);
 		CREATE INDEX IF NOT EXISTS idx_vault_entries_hash ON vault_entries(vault_id, content_hash, size);
+
+		CREATE TABLE IF NOT EXISTS vault_file_metadata (
+			vault_id TEXT NOT NULL,
+			path_key TEXT NOT NULL,
+			payload BLOB NOT NULL,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (vault_id, path_key)
+		);
 
 		CREATE TABLE IF NOT EXISTS app_meta (
 			key TEXT PRIMARY KEY,
@@ -224,6 +234,9 @@ func (d *DB) DeleteVault(id string) error {
 	defer tx.Rollback()
 
 	if _, err := tx.Exec("DELETE FROM vault_entries WHERE vault_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM vault_file_metadata WHERE vault_id = ?", id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM tasks WHERE vault_id = ?", id); err != nil {
@@ -406,6 +419,17 @@ func (d *DB) DeleteCompletedTasks(vaultID string) (int64, error) {
 
 // UpsertEntry creates or updates an indexed file or directory row.
 func (d *DB) UpsertEntry(record *EntryRecord) error {
+	return upsertEntryExecutor(d, record)
+}
+
+type sqlExecutor interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func upsertEntryExecutor(executor sqlExecutor, record *EntryRecord) error {
+	if executor == nil || record == nil {
+		return errors.New("invalid index entry")
+	}
 	now := time.Now().Unix()
 	if record.CreatedAt == 0 {
 		record.CreatedAt = now
@@ -420,7 +444,7 @@ func (d *DB) UpsertEntry(record *EntryRecord) error {
 		childrenIndexed = 1
 	}
 
-	_, err := d.Exec(
+	_, err := executor.Exec(
 		`INSERT INTO vault_entries (vault_id, path_key, parent_key, name_key, is_dir, children_indexed, content_hash, size, mod_time, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(vault_id, path_key) DO UPDATE SET
@@ -484,13 +508,121 @@ func (d *DB) ListChildEntries(vaultID, parentKey string) ([]EntryRecord, error) 
 
 // DeleteEntry removes one indexed file or directory row.
 func (d *DB) DeleteEntry(vaultID, pathKey string) error {
-	_, err := d.Exec("DELETE FROM vault_entries WHERE vault_id=? AND path_key=?", vaultID, pathKey)
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM vault_file_metadata WHERE vault_id=? AND path_key=?", vaultID, pathKey); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM vault_entries WHERE vault_id=? AND path_key=?", vaultID, pathKey); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ClearEntries removes all indexed entries and their derived metadata for a vault.
+func (d *DB) ClearEntries(vaultID string) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM vault_file_metadata WHERE vault_id=?", vaultID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM vault_entries WHERE vault_id=?", vaultID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *DB) UpsertFileMetadata(vaultID, pathKey string, payload []byte) error {
+	if vaultID == "" || pathKey == "" || len(payload) == 0 {
+		return errors.New("invalid encrypted file metadata")
+	}
+	now := time.Now().Unix()
+	_, err := d.Exec(
+		`INSERT INTO vault_file_metadata (vault_id, path_key, payload, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(vault_id, path_key) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`,
+		vaultID, pathKey, payload, now, now,
+	)
 	return err
 }
 
-// ClearEntries removes all indexed entries for a vault.
-func (d *DB) ClearEntries(vaultID string) error {
-	_, err := d.Exec("DELETE FROM vault_entries WHERE vault_id=?", vaultID)
+// UpsertEntryWithFileMetadata commits the searchable index row and its
+// encrypted derived metadata as one unit. New files must never become visible
+// with only half of their index state written.
+func (d *DB) UpsertEntryWithFileMetadata(entry *EntryRecord, payload []byte) error {
+	if entry == nil || entry.VaultID == "" || entry.PathKey == "" || len(payload) == 0 {
+		return errors.New("invalid indexed file metadata")
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertEntryExecutor(tx, entry); err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	if _, err := tx.Exec(
+		`INSERT INTO vault_file_metadata (vault_id, path_key, payload, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(vault_id, path_key) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`,
+		entry.VaultID, entry.PathKey, payload, now, now,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// UpsertEntryWithoutFileMetadata atomically publishes a non-media file and
+// removes any metadata left by a previous object at the same virtual path.
+func (d *DB) UpsertEntryWithoutFileMetadata(entry *EntryRecord) error {
+	if entry == nil || entry.VaultID == "" || entry.PathKey == "" {
+		return errors.New("invalid indexed file")
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertEntryExecutor(tx, entry); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM vault_file_metadata WHERE vault_id=? AND path_key=?", entry.VaultID, entry.PathKey); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *DB) GetFileMetadata(vaultID, pathKey string) ([]byte, error) {
+	var payload []byte
+	err := d.QueryRow(
+		"SELECT payload FROM vault_file_metadata WHERE vault_id=? AND path_key=?",
+		vaultID, pathKey,
+	).Scan(&payload)
+	return payload, err
+}
+
+func (d *DB) DeleteFileMetadata(vaultID, pathKey string) error {
+	_, err := d.Exec("DELETE FROM vault_file_metadata WHERE vault_id=? AND path_key=?", vaultID, pathKey)
+	return err
+}
+
+func (d *DB) PruneFileMetadata(vaultID string) error {
+	_, err := d.Exec(
+		`DELETE FROM vault_file_metadata
+		 WHERE vault_id=? AND NOT EXISTS (
+			SELECT 1 FROM vault_entries
+			WHERE vault_entries.vault_id=vault_file_metadata.vault_id
+			  AND vault_entries.path_key=vault_file_metadata.path_key
+		)`,
+		vaultID,
+	)
 	return err
 }
 

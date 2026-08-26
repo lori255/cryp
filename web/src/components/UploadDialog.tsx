@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { api, formatSize } from '../lib/api'
 import { Upload, X, FileUp, CheckCircle2, AlertCircle } from 'lucide-react'
 
@@ -23,13 +23,26 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
   const [dragOver, setDragOver] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const uploadAbortRef = useRef<AbortController | null>(null)
+  const uploadTaskIdRef = useRef<string | null>(null)
+  const mountedRef = useRef(true)
 
-  useEffect(() => () => {
+  const cancelUpload = useCallback(() => {
     uploadAbortRef.current?.abort()
-  }, [])
+    const taskId = uploadTaskIdRef.current
+    uploadTaskIdRef.current = null
+    if (taskId) void api.cancelTask(vaultId, taskId).catch(() => {})
+  }, [vaultId])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      cancelUpload()
+    }
+  }, [cancelUpload])
 
   function handleClose() {
-    uploadAbortRef.current?.abort()
+    cancelUpload()
     onClose()
   }
 
@@ -53,22 +66,38 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
     setUploading(true)
     const controller = new AbortController()
     uploadAbortRef.current = controller
+    const isActive = () => mountedRef.current && uploadAbortRef.current === controller && !controller.signal.aborted
 
     const pendingItems = items.filter(i => i.status === 'pending')
     const totalBytes = pendingItems.reduce((sum, i) => sum + i.file.size, 0)
 
     let taskId: string | undefined
     try {
+      // Keep task creation alive when the dialog closes. Once its ID arrives,
+      // the inactive branch below cancels it, closing the server-created/client-
+      // aborted response race that would otherwise leave an orphan task.
       const resp = await api.createUploadTask(vaultId, pendingItems.length, totalBytes)
       taskId = resp.taskId
+      uploadTaskIdRef.current = taskId
+      if (!isActive()) {
+        uploadTaskIdRef.current = null
+        if (uploadAbortRef.current === controller) uploadAbortRef.current = null
+        void api.cancelTask(vaultId, taskId).catch(() => {})
+        return
+      }
       onTaskCreated?.()
-    } catch {
+    } catch (error) {
+      if (!isActive() || (error instanceof DOMException && error.name === 'AbortError')) return
       // Task creation failed, continue without task tracking
     }
 
     let fileIndex = 0
     let aborted = false
     for (let i = 0; i < items.length; i++) {
+      if (!isActive()) {
+        aborted = true
+        break
+      }
       if (items[i].status !== 'pending') continue
 
       setItems((prev) => prev.map((item, idx) =>
@@ -81,6 +110,7 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
           currentPath,
           items[i].file,
           (pct) => {
+            if (!isActive()) return
             setItems((prev) => prev.map((item, idx) =>
               idx === i ? { ...item, progress: pct } : item
             ))
@@ -90,10 +120,13 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
           pendingItems.length,
           controller.signal,
         )
+        if (!isActive()) {
+          aborted = true
+          break
+        }
         setItems((prev) => prev.map((item, idx) =>
           idx === i ? { ...item, status: 'done' as const, progress: 100 } : item
         ))
-        onUploaded()
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') {
           aborted = true
@@ -105,9 +138,18 @@ export default function UploadDialog({ vaultId, currentPath, onClose, onUploaded
       }
       fileIndex++
     }
-    uploadAbortRef.current = null
+    if (aborted) {
+      const activeTaskId = uploadTaskIdRef.current
+      uploadTaskIdRef.current = null
+      if (activeTaskId) void api.cancelTask(vaultId, activeTaskId).catch(() => {})
+    }
+    if (uploadAbortRef.current === controller) uploadAbortRef.current = null
+    if (!mountedRef.current) return
     setUploading(false)
-    if (!aborted) onUploaded()
+    if (!aborted) {
+      uploadTaskIdRef.current = null
+      onUploaded()
+    }
   }
 
   const pendingCount = items.filter((i) => i.status === 'pending').length

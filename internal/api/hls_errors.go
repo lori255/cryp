@@ -10,6 +10,8 @@ import (
 // active/pending stream budget. It is kept as a domain error so every HLS
 // entrypoint exposes the same status and machine-readable code.
 var errHLSCapacity = errors.New("hls stream capacity reached")
+var errHLSMetadataMissing = errors.New("encrypted media metadata is missing")
+var errHLSMetadataUnavailable = errors.New("media duration is unavailable")
 
 // hlsStartHTTPStatus is the HTTP adapter for the HLS domain's startup
 // lifecycle errors. Keeping this pure mapping outside the large handler file
@@ -17,6 +19,8 @@ var errHLSCapacity = errors.New("hls stream capacity reached")
 // leaking into the stream state machine.
 func hlsStartHTTPStatus(err error) int {
 	switch {
+	case errors.Is(err, errHLSMetadataMissing), errors.Is(err, errHLSMetadataUnavailable):
+		return http.StatusConflict
 	case errors.Is(err, errHLSCapacity):
 		return http.StatusTooManyRequests
 	case errors.Is(err, context.Canceled):
@@ -30,6 +34,10 @@ func hlsStartHTTPStatus(err error) int {
 
 func hlsStartErrorCode(err error) string {
 	switch {
+	case errors.Is(err, errHLSMetadataMissing):
+		return "file_metadata_missing"
+	case errors.Is(err, errHLSMetadataUnavailable):
+		return "file_metadata_unavailable"
 	case errors.Is(err, errHLSCapacity):
 		return "hls_capacity_exceeded"
 	case errors.Is(err, context.Canceled):

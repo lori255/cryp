@@ -373,10 +373,11 @@ class ApiClient {
     });
   }
 
-  async createUploadTask(vaultId: string, totalFiles: number, totalBytes: number) {
+  async createUploadTask(vaultId: string, totalFiles: number, totalBytes: number, signal?: AbortSignal) {
     return this.request<{ taskId: string }>(`/vaults/${vaultId}/tasks/upload`, {
       method: 'POST',
       body: JSON.stringify({ totalFiles, totalBytes }),
+      signal,
     });
   }
 

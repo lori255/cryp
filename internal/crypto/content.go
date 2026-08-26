@@ -59,6 +59,7 @@ func WriteFileHeader(w io.Writer, masterKey []byte, contentKey []byte) (*FileHea
 
 	// Build plaintext payload: reserved(8) + contentKey(32)
 	payload := make([]byte, HeaderPayloadSize)
+	defer clear(payload)
 	binary.BigEndian.PutUint64(payload[:8], HeaderReservedValue)
 	copy(payload[8:], contentKey)
 
@@ -98,6 +99,7 @@ func ReadFileHeader(r io.Reader, masterKey []byte) (*FileHeader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decrypt header: %w", err)
 	}
+	defer clear(payload)
 
 	reserved := binary.BigEndian.Uint64(payload[:8])
 	if reserved != HeaderReservedValue {

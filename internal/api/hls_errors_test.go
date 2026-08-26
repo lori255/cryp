@@ -14,6 +14,8 @@ func TestHLSStartHTTPStatus(t *testing.T) {
 		want int
 	}{
 		{name: "capacity", err: errHLSCapacity, want: http.StatusTooManyRequests},
+		{name: "metadata missing", err: errHLSMetadataMissing, want: http.StatusConflict},
+		{name: "metadata unavailable", err: errHLSMetadataUnavailable, want: http.StatusConflict},
 		{name: "cancelled", err: context.Canceled, want: http.StatusConflict},
 		{name: "deadline", err: context.DeadlineExceeded, want: http.StatusGatewayTimeout},
 		{name: "wrapped cancel", err: errors.Join(errors.New("startup"), context.Canceled), want: http.StatusConflict},
@@ -34,6 +36,8 @@ func TestHLSStartErrorCode(t *testing.T) {
 		want string
 	}{
 		{err: errHLSCapacity, want: "hls_capacity_exceeded"},
+		{err: errHLSMetadataMissing, want: "file_metadata_missing"},
+		{err: errHLSMetadataUnavailable, want: "file_metadata_unavailable"},
 		{err: context.Canceled, want: "hls_start_cancelled"},
 		{err: context.DeadlineExceeded, want: "hls_start_timeout"},
 		{err: errors.New("ffmpeg failed"), want: "hls_start_failed"},

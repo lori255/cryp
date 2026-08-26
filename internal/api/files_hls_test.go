@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -11,6 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"cryp/internal/crypto"
+	"cryp/internal/filemeta"
+	"cryp/internal/session"
+	"cryp/internal/storage"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -18,6 +24,16 @@ import (
 // below. It is activated only in a child process through an environment flag,
 // so normal package tests retain their usual runner.
 func TestMain(m *testing.M) {
+	if os.Getenv("CRYP_FAKE_FFPROBE_HELPER") == "1" {
+		if delay := os.Getenv("CRYP_FAKE_FFPROBE_DELAY"); delay != "" {
+			if parsed, err := time.ParseDuration(delay); err == nil {
+				time.Sleep(parsed)
+			}
+		}
+		fmt.Fprintf(os.Stdout, `{"format":{"duration":%q,"format_name":"mov,mp4","bit_rate":"1000000"},"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080}]}`,
+			os.Getenv("CRYP_FAKE_FFPROBE_DURATION"))
+		os.Exit(0)
+	}
 	if os.Getenv("CRYP_FAKE_FFMPEG_HELPER") == "1" {
 		if os.Getenv("CRYP_FAKE_FFMPEG_EXIT_EARLY") == "1" {
 			os.Exit(17)
@@ -36,6 +52,106 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(m.Run())
+}
+
+func TestDeriveMediaMetadataParsesFiniteDuration(t *testing.T) {
+	t.Setenv("CRYP_FFPROBE_BIN", os.Args[0])
+	t.Setenv("CRYP_FAKE_FFPROBE_HELPER", "1")
+	t.Setenv("CRYP_FAKE_FFPROBE_DURATION", "123.456")
+
+	sessions := session.NewStore()
+	defer sessions.Close()
+	s := &Server{sessions: sessions, port: "unused"}
+	keys := &crypto.VaultKeys{MasterKey: make([]byte, crypto.MasterKeySize), MACKey: make([]byte, crypto.MasterKeySize)}
+	record, err := s.deriveMediaMetadata(context.Background(), "vault", t.TempDir(), "/video.mp4", keys)
+	if err != nil {
+		t.Fatalf("deriveMediaMetadata: %v", err)
+	}
+	if duration := record.Duration(); duration != 123.456 {
+		t.Fatalf("duration = %v, want 123.456", duration)
+	}
+}
+
+func TestDeriveMediaMetadataHonorsCancellation(t *testing.T) {
+	t.Setenv("CRYP_FFPROBE_BIN", os.Args[0])
+	t.Setenv("CRYP_FAKE_FFPROBE_HELPER", "1")
+	t.Setenv("CRYP_FAKE_FFPROBE_DELAY", "2s")
+	t.Setenv("CRYP_FAKE_FFPROBE_DURATION", "123")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	sessions := session.NewStore()
+	defer sessions.Close()
+	s := &Server{sessions: sessions, port: "unused"}
+	keys := &crypto.VaultKeys{MasterKey: make([]byte, crypto.MasterKeySize), MACKey: make([]byte, crypto.MasterKeySize)}
+	_, err := s.deriveMediaMetadata(ctx, "vault", t.TempDir(), "/video.mp4", keys)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("probe error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("cancelled probe returned after %s", elapsed)
+	}
+}
+
+func TestRedirectHLSStreamIncludesStableDuration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest("GET", "/api/vaults/vault/files/hls", nil)
+	redirectHLSStream(c, "vault", "stream", 123.4567)
+
+	if recorder.Code != 302 {
+		t.Fatalf("status = %d, want 302", recorder.Code)
+	}
+	if got := recorder.Header().Get("Location"); got != "/api/vaults/vault/files/hls/stream/index.m3u8?duration=123.457" {
+		t.Fatalf("Location = %q", got)
+	}
+}
+
+func TestStoredMediaDurationRequiresCurrentIndexBinding(t *testing.T) {
+	db, err := storage.NewDB(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+	_, keys, err := crypto.InitVault(t.TempDir(), []byte("test-password"))
+	if err != nil {
+		t.Fatalf("InitVault: %v", err)
+	}
+	const vaultID = "vault"
+	const virtualPath = "/video.mp4"
+	entry, err := buildEntryRecord(keys.MACKey, vaultID, virtualPath, false, false, 123, 456, "protected-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	record := filemeta.Record{
+		Binding: filemeta.Binding{ContentHash: entry.ContentHash, Size: entry.Size, ModTime: entry.ModTime},
+		Media:   &filemeta.Media{DurationSeconds: 78.5, VideoCodec: "h264"},
+	}
+	payload, err := filemeta.Seal(keys.MasterKey, vaultID, entry.PathKey, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertFileMetadata(vaultID, entry.PathKey, payload); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{db: db}
+	key := hlsKey{vaultID: vaultID, virtualPath: virtualPath}
+	if got, err := s.storedMediaDuration(keys, key); err != nil || got != 78.5 {
+		t.Fatalf("stored duration = %v, want 78.5", got)
+	}
+
+	entry.ContentHash = "replacement-hash"
+	if err := db.UpsertEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.storedMediaDuration(keys, key); !errors.Is(err, errHLSMetadataMissing) || got != 0 {
+		t.Fatalf("stale stored duration = %v, error = %v, want metadata missing", got, err)
+	}
 }
 
 func TestCompleteHLSStartBroadcastsFailure(t *testing.T) {

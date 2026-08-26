@@ -228,7 +228,7 @@ function TaskItem({ task: t, onCancel, onDelete }: {
               : <Upload className="w-5 h-5 text-blue-500 flex-shrink-0" />}
           <div>
             <p className="text-sm font-medium text-white">
-              {t.type === 'import' ? '导入加密' : t.type === 'index' ? '重建索引' : '文件上传'}
+              {t.type === 'import' ? '导入加密' : t.type === 'index' ? '重建索引与媒体派生数据' : '文件上传'}
             </p>
             {t.sourcePath && (
               <p className="text-xs text-gray-500 truncate max-w-[240px]">{t.sourcePath}</p>

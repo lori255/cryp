@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"cryp/internal/crypto"
+	"cryp/internal/fileindex"
+	"cryp/internal/filemeta"
 	"cryp/internal/pathguard"
 	"cryp/internal/storage"
 	"cryp/internal/thumbnail"
@@ -22,8 +24,29 @@ type ThumbEnqueuer interface {
 	Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, virtualPath string)
 }
 
+// MediaDeriver extracts metadata from a completed encrypted file. The API
+// layer supplies the implementation because it owns authenticated content
+// serving; task workers only orchestrate when derived data is written.
+type MediaDeriver func(ctx context.Context, vaultID, vaultPath, virtualPath string, keys *crypto.VaultKeys) (*filemeta.Record, error)
+
 type thumbInvalidator interface {
 	DeleteThumbnail(vaultID, virtualPath string)
+}
+
+type thumbContextEnqueuer interface {
+	EnqueueContext(ctx context.Context, vaultID, vaultPath string, keys *crypto.VaultKeys, virtualPath string) error
+}
+
+type thumbVaultWaiter interface {
+	WaitVaultIdle(ctx context.Context, vaultID string) error
+}
+
+type thumbRebuildPreparer interface {
+	PrepareVaultRebuild(ctx context.Context, vaultID string) error
+}
+
+type thumbRebuildResumer interface {
+	ResumeVault(vaultID string)
 }
 
 // ReplaceGuard runs immediately before an imported file is written to its
@@ -77,6 +100,7 @@ type Manager struct {
 	runningByVaultType map[string]string       // vaultID:type -> taskID
 	taskRunKeys        map[string]string       // taskID -> vaultID:type
 	thumbs             ThumbEnqueuer
+	mediaDeriver       MediaDeriver
 	replaceGuard       ReplaceGuard
 	replaceLeaseGuard  ReplaceLeaseGuard
 	importGuard        *pathguard.Guard
@@ -114,6 +138,25 @@ func (m *Manager) SetThumbEnqueuer(t ThumbEnqueuer) {
 	m.mu.Lock()
 	m.thumbs = t
 	m.mu.Unlock()
+}
+
+func (m *Manager) SetMediaDeriver(deriver MediaDeriver) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.mediaDeriver = deriver
+	m.mu.Unlock()
+}
+
+func (m *Manager) getMediaDeriver() MediaDeriver {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	deriver := m.mediaDeriver
+	m.mu.RUnlock()
+	return deriver
 }
 
 func (m *Manager) getThumbEnqueuer() ThumbEnqueuer {
@@ -854,6 +897,19 @@ func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, ct
 		m.finishRun(t.ID)
 	}()
 
+	thumbs := m.getThumbEnqueuer()
+	if preparer, ok := thumbs.(thumbRebuildPreparer); ok {
+		if resumer, ok := thumbs.(thumbRebuildResumer); ok {
+			defer resumer.ResumeVault(t.VaultID)
+		}
+		if err := preparer.PrepareVaultRebuild(ctx, t.VaultID); err != nil {
+			t.Status = "error"
+			t.ErrorMsg = err.Error()
+			m.updateTask(t)
+			return
+		}
+	}
+
 	if err := m.db.ClearEntries(t.VaultID); err != nil {
 		t.Status = "error"
 		t.ErrorMsg = err.Error()
@@ -862,6 +918,14 @@ func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, ct
 	}
 
 	err := m.rebuildEntryIndex(ctx, vault, t, "/")
+	if err == nil {
+		if waiter, ok := m.getThumbEnqueuer().(thumbVaultWaiter); ok {
+			err = waiter.WaitVaultIdle(ctx, t.VaultID)
+		}
+	}
+	if err == nil {
+		err = m.db.PruneFileMetadata(t.VaultID)
+	}
 
 	if err != nil {
 		if errors.Is(err, errTaskCancelled) || errors.Is(err, context.Canceled) {
@@ -954,10 +1018,13 @@ func (m *Manager) encryptDirRecursive(ctx context.Context, vault *crypto.Vault, 
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if err := crypto.ValidateSourceIdentity(entryPath, result.Source); err != nil {
+				return fmt.Errorf("source changed after encryption %s: %w", entry.Name(), err)
+			}
 
 			protectedHash := crypto.ProtectContentHash(keys.MACKey, vault.ID, result.ContentHash)
-			if err := m.upsertEntry(keys.MACKey, vault.ID, virtualPath, false, false, result.PlaintextSize, result.ModTime, protectedHash); err != nil {
-				return fmt.Errorf("index entry %s: %w", virtualPath, err)
+			if err := m.indexFileWithArtifacts(ctx, vault, virtualPath, protectedHash, result.PlaintextSize, result.ModTime, false); err != nil {
+				return fmt.Errorf("derive artifacts %s: %w", virtualPath, err)
 			}
 
 			// Drop page cache for source file immediately after encryption.
@@ -977,21 +1044,14 @@ func (m *Manager) encryptDirRecursive(ctx context.Context, vault *crypto.Vault, 
 						return fmt.Errorf("validate source before removal %s: %w", entry.Name(), err)
 					}
 				}
-				if err := os.Remove(entryPath); err != nil {
+				if err := crypto.ValidateSourceIdentity(entryPath, result.Source); err != nil {
+					return fmt.Errorf("source changed before removal %s: %w", entry.Name(), err)
+				}
+				if err := crypto.RemoveSourceFile(entryPath, result.Source); err != nil {
 					return fmt.Errorf("remove source %s: %w", entryPath, err)
 				}
 			}
 
-			// Enqueue thumbnail generation for supported expensive previews. Take
-			// one synchronized snapshot so runtime reconfiguration cannot race the
-			// worker while it invokes the callback.
-			thumbs := m.getThumbEnqueuer()
-			if thumbs != nil && result.PlaintextSize > 0 && (thumbnail.IsVideo(entry.Name()) || thumbnail.IsHEIF(entry.Name())) {
-				if invalidator, ok := thumbs.(thumbInvalidator); ok {
-					invalidator.DeleteThumbnail(vault.ID, virtualPath)
-				}
-				thumbs.Enqueue(vault.ID, vault.Path, keys, virtualPath)
-			}
 			t.ProcessedFiles++
 			if info != nil && info.Size() > 0 {
 				t.ProcessedBytes += info.Size()
@@ -1041,8 +1101,8 @@ func (m *Manager) rebuildEntryIndex(ctx context.Context, vault *crypto.Vault, t 
 		}
 		protectedHash := crypto.ProtectContentHash(vault.Keys.MACKey, t.VaultID, hash)
 
-		if err := m.upsertEntry(vault.Keys.MACKey, t.VaultID, virtualPath, false, false, entry.Size, entry.ModTime, protectedHash); err != nil {
-			return fmt.Errorf("index entry %s: %w", virtualPath, err)
+		if err := m.indexFileWithArtifacts(ctx, vault, virtualPath, protectedHash, entry.Size, entry.ModTime, true); err != nil {
+			return fmt.Errorf("derive artifacts %s: %w", virtualPath, err)
 		}
 
 		t.ProcessedFiles++
@@ -1055,47 +1115,54 @@ func (m *Manager) rebuildEntryIndex(ctx context.Context, vault *crypto.Vault, t 
 	return nil
 }
 
+func (m *Manager) indexFileWithArtifacts(ctx context.Context, vault *crypto.Vault, virtualPath, protectedHash string, size, modTime int64, reliableThumbnail bool) error {
+	if m == nil || vault == nil || vault.Keys == nil {
+		return errors.New("media derivation is unavailable")
+	}
+	var record *filemeta.Record
+	if filemeta.IsMediaPath(virtualPath) {
+		record = &filemeta.Record{}
+		deriver := m.getMediaDeriver()
+		if deriver == nil {
+			return errors.New("media metadata deriver is not configured")
+		}
+		derived, err := deriver(ctx, vault.ID, vault.Path, virtualPath, vault.Keys)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("metadata: probe %s: %v", virtualPath, err)
+		} else if derived != nil {
+			record = derived
+		}
+	}
+	if _, err := fileindex.StoreFile(m.db, vault.Keys, fileindex.FileInput{VaultID: vault.ID, VirtualPath: virtualPath, Size: size, ModTime: modTime, ProtectedHash: protectedHash, Media: record}); err != nil {
+		return fmt.Errorf("store file index %s: %w", virtualPath, err)
+	}
+
+	thumbs := m.getThumbEnqueuer()
+	if thumbs == nil || size <= 0 || (!thumbnail.IsVideo(virtualPath) && !thumbnail.IsHEIF(virtualPath)) {
+		return nil
+	}
+	if invalidator, ok := thumbs.(thumbInvalidator); ok {
+		invalidator.DeleteThumbnail(vault.ID, virtualPath)
+	}
+	if reliableThumbnail {
+		if reliable, ok := thumbs.(thumbContextEnqueuer); ok {
+			return reliable.EnqueueContext(ctx, vault.ID, vault.Path, vault.Keys, virtualPath)
+		}
+		return errors.New("thumbnail enqueuer does not support reliable admission")
+	}
+	thumbs.Enqueue(vault.ID, vault.Path, vault.Keys, virtualPath)
+	return nil
+}
+
 func (m *Manager) upsertEntry(macKey []byte, vaultID, virtualPath string, isDir bool, childrenIndexed bool, size, modTime int64, protectedHash string) error {
-	record, err := buildEntryRecord(macKey, vaultID, virtualPath, isDir, childrenIndexed, size, modTime, protectedHash)
+	record, err := fileindex.BuildEntryRecord(macKey, fileindex.EntryInput{VaultID: vaultID, VirtualPath: virtualPath, IsDir: isDir, ChildrenIndexed: childrenIndexed, Size: size, ModTime: modTime, ProtectedHash: protectedHash})
 	if err != nil {
 		return err
 	}
 	return m.db.UpsertEntry(record)
-}
-
-func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, childrenIndexed bool, size, modTime int64, protectedHash string) (*storage.EntryRecord, error) {
-	normalized := crypto.NormalizeVirtualPath(virtualPath)
-	pathKey, err := crypto.EncryptIndexPath(macKey, vaultID, normalized)
-	if err != nil {
-		return nil, err
-	}
-	parent := crypto.ParentVirtualPath(normalized)
-	parentKey := ""
-	if parent != "" {
-		parentKey, err = crypto.EncryptIndexPath(macKey, vaultID, parent)
-		if err != nil {
-			return nil, err
-		}
-	}
-	nameKey, err := crypto.EncryptEntryNameKey(macKey, vaultID, parentKey, crypto.BaseVirtualName(normalized))
-	if err != nil {
-		return nil, err
-	}
-	if isDir {
-		protectedHash = ""
-		size = 0
-	}
-	return &storage.EntryRecord{
-		VaultID:         vaultID,
-		PathKey:         pathKey,
-		ParentKey:       parentKey,
-		NameKey:         nameKey,
-		IsDir:           isDir,
-		ChildrenIndexed: childrenIndexed,
-		ContentHash:     protectedHash,
-		Size:            size,
-		ModTime:         modTime,
-	}, nil
 }
 
 func joinVirtualPath(parent, name string) string {

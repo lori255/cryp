@@ -302,6 +302,7 @@ export default function FileBrowser() {
           <div className="text-center py-20">
             <Folder className="w-12 h-12 text-gray-700 mx-auto mb-4" />
             <p className="text-gray-400">此目录尚未建立索引</p>
+            <p className="text-sm text-gray-500 mt-2">重建将同时生成媒体元数据和缩略图。</p>
             <button onClick={handleRebuildIndex} className="mt-4 text-blue-500 hover:text-blue-400 text-sm">重建索引</button>
           </div>
         ) : files.length === 0 ? (

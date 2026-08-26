@@ -30,6 +30,85 @@ type EncryptResult struct {
 	PlaintextSize int64
 	ContentHash   string
 	ModTime       int64
+	Source        SourceIdentity
+}
+
+// SourceIdentity binds a completed import to the exact regular file that was
+// opened. Callers that remove the source must validate it again immediately
+// before unlinking so a new file moved onto the same path is never deleted.
+// The FileInfo value is intentionally opaque outside this package.
+type SourceIdentity struct {
+	info        os.FileInfo
+	Size        int64
+	ModTimeNano int64
+}
+
+func sourceIdentity(info os.FileInfo) SourceIdentity {
+	return SourceIdentity{info: info, Size: info.Size(), ModTimeNano: info.ModTime().UnixNano()}
+}
+
+func sourceInfoMatches(identity SourceIdentity, info os.FileInfo) bool {
+	return identity.info != nil && info != nil && info.Mode().IsRegular() &&
+		os.SameFile(identity.info, info) && info.Size() == identity.Size &&
+		info.ModTime().UnixNano() == identity.ModTimeNano
+}
+
+// ValidateSourceIdentity verifies that path still names the exact unchanged
+// file represented by identity.
+func ValidateSourceIdentity(path string, identity SourceIdentity) error {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("%w: stat source: %v", ErrUnsafeSource, err)
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !sourceInfoMatches(identity, pathInfo) {
+		return fmt.Errorf("%w: %s", ErrUnsafeSource, path)
+	}
+	return nil
+}
+
+// RemoveSourceFile first atomically moves the path to an unpredictable
+// quarantine name in the same directory, then validates and removes that
+// claimed name. A downloader may recreate the original path immediately, but
+// that new file is never the path being unlinked.
+func RemoveSourceFile(path string, identity SourceIdentity) error {
+	placeholder, err := os.CreateTemp(filepath.Dir(path), ".cryp-source-delete-*")
+	if err != nil {
+		return fmt.Errorf("create source quarantine: %w", err)
+	}
+	quarantinePath := placeholder.Name()
+	if err := placeholder.Close(); err != nil {
+		_ = os.Remove(quarantinePath)
+		return fmt.Errorf("close source quarantine: %w", err)
+	}
+	if err := os.Rename(path, quarantinePath); err != nil {
+		_ = os.Remove(quarantinePath)
+		return fmt.Errorf("claim source for removal: %w", err)
+	}
+	if err := ValidateSourceIdentity(quarantinePath, identity); err != nil {
+		// Restore only when doing so cannot overwrite a file recreated at the
+		// original path. Otherwise retain the quarantined file for recovery.
+		if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+			if restoreErr := os.Rename(quarantinePath, path); restoreErr != nil {
+				return fmt.Errorf("%w; restore quarantined source %s: %v", err, quarantinePath, restoreErr)
+			}
+		}
+		return err
+	}
+	if err := os.Remove(quarantinePath); err != nil {
+		return fmt.Errorf("remove quarantined source: %w", err)
+	}
+	return nil
+}
+
+func validateOpenSource(file *os.File, path string, identity SourceIdentity) error {
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("%w: stat opened source: %v", ErrUnsafeSource, err)
+	}
+	if !sourceInfoMatches(identity, fileInfo) {
+		return fmt.Errorf("%w: opened file changed: %s", ErrUnsafeSource, path)
+	}
+	return ValidateSourceIdentity(path, identity)
 }
 
 // CopyWithCacheDrop copies src to dst through encWriter, periodically
@@ -171,6 +250,7 @@ func EncryptSingleFileContext(ctx context.Context, vault *Vault, keys *VaultKeys
 		return result, fmt.Errorf("%w: %s", ErrUnsafeSource, srcPath)
 	}
 
+	result.Source = sourceIdentity(fileInfo)
 	result.ModTime = fileInfo.ModTime().Unix()
 
 	encPath, err := vault.GetEncryptedFilePath(virtualPath)
@@ -195,6 +275,7 @@ func EncryptSingleFileContext(ctx context.Context, vault *Vault, keys *VaultKeys
 	unix.Fadvise(int(srcFile.Fd()), 0, 0, unix.FADV_SEQUENTIAL|unix.FADV_NOREUSE)
 
 	contentKey := make([]byte, MasterKeySize)
+	defer clear(contentKey)
 	if _, err := rand.Read(contentKey); err != nil {
 		os.Remove(tmpPath)
 		return result, err
@@ -224,6 +305,12 @@ func EncryptSingleFileContext(ctx context.Context, vault *Vault, keys *VaultKeys
 	}
 	result.PlaintextSize = written
 	result.ContentHash = hex.EncodeToString(hasher.Sum(nil))
+	if written != result.Source.Size {
+		return result, fmt.Errorf("%w: source size changed while reading %s", ErrUnsafeSource, srcPath)
+	}
+	if err := validateOpenSource(srcFile, srcPath, result.Source); err != nil {
+		return result, err
+	}
 
 	if err := writer.Close(); err != nil {
 		os.Remove(tmpPath)
@@ -245,6 +332,12 @@ func EncryptSingleFileContext(ctx context.Context, vault *Vault, keys *VaultKeys
 	}
 	if err := ctx.Err(); err != nil {
 		os.Remove(tmpPath)
+		return result, err
+	}
+	// Syncing a large destination can take long enough for a downloader to
+	// append to or replace the source. Re-check after fsync and immediately
+	// before the atomic destination replacement.
+	if err := validateOpenSource(srcFile, srcPath, result.Source); err != nil {
 		return result, err
 	}
 	if err := os.Rename(tmpPath, encPath); err != nil {

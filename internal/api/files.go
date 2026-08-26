@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -20,6 +21,7 @@ import (
 	"strings"
 
 	"cryp/internal/crypto"
+	"cryp/internal/fileindex"
 	"cryp/internal/session"
 	"cryp/internal/storage"
 	"cryp/internal/task"
@@ -180,7 +182,7 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 
 	reader := multipart.NewReader(c.Request.Body, params["boundary"])
 
-	// Find the "file" part
+	// Find the file part without buffering the request body.
 	var part *multipart.Part
 	for {
 		p, err := reader.NextPart()
@@ -196,7 +198,7 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 			part = p
 			break
 		}
-		p.Close()
+		_ = p.Close()
 	}
 	if part == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file part not found"})
@@ -245,6 +247,7 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 	}()
 
 	contentKey := make([]byte, crypto.MasterKeySize)
+	defer clear(contentKey)
 	if _, err := rand.Read(contentKey); err != nil {
 		os.Remove(tmpPath)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate content key"})
@@ -299,7 +302,9 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 	}
 
 	protectedHash := crypto.ProtectContentHash(sess.Keys.MACKey, sess.VaultID, hex.EncodeToString(hasher.Sum(nil)))
-	if err := s.upsertEntry(sess.Keys.MACKey, sess.VaultID, virtualPath, false, false, written, modTime, protectedHash); err != nil {
+	metadataReady, indexErr := s.indexCommittedFile(context.Background(), sess.VaultID, sess.VaultPath, virtualPath, sess.Keys, written, modTime, protectedHash)
+	if indexErr != nil {
+		log.Printf("upload: derive/index %s: %v", virtualPath, indexErr)
 		removeEncryptedPath(encPath)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to index file"})
 		return
@@ -318,19 +323,12 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 		}
 	}
 
-	// Enqueue video thumbnail generation
-	if s.thumbs != nil && written > 0 && (thumbnail.IsVideo(fileName) || thumbnail.IsHEIF(fileName)) {
-		// The encrypted destination may have replaced an older file at the same
-		// virtual path. Invalidate its cached preview before enqueueing; Enqueue
-		// intentionally skips existing thumbnails to deduplicate work.
-		s.thumbs.DeleteThumbnail(sess.VaultID, virtualPath)
-		s.thumbs.Enqueue(sess.VaultID, sess.VaultPath, sess.Keys, virtualPath)
-	}
 	c.JSON(http.StatusOK, gin.H{
-		"message":  "file uploaded",
-		"path":     virtualPath,
-		"size":     written,
-		"fileName": fileName,
+		"message":       "file uploaded",
+		"path":          virtualPath,
+		"size":          written,
+		"fileName":      fileName,
+		"metadataReady": metadataReady,
 	})
 }
 
@@ -754,9 +752,10 @@ func (s *Server) handleThumbnail(c *gin.Context) {
 	}
 	thumbPath := s.thumbs.GetPath(sess.VaultID, path)
 	if thumbPath == "" {
-		// Thumbnail not yet generated — trigger async generation and return 404
-		s.thumbs.Enqueue(sess.VaultID, sess.VaultPath, sess.Keys, path)
-		c.JSON(http.StatusNotFound, gin.H{"error": "thumbnail not ready"})
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "thumbnail is missing; rebuild the file index to regenerate derived media",
+			"code":  "thumbnail_missing",
+		})
 		return
 	}
 
@@ -879,36 +878,5 @@ func (s *Server) upsertEntry(macKey []byte, vaultID, virtualPath string, isDir b
 }
 
 func buildEntryRecord(macKey []byte, vaultID, virtualPath string, isDir bool, childrenIndexed bool, size, modTime int64, protectedHash string) (*storage.EntryRecord, error) {
-	normalized := crypto.NormalizeVirtualPath(virtualPath)
-	pathKey, err := crypto.EncryptIndexPath(macKey, vaultID, normalized)
-	if err != nil {
-		return nil, err
-	}
-	parent := crypto.ParentVirtualPath(normalized)
-	parentKey := ""
-	if parent != "" {
-		parentKey, err = crypto.EncryptIndexPath(macKey, vaultID, parent)
-		if err != nil {
-			return nil, err
-		}
-	}
-	nameKey, err := crypto.EncryptEntryNameKey(macKey, vaultID, parentKey, crypto.BaseVirtualName(normalized))
-	if err != nil {
-		return nil, err
-	}
-	if isDir {
-		protectedHash = ""
-		size = 0
-	}
-	return &storage.EntryRecord{
-		VaultID:         vaultID,
-		PathKey:         pathKey,
-		ParentKey:       parentKey,
-		NameKey:         nameKey,
-		IsDir:           isDir,
-		ChildrenIndexed: childrenIndexed,
-		ContentHash:     protectedHash,
-		Size:            size,
-		ModTime:         modTime,
-	}, nil
+	return fileindex.BuildEntryRecord(macKey, fileindex.EntryInput{VaultID: vaultID, VirtualPath: virtualPath, IsDir: isDir, ChildrenIndexed: childrenIndexed, Size: size, ModTime: modTime, ProtectedHash: protectedHash})
 }

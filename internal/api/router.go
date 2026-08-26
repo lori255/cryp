@@ -87,6 +87,7 @@ func NewServerWithPortAndSourceRoot(db *storage.DB, sessions *session.Store, tas
 		tasks.SetReplaceGuard(server.PrepareFileReplacement)
 		tasks.SetReplaceLeaseGuard(server.BeginFileReplacement)
 		tasks.SetImportSourceGuard(sourceGuard)
+		tasks.SetMediaDeriver(server.deriveMediaMetadata)
 	}
 	return server
 }

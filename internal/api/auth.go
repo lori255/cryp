@@ -84,11 +84,6 @@ func (s *Server) handleLogin(c *gin.Context) {
 	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("session_id", sessionID, 86400, "/", "", false, true)
 
-	// Trigger background thumbnail scan for videos missing thumbnails
-	if s.thumbs != nil {
-		s.thumbs.ScanVault(vault.ID, vault.Path, keys)
-	}
-
 	c.JSON(http.StatusOK, gin.H{
 		"sessionId": sessionID,
 		"vaultId":   vault.ID,

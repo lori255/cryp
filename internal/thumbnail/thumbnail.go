@@ -41,6 +41,7 @@ const (
 
 var errThumbnailStale = errors.New("thumbnail job superseded")
 var errThumbnailSkipped = errors.New("thumbnail generation skipped")
+var errThumbnailQueueFull = errors.New("thumbnail queue is full")
 
 // videoExtensions lists supported video file extensions
 var videoExtensions = map[string]bool{
@@ -101,7 +102,6 @@ type vaultLifecycle struct {
 	pending   int
 	nextID    uint64
 	active    map[uint64]*thumbnailRun
-	scans     map[uint64]*thumbnailRun
 }
 
 // Generator manages async thumbnail generation with a single-worker queue.
@@ -117,15 +117,14 @@ type Generator struct {
 	jobs           chan thumbJob
 	ffmpeg         ffmpegConfig
 	wg             sync.WaitGroup
-	scanWg         sync.WaitGroup
 	mu             sync.Mutex
 	commitMu       sync.Mutex
 	queued         map[string]struct{}
 	failed         map[string]time.Time
-	scanning       map[string]struct{}
 	generations    map[string]uint64
 	generationRefs map[string]int
 	vaults         map[string]*vaultLifecycle
+	resumePending  map[string]struct{}
 	stopped        bool
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -172,10 +171,10 @@ func NewGenerator(vaultDir string, sessions *session.Store, port string) *Genera
 		ffmpeg:         cfg,
 		queued:         make(map[string]struct{}),
 		failed:         make(map[string]time.Time),
-		scanning:       make(map[string]struct{}),
 		generations:    make(map[string]uint64),
 		generationRefs: make(map[string]int),
 		vaults:         make(map[string]*vaultLifecycle),
+		resumePending:  make(map[string]struct{}),
 		ctx:            ctx,
 		cancel:         cancel,
 	}
@@ -411,17 +410,11 @@ func (g *Generator) lifecycleLocked(vaultID string) *vaultLifecycle {
 	}
 	state := g.vaults[vaultID]
 	if state == nil {
-		state = &vaultLifecycle{
-			active: make(map[uint64]*thumbnailRun),
-			scans:  make(map[uint64]*thumbnailRun),
-		}
+		state = &vaultLifecycle{active: make(map[uint64]*thumbnailRun)}
 		g.vaults[vaultID] = state
 	}
 	if state.active == nil {
 		state.active = make(map[uint64]*thumbnailRun)
-	}
-	if state.scans == nil {
-		state.scans = make(map[uint64]*thumbnailRun)
 	}
 	return state
 }
@@ -435,8 +428,9 @@ func (g *Generator) maybeRetireLocked(vaultID string) {
 	if state == nil || !state.retiring {
 		return
 	}
-	if state.pending == 0 && len(state.active) == 0 && len(state.scans) == 0 {
+	if state.pending == 0 && len(state.active) == 0 {
 		g.purgeVaultCachesLocked(vaultID)
+		delete(g.resumePending, vaultID)
 		delete(g.vaults, vaultID)
 	}
 }
@@ -541,52 +535,17 @@ func (g *Generator) endJob(job thumbJob) {
 		run.cancel()
 		close(run.done)
 	}
+	if len(state.active) == 0 && state.pending == 0 {
+		if _, requested := g.resumePending[job.VaultID]; requested && !state.retiring {
+			state.quiescing = false
+			delete(g.resumePending, job.VaultID)
+		}
+	}
 	g.maybeRetireLocked(job.VaultID)
 }
 
-func (g *Generator) beginScan(vaultID string) (context.Context, uint64, bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.stopped {
-		return nil, 0, false
-	}
-	state := g.lifecycleLocked(vaultID)
-	if state.quiescing || state.retiring {
-		return nil, 0, false
-	}
-	if g.scanning == nil {
-		g.scanning = make(map[string]struct{})
-	}
-	if _, ok := g.scanning[vaultID]; ok {
-		return nil, 0, false
-	}
-	state.nextID++
-	runID := state.nextID
-	ctx, cancel := context.WithCancel(g.baseContext())
-	state.scans[runID] = &thumbnailRun{cancel: cancel, done: make(chan struct{})}
-	g.scanning[vaultID] = struct{}{}
-	// Stop waits for scanWg after taking the same mutex, so Add must happen
-	// before releasing g.mu to avoid an Add/Wait race during shutdown.
-	g.scanWg.Add(1)
-	return ctx, runID, true
-}
-
-func (g *Generator) endScan(vaultID string, runID uint64) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	delete(g.scanning, vaultID)
-	if state := g.vaults[vaultID]; state != nil {
-		if run, ok := state.scans[runID]; ok {
-			delete(state.scans, runID)
-			run.cancel()
-			close(run.done)
-		}
-	}
-	g.maybeRetireLocked(vaultID)
-}
-
 // QuiesceVault prevents new thumbnail work for a vault, cancels active
-// FFmpeg/scan work, and waits for the concrete owners to finish. Queued jobs
+// FFmpeg work, and waits for the concrete owners to finish. Queued jobs
 // remain in the shared channel but are discarded by beginJob, so they never
 // touch a path after this method returns successfully.
 func (g *Generator) QuiesceVault(ctx context.Context, vaultID string) error {
@@ -603,11 +562,8 @@ func (g *Generator) QuiesceVault(ctx context.Context, vaultID string) error {
 	}
 	state := g.lifecycleLocked(vaultID)
 	state.quiescing = true
-	runs := make([]*thumbnailRun, 0, len(state.active)+len(state.scans))
+	runs := make([]*thumbnailRun, 0, len(state.active))
 	for _, run := range state.active {
-		runs = append(runs, run)
-	}
-	for _, run := range state.scans {
 		runs = append(runs, run)
 	}
 	g.mu.Unlock()
@@ -635,12 +591,18 @@ func (g *Generator) ResumeVault(vaultID string) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.resumePending == nil {
+		g.resumePending = make(map[string]struct{})
+	}
 	state := g.vaults[vaultID]
 	if state == nil || state.retiring {
 		return
 	}
-	if len(state.active) == 0 && len(state.scans) == 0 {
+	if len(state.active) == 0 && state.pending == 0 {
 		state.quiescing = false
+		delete(g.resumePending, vaultID)
+	} else {
+		g.resumePending[vaultID] = struct{}{}
 	}
 }
 
@@ -672,7 +634,6 @@ func (g *Generator) Stop() {
 		if g.cancel != nil {
 			g.cancel()
 		}
-		g.scanWg.Wait()
 		if g.jobs != nil {
 			g.mu.Lock()
 			close(g.jobs)
@@ -685,11 +646,96 @@ func (g *Generator) Stop() {
 // Enqueue adds a thumbnail generation job to the queue.
 // Non-blocking: drops the job if queue is full.
 func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, virtualPath string) {
+	if err := g.tryEnqueue(vaultID, vaultPath, keys, virtualPath); errors.Is(err, errThumbnailQueueFull) {
+		log.Printf("thumbnail: queue full, dropping %s", virtualPath)
+	}
+}
+
+// EnqueueContext guarantees admission unless the caller is cancelled or the
+// generator is unavailable. Rebuild tasks use it to apply natural backpressure
+// instead of silently dropping derived assets when a large vault fills the
+// bounded worker queue.
+func (g *Generator) EnqueueContext(ctx context.Context, vaultID, vaultPath string, keys *crypto.VaultKeys, virtualPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		err := g.tryEnqueue(vaultID, vaultPath, keys, virtualPath)
+		if !errors.Is(err, errThumbnailQueueFull) {
+			return err
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// WaitVaultIdle waits until every admitted thumbnail for a vault has either
+// completed or failed. Index rebuild tasks use this completion barrier so a
+// successful rebuild means its screenshot work is no longer merely queued.
+func (g *Generator) WaitVaultIdle(ctx context.Context, vaultID string) error {
+	if g == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		g.mu.Lock()
+		state := g.vaults[vaultID]
+		idle := state == nil || (state.pending == 0 && len(state.active) == 0)
+		g.mu.Unlock()
+		if idle {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// PrepareVaultRebuild drains existing work and removes the complete derived
+// thumbnail cache for a vault. Rebuild will repopulate it from the encrypted
+// source of truth, which also removes orphaned screenshots for deleted files.
+// Admission is reopened before returning so the caller can enqueue the fresh
+// generation; the cache removal itself is protected by the quiesce barrier.
+func (g *Generator) PrepareVaultRebuild(ctx context.Context, vaultID string) error {
+	if g == nil || strings.TrimSpace(g.vaultDir) == "" || strings.TrimSpace(vaultID) == "" {
+		return errors.New("thumbnail generator is unavailable")
+	}
+	// Establish the admission barrier before waiting. Otherwise a producer can
+	// enqueue work between WaitVaultIdle returning and cache removal.
+	if err := g.QuiesceVault(ctx, vaultID); err != nil {
+		return err
+	}
+	g.commitMu.Lock()
+	defer g.commitMu.Unlock()
+	if err := os.RemoveAll(filepath.Join(g.vaultDir, vaultID, thumbDir)); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	g.purgeVaultCachesLocked(vaultID)
+	g.mu.Unlock()
+	g.ResumeVault(vaultID)
+	return nil
+}
+
+func (g *Generator) tryEnqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, virtualPath string) error {
 	if g == nil || keys == nil || strings.TrimSpace(g.vaultDir) == "" || strings.TrimSpace(vaultID) == "" {
-		return
+		return errors.New("thumbnail generator is unavailable")
 	}
 	if g.HasThumbnail(vaultID, virtualPath) {
-		return
+		return nil
 	}
 	// Jobs outlive the request/session that enqueued them. Keep an owned copy
 	// so session expiry or logout cannot zero the key slices while the worker is
@@ -707,22 +753,22 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 	g.mu.Lock()
 	if g.stopped {
 		g.mu.Unlock()
-		return
+		return errors.New("thumbnail generator is stopped")
 	}
 	state := g.lifecycleLocked(vaultID)
 	if state.quiescing || state.retiring {
 		g.mu.Unlock()
-		return
+		return errors.New("thumbnail vault is unavailable")
 	}
 	g.pruneFailedLocked(now)
 	if _, ok := g.queued[key]; ok {
 		g.mu.Unlock()
-		return
+		return nil
 	}
 	if failedUntil, ok := g.failed[key]; ok {
 		if now.Before(failedUntil) {
 			g.mu.Unlock()
-			return
+			return nil
 		}
 		delete(g.failed, key)
 	}
@@ -748,9 +794,11 @@ func (g *Generator) Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, v
 		delete(g.queued, key)
 		state.pending--
 		g.maybeRetireLocked(vaultID)
-		log.Printf("thumbnail: queue full, dropping %s", virtualPath)
+		g.mu.Unlock()
+		return errThumbnailQueueFull
 	}
 	g.mu.Unlock()
+	return nil
 }
 
 func (g *Generator) pruneFailedLocked(now time.Time) {
@@ -1251,63 +1299,6 @@ func (g *Generator) writeDecryptedFileWithContext(job thumbJob, outPath string, 
 	crypto.DropFileCache(in)
 	crypto.DropFileCache(out)
 	return nil
-}
-
-// ScanVault scans a vault for video files that are missing thumbnails and enqueues them.
-// Runs in a goroutine to avoid blocking startup.
-func (g *Generator) ScanVault(vaultID, vaultPath string, keys *crypto.VaultKeys) {
-	if g == nil || keys == nil {
-		return
-	}
-	ctx, runID, ok := g.beginScan(vaultID)
-	if !ok {
-		return
-	}
-	keysCopy := keys.Clone()
-	go func() {
-		defer func() {
-			zeroVaultKeys(keysCopy)
-			g.endScan(vaultID, runID)
-			g.scanWg.Done()
-		}()
-		vault := &crypto.Vault{
-			ID:   vaultID,
-			Path: vaultPath,
-			Keys: keysCopy,
-		}
-		g.scanDir(ctx, vault, "/")
-	}()
-}
-
-func (g *Generator) scanDir(ctx context.Context, vault *crypto.Vault, dirPath string) {
-	if ctx == nil {
-		ctx = g.baseContext()
-	}
-	if err := ctx.Err(); err != nil {
-		return
-	}
-	files, err := vault.ListDirectory(dirPath)
-	if err != nil {
-		return
-	}
-
-	for _, f := range files {
-		if err := ctx.Err(); err != nil {
-			return
-		}
-		fullPath := dirPath
-		if fullPath == "/" {
-			fullPath = "/" + f.Name
-		} else {
-			fullPath = dirPath + "/" + f.Name
-		}
-
-		if f.IsDir {
-			g.scanDir(ctx, vault, fullPath)
-		} else if f.Size > 0 && (IsVideo(f.Name) || IsHEIF(f.Name)) && !g.HasThumbnail(vault.ID, fullPath) {
-			g.Enqueue(vault.ID, vault.Path, vault.Keys, fullPath)
-		}
-	}
 }
 
 func zeroVaultKeys(keys *crypto.VaultKeys) {

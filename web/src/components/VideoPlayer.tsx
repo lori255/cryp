@@ -9,6 +9,7 @@ import {
   lockLandscapeOrientation,
   requestVideoFullscreen,
 } from '../lib/videoFullscreen'
+import { durationFromUrl, installStableTimeline } from '../lib/videoTimeline'
 
 interface VideoPlayerProps {
   url: string
@@ -83,6 +84,15 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
     let disposed = false
     let streamStopped = false
     let activeHlsUrl = activeUrl
+    let stableDuration = durationFromUrl(activeUrl)
+    let refreshTimeline = () => {}
+    let terminalErrorHandled = false
+    const rememberStableDuration = (candidate: string) => {
+      const duration = durationFromUrl(candidate)
+      if (duration <= 0) return
+      stableDuration = duration
+      refreshTimeline()
+    }
     const probeController = new AbortController()
     const stopStream = () => {
       if (streamStopped) return
@@ -183,6 +193,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
                   const candidatePath = new URL(candidate, window.location.origin).pathname
                   if (candidatePath.endsWith('/index.m3u8') || candidatePath.endsWith('/files/hls')) {
                     activeHlsUrl = candidate
+                    rememberStableDuration(candidate)
                     break
                   }
                 } catch {
@@ -193,7 +204,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
             })
             let mediaRecoveryCount = 0
             hls.on(Hls.Events.ERROR, (_, data) => {
-              if (disposed || !data.fatal) return
+              if (disposed || !data.fatal || terminalErrorHandled) return
 
               // A single media recovery handles transient decoder state. Do
               // not retry fatal network errors indefinitely: each retry can
@@ -204,6 +215,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
                 return
               }
 
+              terminalErrorHandled = true
               stopStream()
               destroyHlsInstances()
               const detail = data as typeof data & {
@@ -214,6 +226,8 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
               let message = '视频转码播放失败'
               if (status === 401 || status === 403) {
                 message = '登录状态已失效，请重新登录'
+              } else if (status === 409) {
+                message = '缺少或无法读取媒体索引，请先重建文件索引'
               } else if (status === 404) {
                 message = '视频或转码分片不存在'
               } else if (status === 429) {
@@ -232,7 +246,10 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
 
           if (video.canPlayType('application/vnd.apple.mpegurl')) {
             video.src = sourceUrl
+            return
           }
+          terminalErrorHandled = true
+          setErrorState({ baseUrl: activeBaseUrl, message: '当前浏览器不支持 HLS 视频播放' })
         },
       },
     })
@@ -244,6 +261,12 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       videoEl.setAttribute('playsinline', '')
       videoEl.setAttribute('webkit-playsinline', '')
       videoEl.playsInline = true
+      const timeline = installStableTimeline(art, videoEl, () => stableDuration)
+      refreshTimeline = timeline.refresh
+      const refreshStableTimeline = () => {
+        if (videoEl.currentSrc) rememberStableDuration(videoEl.currentSrc)
+        timeline.refresh()
+      }
 
       let pendingResumeTime = resumePositionRef.current
       resumePositionRef.current = null
@@ -337,6 +360,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
         if (videoEl.currentTime > 0) {
           clearStallCheck()
         }
+        timeline.refresh()
       }
 
       const handlePause = () => {
@@ -344,7 +368,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       }
 
       const handleVideoError = () => {
-        if (disposed) return
+        if (disposed || terminalErrorHandled || contentFallbackInProgress) return
         clearStallCheck()
         if (!hasTriedHlsFallback && activeUrl.includes('/files/content')) {
           hasTriedHlsFallback = true
@@ -379,6 +403,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
               setErrorState({ baseUrl: activeBaseUrl, message: '无法读取视频文件（HTTP ' + response.status + '）' })
               return
             }
+            terminalErrorHandled = true
             stopStream()
             setErrorState(null)
             setSourceState({
@@ -392,6 +417,7 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
           })
           return
         }
+        terminalErrorHandled = true
         stopStream()
         setErrorState({ baseUrl: activeBaseUrl, message: '视频转码播放失败' })
       }
@@ -401,6 +427,9 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
       videoEl.addEventListener('webkitpresentationmodechanged', handlePresentationModeChange)
       document.addEventListener('fullscreenchange', handleFullscreenChange)
       videoEl.addEventListener('play', scheduleInitialStallRecovery)
+      videoEl.addEventListener('loadedmetadata', refreshStableTimeline)
+      videoEl.addEventListener('durationchange', refreshStableTimeline)
+      videoEl.addEventListener('progress', refreshStableTimeline)
       videoEl.addEventListener('timeupdate', handleTimeUpdate)
       videoEl.addEventListener('pause', handlePause)
       videoEl.addEventListener('error', handleVideoError)
@@ -416,10 +445,14 @@ export default function VideoPlayer({ url, title, onClose }: VideoPlayerProps) {
         document.removeEventListener('fullscreenchange', handleFullscreenChange)
         videoEl.removeEventListener('loadedmetadata', restorePlaybackPosition)
         videoEl.removeEventListener('play', scheduleInitialStallRecovery)
+        videoEl.removeEventListener('loadedmetadata', refreshStableTimeline)
+        videoEl.removeEventListener('durationchange', refreshStableTimeline)
+        videoEl.removeEventListener('progress', refreshStableTimeline)
         videoEl.removeEventListener('timeupdate', handleTimeUpdate)
         videoEl.removeEventListener('pause', handlePause)
         videoEl.removeEventListener('error', handleVideoError)
         clearStallCheck()
+        timeline.destroy()
         releaseOrientationLock()
       })
     }

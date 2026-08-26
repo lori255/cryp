@@ -13,12 +13,11 @@ import (
 func TestGeneratorStopIsIdempotentAndClosesEnqueueRace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &Generator{
-		jobs:     make(chan thumbJob, 1),
-		queued:   make(map[string]struct{}),
-		failed:   make(map[string]time.Time),
-		scanning: make(map[string]struct{}),
-		ctx:      ctx,
-		cancel:   cancel,
+		jobs:   make(chan thumbJob, 1),
+		queued: make(map[string]struct{}),
+		failed: make(map[string]time.Time),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	g.wg.Add(1)
 	go g.worker()
@@ -35,7 +34,6 @@ func TestEnqueueCopiesKeysForQueuedJob(t *testing.T) {
 		jobs:     make(chan thumbJob, 1),
 		queued:   make(map[string]struct{}),
 		failed:   make(map[string]time.Time),
-		scanning: make(map[string]struct{}),
 	}
 	keys := &crypto.VaultKeys{MasterKey: []byte{1, 2}, MACKey: []byte{3, 4}}
 	g.Enqueue("vault", "/vault", keys, "/video.mp4")
@@ -72,7 +70,6 @@ func TestDeleteThumbnailInvalidatesQueuedGeneration(t *testing.T) {
 		jobs:        make(chan thumbJob, 1),
 		queued:      make(map[string]struct{}),
 		failed:      make(map[string]time.Time),
-		scanning:    make(map[string]struct{}),
 		generations: make(map[string]uint64),
 	}
 	keys := &crypto.VaultKeys{MasterKey: []byte{1}, MACKey: []byte{2}}
@@ -112,7 +109,6 @@ func TestGenerationReleasedAfterStaleAndReplacementJobsFinish(t *testing.T) {
 		jobs:           make(chan thumbJob, 2),
 		queued:         make(map[string]struct{}),
 		failed:         make(map[string]time.Time),
-		scanning:       make(map[string]struct{}),
 		generations:    make(map[string]uint64),
 		generationRefs: make(map[string]int),
 	}
@@ -216,7 +212,6 @@ func TestQuiesceVaultCancelsActiveRunAndBlocksNewJobs(t *testing.T) {
 		jobs:        make(chan thumbJob, 2),
 		queued:      make(map[string]struct{}),
 		failed:      make(map[string]time.Time),
-		scanning:    make(map[string]struct{}),
 		generations: make(map[string]uint64),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -267,7 +262,6 @@ func TestQuiescedQueuedJobIsDiscardedAfterVaultForget(t *testing.T) {
 		jobs:        make(chan thumbJob, 1),
 		queued:      make(map[string]struct{}),
 		failed:      make(map[string]time.Time),
-		scanning:    make(map[string]struct{}),
 		generations: make(map[string]uint64),
 		ctx:         ctx,
 		cancel:      cancel,

@@ -13,12 +13,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,8 +43,9 @@ type hlsKey struct {
 }
 
 type hlsStartResult struct {
-	streamID string
-	err      error
+	streamID        string
+	durationSeconds float64
+	err             error
 }
 
 type hlsPending struct {
@@ -73,8 +76,9 @@ type hlsStream struct {
 	lastSeen      time.Time
 	stopRequested bool
 	finished      bool
-	// Deprecated compatibility fields retained for older in-package tests;
-	// playlists are now produced and served directly by FFmpeg.
+	// durationSeconds is the stable source duration exposed to the player while
+	// the FFmpeg playlist is still growing. The remaining fields are retained
+	// only for older in-package tests; playlists are served directly by FFmpeg.
 	durationSeconds float64
 	segmentSeconds  float64
 	playlist        string
@@ -174,7 +178,7 @@ func (s *Server) handleHLSStart(c *gin.Context) {
 				existing.lastSeen = time.Now()
 				s.hlsMu.Unlock()
 				s.hlsLifeMu.RUnlock()
-				redirectHLSStream(c, sess.VaultID, existingID)
+				redirectHLSStream(c, sess.VaultID, existingID, existing.durationSeconds)
 				return
 			}
 		}
@@ -272,6 +276,11 @@ func (s *Server) runHLSStart(pending *hlsPending, vaultID, vaultPath, virtualPat
 		s.completeHLSStart(pending, nil, err)
 		return
 	}
+	duration, err := s.storedMediaDuration(keysCopy, pending.key)
+	if err != nil {
+		s.completeHLSStart(pending, nil, err)
+		return
+	}
 	sessionID, err := s.sessions.Create(vaultID, vaultPath, keysCopy)
 	if err != nil {
 		s.completeHLSStart(pending, nil, err)
@@ -294,6 +303,7 @@ func (s *Server) runHLSStart(pending *hlsPending, vaultID, vaultPath, virtualPat
 		s.completeHLSStart(pending, nil, err)
 		return
 	}
+	stream.durationSeconds = duration
 
 	result := s.completeHLSStart(pending, stream, nil)
 	if result.err != nil {
@@ -325,10 +335,18 @@ func (s *Server) hlsContentURL(vaultID, virtualPath string) string {
 		port, vaultID, url.QueryEscape(virtualPath))
 }
 
-func redirectHLSStream(c *gin.Context, vaultID, streamID string) {
+func validMediaDuration(duration float64) bool {
+	return !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration > 0
+}
+
+func redirectHLSStream(c *gin.Context, vaultID, streamID string, durationSeconds float64) {
 	c.Header("Cache-Control", "no-store")
 	c.Header("Vary", "Origin, Cookie, X-Session-ID")
-	c.Redirect(http.StatusFound, fmt.Sprintf("/api/vaults/%s/files/hls/%s/index.m3u8", vaultID, streamID))
+	location := fmt.Sprintf("/api/vaults/%s/files/hls/%s/index.m3u8", vaultID, streamID)
+	if validMediaDuration(durationSeconds) {
+		location += "?duration=" + strconv.FormatFloat(durationSeconds, 'f', 3, 64)
+	}
+	c.Redirect(http.StatusFound, location)
 }
 
 // waitForHLSStart is kept as a compatibility wrapper for tests/callers that
@@ -359,7 +377,7 @@ func (s *Server) waitForHLSStartOwner(c *gin.Context, vaultID, ownerID string, p
 			s.releaseHLSStartOwner(vaultID, ownerID, result.streamID)
 			return
 		}
-		redirectHLSStream(c, vaultID, result.streamID)
+		redirectHLSStream(c, vaultID, result.streamID, result.durationSeconds)
 	case <-c.Request.Context().Done():
 		s.releaseHLSStartOwner(vaultID, ownerID, pending.streamID)
 		return
@@ -406,6 +424,7 @@ func (s *Server) completeHLSStart(pending *hlsPending, stream *hlsStream, startE
 			s.hls[pending.streamID] = stream
 			s.hlsActive++
 			result.streamID = pending.streamID
+			result.durationSeconds = stream.durationSeconds
 			accepted = true
 		} else if startErr == nil {
 			result.err = context.Canceled
