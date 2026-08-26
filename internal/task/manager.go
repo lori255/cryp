@@ -928,6 +928,13 @@ func (m *Manager) runRebuildIndex(t *storage.TaskRecord, vault *crypto.Vault, ct
 	if err == nil {
 		err = m.db.PruneFileMetadata(t.VaultID)
 	}
+	if err == nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if cleanupErr := vault.DropVaultFileCache(cleanupCtx); cleanupErr != nil {
+			log.Printf("rebuild: drop vault page cache %s: %v", t.VaultID, cleanupErr)
+		}
+		cancel()
+	}
 
 	if err != nil {
 		if errors.Is(err, errTaskCancelled) || errors.Is(err, context.Canceled) {

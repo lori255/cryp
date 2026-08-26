@@ -105,3 +105,28 @@ func (v *Vault) HashVirtualFileContext(ctx context.Context, virtualPath string, 
 
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
+
+// DropVaultFileCache releases page-cache entries for every encrypted file in
+// a vault. It is a best-effort post-maintenance operation: cache eviction does
+// not affect correctness, so individual open/fadvise failures are ignored.
+func (v *Vault) DropVaultFileCache(ctx context.Context) error {
+	if v == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return v.WalkFiles("/", func(path string, _ FileInfo) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		encPath, err := v.ResolveExistingFilePath(path)
+		if err != nil {
+			return err
+		}
+		DropPathCache(encPath)
+		return nil
+	})
+}
