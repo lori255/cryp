@@ -236,12 +236,12 @@ func ffprobeBinary() string {
 
 type probeOutput struct {
 	Format struct {
-		Duration   string            `json:"duration"`
+		Duration   probeScalar       `json:"duration"`
 		FormatName string            `json:"format_name"`
 		FormatLong string            `json:"format_long_name"`
-		StartTime  string            `json:"start_time"`
-		Size       string            `json:"size"`
-		BitRate    string            `json:"bit_rate"`
+		StartTime  probeScalar       `json:"start_time"`
+		Size       probeScalar       `json:"size"`
+		BitRate    probeScalar       `json:"bit_rate"`
 		ProbeScore int               `json:"probe_score"`
 		NbStreams  int               `json:"nb_streams"`
 		NbPrograms int               `json:"nb_programs"`
@@ -254,13 +254,13 @@ type probeOutput struct {
 		CodecLongName      string            `json:"codec_long_name"`
 		Profile            string            `json:"profile"`
 		CodecTag           string            `json:"codec_tag_string"`
-		Duration           string            `json:"duration"`
-		StartTime          string            `json:"start_time"`
-		DurationTS         string            `json:"duration_ts"`
-		FrameCount         string            `json:"nb_frames"`
+		Duration           probeScalar       `json:"duration"`
+		StartTime          probeScalar       `json:"start_time"`
+		DurationTS         probeScalar       `json:"duration_ts"`
+		FrameCount         probeScalar       `json:"nb_frames"`
 		TimeBase           string            `json:"time_base"`
-		BitRate            string            `json:"bit_rate"`
-		SampleRate         string            `json:"sample_rate"`
+		BitRate            probeScalar       `json:"bit_rate"`
+		SampleRate         probeScalar       `json:"sample_rate"`
 		Width              int               `json:"width"`
 		Height             int               `json:"height"`
 		CodedWidth         int               `json:"coded_width"`
@@ -270,7 +270,7 @@ type probeOutput struct {
 		AverageFrameRate   string            `json:"avg_frame_rate"`
 		SampleAspectRatio  string            `json:"sample_aspect_ratio"`
 		DisplayAspectRatio string            `json:"display_aspect_ratio"`
-		Rotation           string            `json:"rotation"`
+		Rotation           probeScalar       `json:"rotation"`
 		ColorRange         string            `json:"color_range"`
 		ColorSpace         string            `json:"color_space"`
 		ColorTransfer      string            `json:"color_transfer"`
@@ -288,11 +288,34 @@ type probeOutput struct {
 	} `json:"streams"`
 	Chapters []struct {
 		ID        int               `json:"id"`
-		StartTime string            `json:"start_time"`
-		EndTime   string            `json:"end_time"`
+		StartTime probeScalar       `json:"start_time"`
+		EndTime   probeScalar       `json:"end_time"`
 		TimeBase  string            `json:"time_base"`
 		Tags      map[string]string `json:"tags"`
 	} `json:"chapters"`
+}
+
+// probeScalar accepts both JSON strings and numbers. ffprobe emits timestamps
+// and frame counts as numbers on some versions while emitting durations and
+// rates as strings, so binding them to one primitive type is not portable.
+type probeScalar string
+
+func (value *probeScalar) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*value = ""
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		*value = probeScalar(text)
+		return nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(data, &number); err != nil {
+		return err
+	}
+	*value = probeScalar(number.String())
+	return nil
 }
 
 type cappedBuffer struct {
@@ -360,28 +383,28 @@ func decodeProbeOutput(output []byte) (Record, error) {
 	}
 	media := &Media{
 		Format: decoded.Format.FormatName, FormatLongName: decoded.Format.FormatLong,
-		StartTimeSeconds: parseFloat(decoded.Format.StartTime), Size: parseInt64(decoded.Format.Size),
-		BitRate: parseInt64(decoded.Format.BitRate), ProbeScore: decoded.Format.ProbeScore,
+		StartTimeSeconds: parseFloat(string(decoded.Format.StartTime)), Size: parseInt64(string(decoded.Format.Size)),
+		BitRate: parseInt64(string(decoded.Format.BitRate)), ProbeScore: decoded.Format.ProbeScore,
 		StreamCount: decoded.Format.NbStreams, ProgramCount: decoded.Format.NbPrograms,
 		Tags:    decoded.Format.Tags,
 		Streams: make([]Stream, 0, len(decoded.Streams)), Chapters: make([]Chapter, 0, len(decoded.Chapters)),
 	}
-	duration := parseFloat(decoded.Format.Duration)
+	duration := parseFloat(string(decoded.Format.Duration))
 	for _, stream := range decoded.Streams {
-		streamDuration := parseFloat(stream.Duration)
+		streamDuration := parseFloat(string(stream.Duration))
 		duration = math.Max(duration, streamDuration)
 		normalized := Stream{
 			Index: stream.Index, Type: stream.CodecType, Codec: stream.CodecName, CodecLongName: stream.CodecLongName,
 			Profile: stream.Profile, CodecTag: stream.CodecTag, DurationSeconds: streamDuration,
-			StartTimeSeconds: parseFloat(stream.StartTime), DurationTS: parseInt64(stream.DurationTS), FrameCount: parseInt64(stream.FrameCount),
-			TimeBase: stream.TimeBase, BitRate: parseInt64(stream.BitRate),
+			StartTimeSeconds: parseFloat(string(stream.StartTime)), DurationTS: parseInt64(string(stream.DurationTS)), FrameCount: parseInt64(string(stream.FrameCount)),
+			TimeBase: stream.TimeBase, BitRate: parseInt64(string(stream.BitRate)),
 			Width: stream.Width, Height: stream.Height, CodedWidth: stream.CodedWidth, CodedHeight: stream.CodedHeight,
 			PixelFormat: stream.PixelFormat, FrameRate: stream.FrameRate, AverageFrameRate: stream.AverageFrameRate,
 			SampleAspectRatio: stream.SampleAspectRatio, DisplayAspectRatio: stream.DisplayAspectRatio,
-			Rotation: int(parseInt64(stream.Rotation)), ColorRange: stream.ColorRange, ColorSpace: stream.ColorSpace,
+			Rotation: int(parseInt64(string(stream.Rotation))), ColorRange: stream.ColorRange, ColorSpace: stream.ColorSpace,
 			ColorTransfer: stream.ColorTransfer, ColorPrimaries: stream.ColorPrimaries, FieldOrder: stream.FieldOrder,
 			BitsPerRawSample: stream.BitsPerRawSample, SampleFormat: stream.SampleFormat,
-			SampleRate: int(parseInt64(stream.SampleRate)), Channels: stream.Channels, ChannelLayout: stream.ChannelLayout,
+			SampleRate: int(parseInt64(string(stream.SampleRate))), Channels: stream.Channels, ChannelLayout: stream.ChannelLayout,
 			Language: stream.Language, Title: stream.Title, HandlerName: stream.HandlerName,
 			Disposition: stream.Disposition, Tags: stream.Tags,
 		}
@@ -406,11 +429,11 @@ func decodeProbeOutput(output []byte) (Record, error) {
 			if media.AudioCodec == "" {
 				media.AudioCodec = stream.CodecName
 				media.AudioChannels = stream.Channels
-				media.AudioSampleRate = int(parseInt64(stream.SampleRate))
+				media.AudioSampleRate = int(parseInt64(string(stream.SampleRate)))
 			}
 		}
 		if media.BitRate == 0 {
-			media.BitRate = parseInt64(stream.BitRate)
+			media.BitRate = parseInt64(string(stream.BitRate))
 		}
 	}
 	for _, chapter := range decoded.Chapters {
@@ -418,7 +441,7 @@ func decodeProbeOutput(output []byte) (Record, error) {
 		if chapter.Tags != nil {
 			title = chapter.Tags["title"]
 		}
-		media.Chapters = append(media.Chapters, Chapter{ID: chapter.ID, StartTimeSeconds: parseFloat(chapter.StartTime), EndTimeSeconds: parseFloat(chapter.EndTime), TimeBase: chapter.TimeBase, Title: title, Tags: chapter.Tags})
+		media.Chapters = append(media.Chapters, Chapter{ID: chapter.ID, StartTimeSeconds: parseFloat(string(chapter.StartTime)), EndTimeSeconds: parseFloat(string(chapter.EndTime)), TimeBase: chapter.TimeBase, Title: title, Tags: chapter.Tags})
 	}
 	if validDuration(duration) {
 		media.DurationSeconds = duration
