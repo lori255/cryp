@@ -19,6 +19,8 @@ import (
 	"cryp/internal/thumbnail"
 )
 
+const rebuildHashCacheThreshold = 256 * 1024 * 1024
+
 // ThumbEnqueuer is called after each file is encrypted to generate thumbnails
 type ThumbEnqueuer interface {
 	Enqueue(vaultID, vaultPath string, keys *crypto.VaultKeys, virtualPath string)
@@ -1092,10 +1094,7 @@ func (m *Manager) rebuildEntryIndex(ctx context.Context, vault *crypto.Vault, t 
 			continue
 		}
 
-		t.CurrentFile = virtualPath
-		m.updateTask(t)
-
-		hash, err := vault.HashVirtualFile(virtualPath)
+		hash, err := vault.HashVirtualFileContext(ctx, virtualPath, entry.Size > rebuildHashCacheThreshold)
 		if err != nil {
 			return fmt.Errorf("hash %s: %w", virtualPath, err)
 		}

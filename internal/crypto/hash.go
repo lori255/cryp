@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -26,6 +27,17 @@ func ProtectContentHash(macKey []byte, vaultID, plaintextHash string) string {
 
 // HashVirtualFile returns the SHA-256 hash of a decrypted vault file.
 func (v *Vault) HashVirtualFile(virtualPath string) (string, error) {
+	return v.HashVirtualFileContext(context.Background(), virtualPath, true)
+}
+
+// HashVirtualFileContext hashes a decrypted file with cancellation support.
+// dropCache controls the page-cache hints: rebuilds can keep pages available
+// for their immediate metadata/thumbnail passes on bounded files, while large
+// files and one-off scans can opt into aggressive cache dropping.
+func (v *Vault) HashVirtualFileContext(ctx context.Context, virtualPath string, dropCache bool) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	encPath, err := v.ResolveExistingFilePath(virtualPath)
 	if err != nil {
 		return "", err
@@ -37,9 +49,9 @@ func (v *Vault) HashVirtualFile(virtualPath string) (string, error) {
 	}
 	defer file.Close()
 
-	// Rebuild-index is a pure sequential scan, so tell the kernel not to
-	// retain these encrypted pages in cache longer than necessary.
-	unix.Fadvise(int(file.Fd()), 0, 0, unix.FADV_SEQUENTIAL|unix.FADV_NOREUSE)
+	if dropCache {
+		unix.Fadvise(int(file.Fd()), 0, 0, unix.FADV_SEQUENTIAL|unix.FADV_NOREUSE)
+	}
 
 	header, err := ReadFileHeader(file, v.Keys.MasterKey)
 	if err != nil {
@@ -58,6 +70,11 @@ func (v *Vault) HashVirtualFile(virtualPath string) (string, error) {
 
 	var droppedUntil int64
 	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
 		n, readErr := reader.Read(*bufp)
 		if n > 0 {
 			if _, err := hasher.Write((*bufp)[:n]); err != nil {
@@ -65,7 +82,7 @@ func (v *Vault) HashVirtualFile(virtualPath string) (string, error) {
 			}
 
 			readEnd, seekErr := file.Seek(0, io.SeekCurrent)
-			if seekErr == nil && readEnd-droppedUntil >= 8*1024*1024 {
+			if dropCache && seekErr == nil && readEnd-droppedUntil >= 8*1024*1024 {
 				unix.Fadvise(int(file.Fd()), droppedUntil, readEnd-droppedUntil, unix.FADV_DONTNEED)
 				droppedUntil = readEnd
 			}
@@ -82,7 +99,9 @@ func (v *Vault) HashVirtualFile(virtualPath string) (string, error) {
 		}
 	}
 
-	DropFileCache(file)
+	if dropCache {
+		DropFileCache(file)
+	}
 
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
