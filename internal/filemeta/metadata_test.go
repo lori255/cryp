@@ -60,7 +60,7 @@ func TestDecodeProbeOutputCollectsCommonMediaFields(t *testing.T) {
 	record, err := decodeProbeOutput([]byte(`{
 		"format":{"duration":"63.25","format_name":"matroska,webm","format_long_name":"Matroska / WebM","size":"123456","bit_rate":"2400000","probe_score":100,"nb_streams":3,"tags":{"title":"demo"}},
 		"streams":[
-			{"index":0,"codec_type":"video","codec_name":"hevc","codec_long_name":"H.265","profile":"Main 10","width":3840,"height":2160,"pix_fmt":"yuv420p10le","avg_frame_rate":"30000/1001","time_base":"1/1000","duration_ts":189750,"nb_frames":1898,"tags":{"language":"und","title":"video"}},
+			{"index":0,"codec_type":"video","codec_name":"hevc","codec_long_name":"H.265","profile":"Main 10","width":3840,"height":2160,"pix_fmt":"yuv420p10le","avg_frame_rate":"30000/1001","time_base":"1/1000","duration_ts":189750,"nb_frames":1898,"bits_per_raw_sample":"10","tags":{"language":"und","title":"video"}},
 			{"index":1,"codec_type":"audio","codec_name":"aac","channels":6,"sample_rate":"48000","channel_layout":"5.1","tags":{"language":"eng","title":"English"}},
 			{"index":2,"codec_type":"subtitle","codec_name":"ass","tags":{"language":"jpn","title":"Japanese"}}
 		],
@@ -76,7 +76,7 @@ func TestDecodeProbeOutputCollectsCommonMediaFields(t *testing.T) {
 		media.AudioChannels != 6 || media.AudioSampleRate != 48000 || media.FormatLongName != "Matroska / WebM" ||
 		media.Size != 123456 || media.ProbeScore != 100 || len(media.Streams) != 3 || len(media.Chapters) != 1 ||
 		media.Streams[0].AverageFrameRate != "30000/1001" || media.Streams[1].ChannelLayout != "5.1" ||
-		media.Streams[0].DurationTS != 189750 || media.Streams[0].FrameCount != 1898 || media.Streams[1].Language != "eng" ||
+		media.Streams[0].DurationTS != 189750 || media.Streams[0].FrameCount != 1898 || media.Streams[0].BitsPerRawSample != 10 || media.Streams[1].Language != "eng" ||
 		media.Streams[2].Type != "subtitle" || media.Chapters[0].Title != "Intro" {
 		t.Fatalf("media = %#v", media)
 	}
