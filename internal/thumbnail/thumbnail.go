@@ -42,6 +42,7 @@ const (
 var errThumbnailStale = errors.New("thumbnail job superseded")
 var errThumbnailSkipped = errors.New("thumbnail generation skipped")
 var errThumbnailQueueFull = errors.New("thumbnail queue is full")
+var errThumbnailGenerationFailed = errors.New("thumbnail generation failed")
 
 // videoExtensions lists supported video file extensions
 var videoExtensions = map[string]bool{
@@ -692,8 +693,21 @@ func (g *Generator) WaitVaultIdle(ctx context.Context, vaultID string) error {
 		g.mu.Lock()
 		state := g.vaults[vaultID]
 		idle := state == nil || (state.pending == 0 && len(state.active) == 0)
+		failed := false
+		prefix := vaultID + "\x00"
+		if idle {
+			for key := range g.failed {
+				if strings.HasPrefix(key, prefix) {
+					failed = true
+					break
+				}
+			}
+		}
 		g.mu.Unlock()
 		if idle {
+			if failed {
+				return fmt.Errorf("%w for vault %s", errThumbnailGenerationFailed, vaultID)
+			}
 			return nil
 		}
 		select {
